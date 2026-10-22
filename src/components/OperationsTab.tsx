@@ -1,16 +1,19 @@
 import React, { useState } from 'react';
 import {
   Flame,
+  Plus,
   PlusCircle,
   Printer,
   QrCode,
   Send,
+  Users,
 } from 'lucide-react';
 import {
   ClubRole,
   FiresideGroup,
   GuestRotaryMakeupCard,
   MakeupSubmission,
+  RotaryMember,
 } from '../types/rotary';
 import { RotaryWheelIcon } from './RotaryArtwork';
 
@@ -30,6 +33,8 @@ interface OperationsTabProps {
   onOpenOfficialCertificateModal: (card: GuestRotaryMakeupCard) => void;
   firesideGroups: FiresideGroup[];
   onSubmitFiresideReport: (groupId: string, summary: string, attendanceRate: string) => void;
+  members: RotaryMember[];
+  onCreateFiresideGroup: (newGroup: Omit<FiresideGroup, 'id' | 'reportSubmitted'>) => void;
 }
 
 export const OperationsTab: React.FC<OperationsTabProps> = ({
@@ -44,6 +49,8 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
   onOpenOfficialCertificateModal,
   firesideGroups,
   onSubmitFiresideReport,
+  members,
+  onCreateFiresideGroup,
 }) => {
   const [makeupSubTab, setMakeupSubTab] = useState<'member_makeup' | 'guest_makeup'>(
     'member_makeup'
@@ -69,6 +76,28 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
   const [reportText, setReportText] = useState('');
   const [reportAttendance, setReportAttendance] = useState('%100 (6/6 Üye)');
   const [reportError, setReportError] = useState('');
+
+  // New Fireside Group Creation Modal State (Secretary / President)
+  const [isNewFiresideModalOpen, setIsNewFiresideModalOpen] = useState(false);
+  const [newGroupName, setNewGroupName] = useState(
+    '4. Grup Ocakbaşı — Cihangir & Tophane Buluşması'
+  );
+  const [newGroupHost, setNewGroupHost] = useState('Rtn. Rifat Akın');
+  const [newGroupDate, setNewGroupDate] = useState('12 Kasım 2026 Perşembe');
+  const [newGroupTime, setNewGroupTime] = useState('20:00');
+  const [newGroupLocation, setNewGroupLocation] = useState('Cihangir Savoia Rezidans');
+  const [newGroupAddress, setNewGroupAddress] = useState('Sıraselviler Cad. No: 42 Beyoğlu');
+  const [newGroupTopic, setNewGroupTopic] = useState(
+    'Gençlik Hizmetleri & RYLA Liderlik Kampı Bursiyer Seçimi'
+  );
+  const [selectedParticipants, setSelectedParticipants] = useState<string[]>([
+    'Rtn. Rifat Akın',
+    'Rtn. Av. Nazlı Denizmen',
+    'Rtn. Dr. Kerem Aydın',
+    'Rtn. Zeynep Korkmaz',
+  ]);
+
+  const isBoardLeader = activeRole === 'sekreter' || activeRole === 'baskan';
 
   const handleMemberMakeupSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -118,6 +147,34 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
     onSubmitFiresideReport(activeReportGroupId, reportText.trim(), reportAttendance);
     setActiveReportGroupId(null);
     setReportText('');
+  };
+
+  const toggleParticipantSelection = (memberFullName: string) => {
+    const label = `Rtn. ${memberFullName}`;
+    setSelectedParticipants((prev) =>
+      prev.includes(label) ? prev.filter((item) => item !== label) : [...prev, label]
+    );
+  };
+
+  const handleCreateNewFiresideSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newGroupName.trim() || !newGroupLocation.trim()) return;
+    const hostInfo = members.find(
+      (m) => `Rtn. ${m.fullName}` === newGroupHost || m.fullName === newGroupHost
+    );
+    onCreateFiresideGroup({
+      groupName: newGroupName.trim(),
+      hostMember: newGroupHost,
+      hostRole: hostInfo?.clubTitle || 'Ev Sahibi Üye',
+      date: newGroupDate.trim() || '12 Kasım 2026 Perşembe',
+      time: newGroupTime.trim() || '20:00',
+      location: newGroupLocation.trim(),
+      addressDetail: newGroupAddress.trim() || 'Beyoğlu / İstanbul',
+      topic: newGroupTopic.trim() || 'Kulüp İçi Dostluk & Komite Çalışması',
+      participants:
+        selectedParticipants.length > 0 ? selectedParticipants : [newGroupHost],
+    });
+    setIsNewFiresideModalOpen(false);
   };
 
   return (
@@ -605,20 +662,41 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
             aria-labelledby="fireside-planner-heading"
             className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 space-y-5 shadow-xs"
           >
-            <div className="border-b border-slate-100 pb-4">
-              <div className="flex items-center gap-1.5 text-xs font-semibold text-[#0C3C7C]">
-                <Flame className="w-4 h-4 text-[#F7A81B]" />
-                <span>Ocakbaşı (Fireside) Planlayıcı</span>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-4">
+              <div>
+                <div className="flex items-center gap-1.5 text-xs font-semibold text-[#0C3C7C]">
+                  <Flame className="w-4 h-4 text-[#F7A81B]" />
+                  <span>Ocakbaşı (Fireside) Planlayıcı</span>
+                </div>
+                <h2
+                  id="fireside-planner-heading"
+                  className="font-serif-display text-xl sm:text-2xl font-bold text-slate-900 mt-0.5"
+                >
+                  Aktif Ocakbaşı Grupları & Raporlama
+                </h2>
+                <p className="text-xs text-slate-500 mt-1">
+                  Ev sahibi üyeler toplantı sonrası Ocakbaşı karar ve yoklama özetini buradan yükler.
+                </p>
               </div>
-              <h2
-                id="fireside-planner-heading"
-                className="font-serif-display text-xl sm:text-2xl font-bold text-slate-900 mt-0.5"
-              >
-                Aktif Ocakbaşı Grupları & Raporlama
-              </h2>
-              <p className="text-xs text-slate-500 mt-1">
-                Ev sahibi üyeler toplantı sonrası Ocakbaşı karar ve yoklama özetini buradan yükler.
-              </p>
+
+              {isBoardLeader ? (
+                <button
+                  type="button"
+                  onClick={() => setIsNewFiresideModalOpen(true)}
+                  className="min-h-[38px] px-3.5 py-1.5 rounded-xl bg-[#0C3C7C] hover:bg-[#17458F] text-white text-xs font-semibold inline-flex items-center gap-1.5 shrink-0 transition-colors cursor-pointer"
+                >
+                  <Plus className="w-4 h-4 text-[#F7A81B]" />
+                  <span>+ Yeni Ocakbaşı Grubu Kur</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => onSelectRole('sekreter')}
+                  className="min-h-[34px] px-3 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-semibold shrink-0 transition-colors cursor-pointer"
+                >
+                  Grup Kurmak İçin Sekreter Rolüne Geç
+                </button>
+              )}
             </div>
 
             <div className="space-y-4">
@@ -792,6 +870,189 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                   className="min-h-[42px] px-5 py-2 rounded-xl bg-[#0C3C7C] text-white text-xs font-semibold hover:bg-[#17458F] cursor-pointer"
                 >
                   Raporu Kaydet & Sekreterliğe İlet
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* NEW v3.0: Create New Fireside (Ocakbaşı) Group Modal */}
+      {isNewFiresideModalOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="new-fireside-modal-title"
+          className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4"
+        >
+          <div className="bg-white rounded-2xl border border-slate-200 max-w-xl w-full p-6 space-y-4 shadow-xl max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div>
+                <div className="text-xs font-semibold text-[#0C3C7C]">
+                  Kulüp Yönetimi & Dostluk Komitesi
+                </div>
+                <h3
+                  id="new-fireside-modal-title"
+                  className="font-serif-display text-xl font-bold text-slate-900"
+                >
+                  Yeni Ocakbaşı (Fireside) Grubu Kur
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsNewFiresideModalOpen(false)}
+                className="min-h-[36px] px-2.5 text-xs font-semibold text-slate-500 hover:text-slate-900 cursor-pointer"
+              >
+                Kapat
+              </button>
+            </div>
+
+            <form onSubmit={handleCreateNewFiresideSubmit} className="space-y-3.5">
+              <div>
+                <label
+                  htmlFor="new-fs-name"
+                  className="block text-xs font-semibold text-slate-700 mb-1"
+                >
+                  Ocakbaşı Grup Adı
+                </label>
+                <input
+                  id="new-fs-name"
+                  type="text"
+                  value={newGroupName}
+                  onChange={(e) => setNewGroupName(e.target.value)}
+                  className="w-full text-sm bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-slate-900"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label
+                    htmlFor="new-fs-host"
+                    className="block text-xs font-semibold text-slate-700 mb-1"
+                  >
+                    Ev Sahibi Üye Seçimi
+                  </label>
+                  <select
+                    id="new-fs-host"
+                    value={newGroupHost}
+                    onChange={(e) => setNewGroupHost(e.target.value)}
+                    className="w-full text-sm bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-slate-900"
+                  >
+                    {members.map((m) => (
+                      <option key={m.id} value={`Rtn. ${m.fullName}`}>
+                        Rtn. {m.fullName} ({m.clubTitle})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label
+                    htmlFor="new-fs-date"
+                    className="block text-xs font-semibold text-slate-700 mb-1"
+                  >
+                    Toplantı Tarihi & Günü
+                  </label>
+                  <input
+                    id="new-fs-date"
+                    type="text"
+                    value={newGroupDate}
+                    onChange={(e) => setNewGroupDate(e.target.value)}
+                    className="w-full text-sm bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-slate-900"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label
+                    htmlFor="new-fs-time"
+                    className="block text-xs font-semibold text-slate-700 mb-1"
+                  >
+                    Saat
+                  </label>
+                  <input
+                    id="new-fs-time"
+                    type="text"
+                    value={newGroupTime}
+                    onChange={(e) => setNewGroupTime(e.target.value)}
+                    className="w-full text-sm font-mono-num bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-slate-900"
+                  />
+                </div>
+                <div className="sm:col-span-2">
+                  <label
+                    htmlFor="new-fs-location"
+                    className="block text-xs font-semibold text-slate-700 mb-1"
+                  >
+                    Ev / Ofis / Mekan Adı
+                  </label>
+                  <input
+                    id="new-fs-location"
+                    type="text"
+                    value={newGroupLocation}
+                    onChange={(e) => setNewGroupLocation(e.target.value)}
+                    className="w-full text-sm bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-slate-900"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label
+                  htmlFor="new-fs-topic"
+                  className="block text-xs font-semibold text-slate-700 mb-1"
+                >
+                  Ocakbaşı Gündem Başlığı
+                </label>
+                <input
+                  id="new-fs-topic"
+                  type="text"
+                  value={newGroupTopic}
+                  onChange={(e) => setNewGroupTopic(e.target.value)}
+                  className="w-full text-sm bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-slate-900"
+                />
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-xs font-semibold text-slate-700 flex items-center gap-1">
+                    <Users className="w-3.5 h-3.5 text-[#0C3C7C]" />
+                    <span>Katılımcı Üye Seçimi ({selectedParticipants.length} Seçili)</span>
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-40 overflow-y-auto p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                  {members.map((m) => {
+                    const label = `Rtn. ${m.fullName}`;
+                    const checked = selectedParticipants.includes(label);
+                    return (
+                      <label
+                        key={m.id}
+                        className="flex items-center gap-2 text-xs text-slate-800 p-1.5 rounded-lg hover:bg-white cursor-pointer"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleParticipantSelection(m.fullName)}
+                          className="rounded border-slate-300 text-[#0C3C7C]"
+                        />
+                        <span className="truncate">{m.fullName}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setIsNewFiresideModalOpen(false)}
+                  className="min-h-[42px] px-4 py-2 rounded-xl border border-slate-300 text-xs font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer"
+                >
+                  Vazgeç
+                </button>
+                <button
+                  type="submit"
+                  className="min-h-[42px] px-5 py-2 rounded-xl bg-[#0C3C7C] text-white text-xs font-semibold hover:bg-[#17458F] cursor-pointer"
+                >
+                  Ocakbaşı Grubunu Oluştur & Üyelere Bildir
                 </button>
               </div>
             </form>

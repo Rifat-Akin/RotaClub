@@ -2,7 +2,7 @@ export type ClubRole = 'uye' | 'sekreter' | 'sayman' | 'baskan';
 
 export type TabId = 'home' | 'operations' | 'finance' | 'projects' | 'directory';
 
-export type RsvpStatus = 'attending' | 'with_spouse' | 'with_guest' | 'excused';
+export type RsvpStatus = 'attending' | 'with_spouse' | 'with_guest' | 'excused' | 'pending';
 
 export type MenuPreference = 'Standart' | 'Vejetaryen' | 'Balık';
 
@@ -45,6 +45,10 @@ export interface WeeklyMeeting {
   speakerBio: string;
   certificateStatus: 'Hazır — İmzalandı' | 'PolioPlus Bağışı Bekleniyor' | 'Takdim Edildi';
   certificateDonationTree: string;
+  isPast?: boolean;
+  bulletinSummary?: string;
+  attendanceCount?: number;
+  highlights?: string[];
 }
 
 export interface MakeupSubmission {
@@ -118,6 +122,50 @@ export interface OverdueMemberItem {
   lastRemindedAt?: string;
 }
 
+export interface TreasuryLedgerEntry {
+  id: string;
+  date: string;
+  type: 'Gelir' | 'Gider';
+  category: 'Aidat & Kuver Tahsilatı' | 'Otel & Banket Gideri' | 'UR Bölge & Vakıf' | 'Burs & Proje Fonu' | 'Sponsorluk Geliri';
+  title: string;
+  amount: number;
+  referenceNo: string;
+  counterparty: string;
+}
+
+export interface ScholarStudent {
+  id: string;
+  fullName: string;
+  university: string;
+  department: string;
+  gradeLevel: string;
+  monthlyStipend: number;
+  fundedMonths: number;
+  totalMonths: number;
+  mentorMember: string;
+  statusNote: string;
+}
+
+export interface ClubCommittee {
+  id: string;
+  name: string;
+  chairName: string;
+  viceChairName: string;
+  members: string[];
+  termGoal: string;
+  activeProjectsCount: number;
+  budgetAllocated: number;
+}
+
+export interface PastPresidentRecord {
+  id: string;
+  termYears: string;
+  presidentName: string;
+  rotaryTheme: string;
+  flagshipProject: string;
+  phfHonors: string;
+}
+
 export interface GalleryArchivePhoto {
   id: string;
   title: string;
@@ -151,7 +199,14 @@ export interface RotaryMember {
   fullName: string;
   clubTitle: string;
   classification: string;
-  industryCategory: 'Yazılım & Teknoloji' | 'Deniz Hukuku' | 'Mimarlık' | 'Tekstil' | 'Finans' | 'Sağlık & Tıp' | 'Kültür & Sanat';
+  industryCategory:
+    | 'Yazılım & Teknoloji'
+    | 'Deniz Hukuku'
+    | 'Mimarlık'
+    | 'Tekstil'
+    | 'Finans'
+    | 'Sağlık & Tıp'
+    | 'Kültür & Sanat';
   companyName: string;
   position: string;
   bloodGroup: string;
@@ -162,7 +217,21 @@ export interface RotaryMember {
   email: string;
   phone: string;
   sponsorMember: string;
+  // v3.0 Enriched Member Fields
+  spouseName?: string;
+  birthday: string;
+  weddingAnniversary?: string;
+  sponsorName: string;
+  committees: string[];
+  duesBalance: number;
+  mealBalance: number;
+  foundationBalance: number;
+  rsvpStatus: RsvpStatus;
+  mealPreference: MenuPreference;
+  guestName?: string;
 }
+
+export type Member = RotaryMember;
 
 export interface TermBoardInfo {
   termLabel: string;

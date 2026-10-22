@@ -1,13 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  applyBulkMemberAccrual,
   calculateKuverSummary,
   calculateMemberFinanceSummary,
   calculateProjectProgress,
+  calculateTreasurySummary,
   calculateUpdatedAttendance,
   createSpeakerProposal,
   executeJulyFirstRollover,
   filterMembersByQueryAndClassification,
+  generateKuverCsvContent,
+  generateMembersFinanceCsvContent,
   toggleVoteSpeakerProposal,
 } from './rotaryLogic';
 import {
@@ -16,7 +20,67 @@ import {
   PaymentNotification,
   RotaryMember,
   TermBoardInfo,
+  TreasuryLedgerEntry,
 } from '../types/rotary';
+
+const SAMPLE_MEMBERS: RotaryMember[] = [
+  {
+    id: 'm-rifat',
+    rotaryId: 'TR-2420-88412',
+    fullName: 'Rifat Akın',
+    clubTitle: 'Üye & Dijital Dönüşüm Komitesi Başkanı',
+    classification: 'Kurumsal Yazılım Mimarisi & Yapay Zeka',
+    industryCategory: 'Yazılım & Teknoloji',
+    companyName: 'Bosphorus Cloud Systems A.Ş.',
+    position: 'Kurucu Ortak & CTO',
+    bloodGroup: 'A Rh(+)',
+    phfLevel: 'PHF +2',
+    phfStars: 3,
+    joinYear: 2019,
+    attendancePercent: 92,
+    email: 'rifat.akin@galatarotary.org',
+    phone: '+90 532 410 24 20',
+    sponsorMember: 'GDB. Haluk Şahin',
+    spouseName: 'Selin Akın',
+    birthday: '14 Mayıs',
+    weddingAnniversary: '12 Eylül',
+    sponsorName: 'GDB. Haluk Şahin',
+    committees: ['Gençlik & RYLA', 'Halkla İlişkiler & Dijital İmaj'],
+    duesBalance: 0,
+    mealBalance: 4800,
+    foundationBalance: 4500,
+    rsvpStatus: 'attending',
+    mealPreference: 'Standart',
+  },
+  {
+    id: 'm-deniz',
+    rotaryId: 'TR-2420-77104',
+    fullName: 'Av. Nazlı Denizmen',
+    clubTitle: 'Kulüp Genel Sekreteri',
+    classification: 'Uluslararası Deniz Ticareti ve P&I Hukuku',
+    industryCategory: 'Deniz Hukuku',
+    companyName: 'Denizmen & Partners Maritime Law',
+    position: 'Kıdemli Yönetici Ortak',
+    bloodGroup: '0 Rh(+)',
+    phfLevel: 'PHF +3',
+    phfStars: 4,
+    joinYear: 2016,
+    attendancePercent: 98,
+    email: 'nazli.denizmen@galatarotary.org',
+    phone: '+90 533 218 88 10',
+    sponsorMember: 'GDB. Emre Karaca',
+    spouseName: 'Mert Denizmen',
+    birthday: '22 Mart',
+    weddingAnniversary: '08 Haziran',
+    sponsorName: 'GDB. Emre Karaca',
+    committees: ['Kulüp Yönetimi', 'Üyelik'],
+    duesBalance: 0,
+    mealBalance: 2400,
+    foundationBalance: 0,
+    rsvpStatus: 'with_spouse',
+    mealPreference: 'Balık',
+  },
+];
 
 test('calculateKuverSummary accurately totals members, spouses, guests, and menu preferences', () => {
   const baseRsvps: MemberRsvp[] = [
@@ -28,14 +92,14 @@ test('calculateKuverSummary accurately totals members, spouses, guests, and menu
 
   const summary = calculateKuverSummary(baseRsvps, 'with_spouse', 'Balık');
 
-  assert.equal(summary.attendingMembers, 4); // m-rifat + 3 attending
-  assert.equal(summary.spousesCount, 2); // m-rifat spouse + m-2 spouse
-  assert.equal(summary.guestsCount, 2); // m-3 has 2 guests
-  assert.equal(summary.excusedMembers, 1); // m-4 excused
-  assert.equal(summary.totalKuver, 8); // 4 + 2 + 2
-  assert.equal(summary.menuBreakdown.Balık, 4); // m-rifat(2) + m-2(2)
-  assert.equal(summary.menuBreakdown.Vejetaryen, 3); // m-3(1 + 2 guests)
-  assert.equal(summary.menuBreakdown.Standart, 1); // m-1(1)
+  assert.equal(summary.attendingMembers, 4);
+  assert.equal(summary.spousesCount, 2);
+  assert.equal(summary.guestsCount, 2);
+  assert.equal(summary.excusedMembers, 1);
+  assert.equal(summary.totalKuver, 8);
+  assert.equal(summary.menuBreakdown.Balık, 4);
+  assert.equal(summary.menuBreakdown.Vejetaryen, 3);
+  assert.equal(summary.menuBreakdown.Standart, 1);
 });
 
 test('calculateUpdatedAttendance increments attendance rate and caps at 100%', () => {
@@ -109,50 +173,11 @@ test('calculateProjectProgress computes percentage and remaining goal', () => {
 });
 
 test('filterMembersByQueryAndClassification filters by Turkish query and category', () => {
-  const sampleMembers: RotaryMember[] = [
-    {
-      id: 'm-rifat',
-      rotaryId: 'TR-2420-88412',
-      fullName: 'Rifat Akın',
-      clubTitle: 'Üye & Dijital Dönüşüm Komitesi Başkanı',
-      classification: 'Kurumsal Yazılım Mimarisi & Yapay Zeka',
-      industryCategory: 'Yazılım & Teknoloji',
-      companyName: 'Bosphorus Cloud Systems A.Ş.',
-      position: 'Kurucu Ortak & CTO',
-      bloodGroup: 'A Rh(+)',
-      phfLevel: 'PHF +2',
-      phfStars: 3,
-      joinYear: 2019,
-      attendancePercent: 92,
-      email: 'rifat.akin@galatarotary.org',
-      phone: '+90 532 410 24 20',
-      sponsorMember: 'GDB. Haluk Şahin',
-    },
-    {
-      id: 'm-deniz',
-      rotaryId: 'TR-2420-77104',
-      fullName: 'Av. Nazlı Denizmen',
-      clubTitle: 'Kulüp Genel Sekreteri',
-      classification: 'Uluslararası Deniz Ticareti ve P&I Hukuku',
-      industryCategory: 'Deniz Hukuku',
-      companyName: 'Denizmen & Partners Maritime Law',
-      position: 'Kıdemli Yönetici Ortak',
-      bloodGroup: '0 Rh(+)',
-      phfLevel: 'PHF +3',
-      phfStars: 4,
-      joinYear: 2016,
-      attendancePercent: 98,
-      email: 'nazli.denizmen@galatarotary.org',
-      phone: '+90 533 218 88 10',
-      sponsorMember: 'GDB. Emre Karaca',
-    },
-  ];
-
-  const byCategory = filterMembersByQueryAndClassification(sampleMembers, '', 'Deniz Hukuku');
+  const byCategory = filterMembersByQueryAndClassification(SAMPLE_MEMBERS, '', 'Deniz Hukuku');
   assert.equal(byCategory.length, 1);
   assert.equal(byCategory[0].fullName, 'Av. Nazlı Denizmen');
 
-  const byBloodGroup = filterMembersByQueryAndClassification(sampleMembers, 'A Rh(+)', 'Tümü');
+  const byBloodGroup = filterMembersByQueryAndClassification(SAMPLE_MEMBERS, 'A Rh(+)', 'Tümü');
   assert.equal(byBloodGroup.length, 1);
   assert.equal(byBloodGroup[0].fullName, 'Rifat Akın');
 });
@@ -203,4 +228,46 @@ test('toggleVoteSpeakerProposal and createSpeakerProposal manage speaker pool vo
     targetMonth: 'Aralık 2026',
   });
   assert.equal(afterAdd.length, 2);
+});
+
+test('applyBulkMemberAccrual, calculateTreasurySummary and CSV generators work accurately', () => {
+  const updated = applyBulkMemberAccrual(SAMPLE_MEMBERS, 'Toplantı Kuver Bakiyesi', 2400);
+  assert.equal(updated[0].mealBalance, 7200);
+  assert.equal(updated[1].mealBalance, 4800);
+
+  const ledger: TreasuryLedgerEntry[] = [
+    {
+      id: 'tr-1',
+      date: '20 Ekim 2026',
+      type: 'Gelir',
+      category: 'Aidat & Kuver Tahsilatı',
+      title: '1. Yarıyıl Aidat Tahsilatları',
+      amount: 180000,
+      referenceNo: 'BNK-101',
+      counterparty: 'Kulüp Üyeleri',
+    },
+    {
+      id: 'tr-2',
+      date: '21 Ekim 2026',
+      type: 'Gider',
+      category: 'Otel & Banket Gideri',
+      title: 'Pera Palace #1841 Banket Ödemesi',
+      amount: 80000,
+      referenceNo: 'BNK-102',
+      counterparty: 'Pera Palace Hotel',
+    },
+  ];
+
+  const treasury = calculateTreasurySummary(ledger, updated, 1000000);
+  assert.equal(treasury.totalIncome, 180000);
+  assert.equal(treasury.totalExpense, 80000);
+  assert.equal(treasury.netBankBalance, 1100000);
+  assert.equal(treasury.totalMemberReceivables, 7200 + 4500 + 4800);
+
+  const kuverCsv = generateKuverCsvContent(SAMPLE_MEMBERS, 1842);
+  assert.ok(kuverCsv.includes('Rifat Akın'));
+  assert.ok(kuverCsv.includes('Mert Denizmen'));
+
+  const financeCsv = generateMembersFinanceCsvContent(SAMPLE_MEMBERS);
+  assert.ok(financeCsv.includes('TR-2420-88412'));
 });

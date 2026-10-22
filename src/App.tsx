@@ -2,42 +2,52 @@ import React, { useEffect, useState } from 'react';
 import { CheckCircle2, X } from 'lucide-react';
 import {
   CelebrationItem,
+  ClubCommittee,
   ClubRole,
   FinancialLineItem,
   FiresideGroup,
   GalataProject,
   GuestRotaryMakeupCard,
   MakeupSubmission,
+  MemberRsvp,
   MenuPreference,
   OverdueMemberItem,
+  PastPresidentRecord,
   PaymentNotification,
   RitualStep,
   RotaryMember,
   RsvpStatus,
+  ScholarStudent,
   SpeakerProposal,
   TabId,
   TenantClubOption,
   TermBoardInfo,
+  TreasuryLedgerEntry,
   WeeklyMeeting,
 } from './types/rotary';
 import {
   GALATA_ROTARY_MEMBERS,
   GALLERY_ARCHIVE_PHOTOS,
   INITIAL_CELEBRATIONS,
+  INITIAL_CLUB_COMMITTEES,
   INITIAL_FINANCIAL_ITEMS,
   INITIAL_FIRESIDE_GROUPS,
   INITIAL_GALATA_PROJECTS,
   INITIAL_GUEST_MAKEUP_CARDS,
   INITIAL_MAKEUP_SUBMISSIONS,
+  INITIAL_MEETINGS_LIST,
   INITIAL_OTHER_MEMBER_RSVPS,
   INITIAL_OVERDUE_MEMBERS,
+  INITIAL_PAST_PRESIDENTS,
   INITIAL_PAYMENT_NOTIFICATIONS,
   INITIAL_RITUAL_STEPS,
+  INITIAL_SCHOLARS,
   INITIAL_SPEAKER_PROPOSALS,
   INITIAL_TERM_BOARD,
-  UPCOMING_MEETING,
+  INITIAL_TREASURY_LEDGER,
 } from './data/mockGalataData';
 import {
+  applyBulkMemberAccrual,
   calculateKuverSummary,
   calculateMemberFinanceSummary,
   calculateUpdatedAttendance,
@@ -63,7 +73,7 @@ interface ToastMessage {
   detail: string;
 }
 
-const STORAGE_KEY = 'rotaclub_v2_galata_state';
+const STORAGE_KEY = 'rotaclub_v3_galata_state';
 
 function loadPersistedState<T>(key: string, fallback: T): T {
   try {
@@ -90,9 +100,12 @@ export default function App() {
     loadPersistedState('termInfo', INITIAL_TERM_BOARD)
   );
 
-  // Tab 1: Home, Speaker Pool & Meeting Cockpit State
-  const [meeting, setMeeting] = useState<WeeklyMeeting>(() =>
-    loadPersistedState('meeting', UPCOMING_MEETING)
+  // Tab 1: Home, Meetings Archive, Speaker Pool & Meeting Cockpit State
+  const [meetings, setMeetings] = useState<WeeklyMeeting[]>(() =>
+    loadPersistedState('meetings', INITIAL_MEETINGS_LIST)
+  );
+  const [selectedMeetingNo, setSelectedMeetingNo] = useState<number>(() =>
+    loadPersistedState('selectedMeetingNo', 1842)
   );
   const [rsvpStatus, setRsvpStatus] = useState<RsvpStatus>(() =>
     loadPersistedState('rsvpStatus', 'attending')
@@ -129,27 +142,43 @@ export default function App() {
     loadPersistedState('firesideGroups', INITIAL_FIRESIDE_GROUPS)
   );
 
-  // Tab 3: Finance & Treasurer State
-  const [financialItems] = useState<FinancialLineItem[]>(INITIAL_FINANCIAL_ITEMS);
+  // Tab 3: Finance, Member Cari Matrix & Club Treasury Ledger State
+  const [financialItems, setFinancialItems] = useState<FinancialLineItem[]>(() =>
+    loadPersistedState('financialItems', INITIAL_FINANCIAL_ITEMS)
+  );
   const [paymentNotifications, setPaymentNotifications] = useState<
     PaymentNotification[]
   >(() => loadPersistedState('paymentNotifications', INITIAL_PAYMENT_NOTIFICATIONS));
   const [overdueMembers, setOverdueMembers] = useState<OverdueMemberItem[]>(() =>
     loadPersistedState('overdueMembers', INITIAL_OVERDUE_MEMBERS)
   );
+  const [treasuryLedger, setTreasuryLedger] = useState<TreasuryLedgerEntry[]>(() =>
+    loadPersistedState('treasuryLedger', INITIAL_TREASURY_LEDGER)
+  );
 
-  // Tab 4: Galata Projects State
+  // Tab 4: Galata Projects & Scholars Fund State
   const [projects, setProjects] = useState<GalataProject[]>(() =>
     loadPersistedState('projects', INITIAL_GALATA_PROJECTS)
   );
+  const [scholars, setScholars] = useState<ScholarStudent[]>(() =>
+    loadPersistedState('scholars', INITIAL_SCHOLARS)
+  );
 
-  // Tab 5: Classification Directory & Apple Wallet Modal State
-  const [members] = useState<RotaryMember[]>(GALATA_ROTARY_MEMBERS);
+  // Tab 5: Classification Directory, Committees, Past Presidents & Apple Wallet Modal State
+  const [members, setMembers] = useState<RotaryMember[]>(() =>
+    loadPersistedState('members', GALATA_ROTARY_MEMBERS)
+  );
+  const [committees, setCommittees] = useState<ClubCommittee[]>(() =>
+    loadPersistedState('committees', INITIAL_CLUB_COMMITTEES)
+  );
+  const [pastPresidents, setPastPresidents] = useState<PastPresidentRecord[]>(() =>
+    loadPersistedState('pastPresidents', INITIAL_PAST_PRESIDENTS)
+  );
   const [walletModalMember, setWalletModalMember] = useState<RotaryMember | null>(
     null
   );
 
-  // Sync document.title and persist core state to localStorage
+  // Sync document.title and persist core state to localStorage under rotaclub_v3_galata_state
   useEffect(() => {
     document.title = 'RotaClub — Galata Rotary Kulübü · 2420. Bölge';
   }, []);
@@ -159,7 +188,8 @@ export default function App() {
       const stateToPersist = {
         activeRole,
         termInfo,
-        meeting,
+        meetings,
+        selectedMeetingNo,
         rsvpStatus,
         menuPreference,
         guestNameInput,
@@ -170,9 +200,15 @@ export default function App() {
         makeupSubmissions,
         guestMakeupCards,
         firesideGroups,
+        financialItems,
         paymentNotifications,
         overdueMembers,
+        treasuryLedger,
         projects,
+        scholars,
+        members,
+        committees,
+        pastPresidents,
       };
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToPersist));
     } catch {
@@ -181,7 +217,8 @@ export default function App() {
   }, [
     activeRole,
     termInfo,
-    meeting,
+    meetings,
+    selectedMeetingNo,
     rsvpStatus,
     menuPreference,
     guestNameInput,
@@ -192,9 +229,15 @@ export default function App() {
     makeupSubmissions,
     guestMakeupCards,
     firesideGroups,
+    financialItems,
     paymentNotifications,
     overdueMembers,
+    treasuryLedger,
     projects,
+    scholars,
+    members,
+    committees,
+    pastPresidents,
   ]);
 
   const showToast = (title: string, detail: string) => {
@@ -214,7 +257,8 @@ export default function App() {
     }
     setActiveRole('uye');
     setTermInfo(INITIAL_TERM_BOARD);
-    setMeeting(UPCOMING_MEETING);
+    setMeetings(INITIAL_MEETINGS_LIST);
+    setSelectedMeetingNo(1842);
     setRsvpStatus('attending');
     setMenuPreference('Standart');
     setGuestNameInput('Mim. Caner Erkin — Kentsel Tasarım');
@@ -225,12 +269,18 @@ export default function App() {
     setMakeupSubmissions(INITIAL_MAKEUP_SUBMISSIONS);
     setGuestMakeupCards(INITIAL_GUEST_MAKEUP_CARDS);
     setFiresideGroups(INITIAL_FIRESIDE_GROUPS);
+    setFinancialItems(INITIAL_FINANCIAL_ITEMS);
     setPaymentNotifications(INITIAL_PAYMENT_NOTIFICATIONS);
     setOverdueMembers(INITIAL_OVERDUE_MEMBERS);
+    setTreasuryLedger(INITIAL_TREASURY_LEDGER);
     setProjects(INITIAL_GALATA_PROJECTS);
+    setScholars(INITIAL_SCHOLARS);
+    setMembers(GALATA_ROTARY_MEMBERS);
+    setCommittees(INITIAL_CLUB_COMMITTEES);
+    setPastPresidents(INITIAL_PAST_PRESIDENTS);
     showToast(
-      'RotaClub Demo Verileri Sıfırlandı',
-      'Tüm LCV, bakiye, make-up, proje bağışı ve dönem verileri sunum başlangıç durumuna döndürüldü.'
+      'RotaClub v3.0 Demo Verileri Sıfırlandı',
+      'Tüm LCV matrisi, kasa defteri, bursiyer fonu, toplantı bültenleri ve üye verileri başlangıç durumuna döndürüldü.'
     );
   };
 
@@ -245,8 +295,22 @@ export default function App() {
     qrCheckedIn
   );
 
+  // Merge detailed members RSVP with additional baseline club members for live Pera Palace Kuver summary
+  const combinedRsvpList: MemberRsvp[] = [
+    ...members
+      .filter((m) => m.id !== 'm-rifat')
+      .map((m) => ({
+        memberId: m.id,
+        memberName: m.fullName,
+        status: m.rsvpStatus,
+        menu: m.mealPreference,
+        guestCount: m.rsvpStatus === 'with_guest' ? 1 : 0,
+      })),
+    ...INITIAL_OTHER_MEMBER_RSVPS.slice(9),
+  ];
+
   const kuverSummary = calculateKuverSummary(
-    INITIAL_OTHER_MEMBER_RSVPS,
+    combinedRsvpList,
     rsvpStatus,
     menuPreference,
     1
@@ -293,23 +357,85 @@ export default function App() {
 
   const handleChangeRsvpStatus = (status: RsvpStatus) => {
     setRsvpStatus(status);
+    setMembers((prev) =>
+      prev.map((m) => (m.id === 'm-rifat' ? { ...m, rsvpStatus: status } : m))
+    );
     const statusLabels: Record<RsvpStatus, string> = {
       attending: 'Katılıyorum (1 Kuver)',
       with_spouse: 'Eşli Katılıyorum (+1 · 2 Kuver)',
       with_guest: 'Konuğum Var (2 Kuver)',
       excused: 'Mazeretliyim (Kuver Düşüldü)',
+      pending: 'Yanıt Bekleniyor',
     };
     showToast(
       `LCV Güncellendi: ${statusLabels[status]}`,
-      'Pera Palace Hotel canlı kuver listesi anında güncellendi ve hafızaya kaydedildi.'
+      'Pera Palace Hotel canlı kuver listesi ve İsim İsim LCV Matrisi anında güncellendi.'
     );
   };
 
   const handleChangeMenuPreference = (menu: MenuPreference) => {
     setMenuPreference(menu);
+    setMembers((prev) =>
+      prev.map((m) => (m.id === 'm-rifat' ? { ...m, mealPreference: menu } : m))
+    );
     showToast(
       `Menü Tercihi: ${menu}`,
       `Toplantı akşam yemeği tercihiniz "${menu} Menü" olarak kaydedildi.`
+    );
+  };
+
+  const handleUpdateMemberRsvp = (
+    memberId: string,
+    status: RsvpStatus,
+    menu?: MenuPreference
+  ) => {
+    const target = members.find((m) => m.id === memberId);
+    setMembers((prev) =>
+      prev.map((m) =>
+        m.id === memberId
+          ? {
+              ...m,
+              rsvpStatus: status,
+              mealPreference: menu || m.mealPreference,
+            }
+          : m
+      )
+    );
+    if (memberId === 'm-rifat') {
+      setRsvpStatus(status);
+      if (menu) setMenuPreference(menu);
+    }
+    if (target) {
+      showToast(
+        `Üye LCV Durumu Güncellendi: ${target.fullName}`,
+        'Pera Palace Hotel canlı kuver toplamı yeni LCV durumuna göre yeniden hesaplandı.'
+      );
+    }
+  };
+
+  const handleRemindUnrespondedMembers = () => {
+    const pendingList = members.filter((m) => m.rsvpStatus === 'pending');
+    showToast(
+      'LCV Hatırlatma Bildirimi Gönderildi',
+      pendingList.length > 0
+        ? `Henüz yanıt vermeyen ${pendingList.map((m) => m.fullName).join(', ')} için WhatsApp/Push LCV hatırlatması iletildi.`
+        : 'Tüm üyelerin LCV yanıtı güncel durumda.'
+    );
+  };
+
+  const handleDownloadKuverCsvNotify = (meetingNo: number) => {
+    showToast(
+      `Kuver Listesi CSV İndirildi (#${meetingNo})`,
+      `Galata_Rotary_Toplantı_${meetingNo}_Kuver_Listesi.csv dosyası otel banket yönetimine iletilmek üzere indirildi.`
+    );
+  };
+
+  const handleCreateNewMeeting = (newMeeting: WeeklyMeeting) => {
+    setMeetings((prev) => [...prev, newMeeting]);
+    setSelectedMeetingNo(newMeeting.meetingNo);
+    showToast(
+      `Yeni Toplantı Planlandı (#${newMeeting.meetingNo})`,
+      `${newMeeting.dateLabel} tarihli "${newMeeting.speakerTopic}" toplantısı bülten takvimine eklendi.`
     );
   };
 
@@ -365,13 +491,18 @@ export default function App() {
   };
 
   const handleAdvanceCertificateStatus = () => {
-    setMeeting((prev) => ({
-      ...prev,
-      certificateStatus: 'Takdim Edildi',
-    }));
+    setMeetings((prev) =>
+      prev.map((m) =>
+        m.meetingNo === selectedMeetingNo
+          ? { ...m, certificateStatus: 'Takdim Edildi' }
+          : m
+      )
+    );
+    const activeMeeting =
+      meetings.find((m) => m.meetingNo === selectedMeetingNo) || meetings[0];
     showToast(
       'Konuşmacı Teşekkür Sertifikası Takdim Edildi',
-      `${meeting.speakerName} adına düzenlenen End Polio Now bağış sertifikası takdim edildi.`
+      `${activeMeeting.speakerName} adına düzenlenen End Polio Now bağış sertifikası takdim edildi.`
     );
   };
 
@@ -450,6 +581,21 @@ export default function App() {
     );
   };
 
+  const handleCreateFiresideGroup = (
+    newGroup: Omit<FiresideGroup, 'id' | 'reportSubmitted'>
+  ) => {
+    const created: FiresideGroup = {
+      id: `fs-${Date.now()}`,
+      ...newGroup,
+      reportSubmitted: false,
+    };
+    setFiresideGroups((prev) => [created, ...prev]);
+    showToast(
+      `Yeni Ocakbaşı Grubu Kuruldu: ${newGroup.groupName}`,
+      `Ev sahibi ${newGroup.hostMember} ve ${newGroup.participants.length} katılımcı üyeye davet iletildi.`
+    );
+  };
+
   const handleCopyIban = (iban: string) => {
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(iban).catch(() => {});
@@ -490,9 +636,43 @@ export default function App() {
       prev.map((p) => (p.id === paymentId ? { ...p, status: 'Onaylandı' } : p))
     );
     if (target) {
+      // Also deduct from the member's balance in Cari Matrix and add to Treasury Ledger
+      setMembers((prev) =>
+        prev.map((m) => {
+          if (m.id !== target.memberId && !target.memberName.includes(m.fullName)) {
+            return m;
+          }
+          if (target.category === 'Dönem Aidatı') {
+            return { ...m, duesBalance: Math.max(0, m.duesBalance - target.amount) };
+          }
+          if (target.category === 'Toplantı Kuver Bakiyesi') {
+            return { ...m, mealBalance: Math.max(0, m.mealBalance - target.amount) };
+          }
+          return {
+            ...m,
+            foundationBalance: Math.max(0, m.foundationBalance - target.amount),
+          };
+        })
+      );
+      setTreasuryLedger((prev) => [
+        {
+          id: `tr-${Date.now()}`,
+          date: '22 Ekim 2026',
+          type: 'Gelir',
+          category:
+            target.category === 'Vakıf / Proje Katkı Payı'
+              ? 'UR Bölge & Vakıf'
+              : 'Aidat & Kuver Tahsilatı',
+          title: `${target.memberName} — ${target.description}`,
+          counterparty: target.memberName,
+          amount: target.amount,
+          referenceNo: target.receiptRef,
+        },
+        ...prev,
+      ]);
       showToast(
         'Ödeme Onaylandı & Cari Bakiyeden Düşüldü',
-        `${target.memberName} tarafından bildirilen ${formatTL(target.amount)} ödeme cari hesaptan düşüldü.`
+        `${target.memberName} tarafından bildirilen ${formatTL(target.amount)} ödeme cari matristen düşüldü ve kasa defterine gelir işlendi.`
       );
     }
   };
@@ -525,6 +705,56 @@ export default function App() {
     }
   };
 
+  const handleRemindMemberBalance = (memberName: string, totalDebt: number) => {
+    showToast(
+      `Cari Bakiye Hatırlatması: ${memberName}`,
+      `Rtn. ${memberName} için ${formatTL(totalDebt)} cari bakiye hatırlatma mesajı iletildi.`
+    );
+  };
+
+  const handleBulkAccrual = (
+    category: FinancialLineItem['category'],
+    amount: number,
+    description: string
+  ) => {
+    setMembers((prev) => applyBulkMemberAccrual(prev, category, amount));
+    setFinancialItems((prev) => [
+      ...prev,
+      {
+        id: `fin-${Date.now()}`,
+        category,
+        title: description,
+        period: 'Ekim 2026 Tahakkuku',
+        totalAmount: amount,
+        paidAmount: 0,
+        dueDate: '15 Kasım 2026',
+      },
+    ]);
+    showToast(
+      `Toplu Tahakkuk Uygulandı (${formatTL(amount)})`,
+      `Tüm kulüp üyelerinin "${category}" cari bakiyesine "${description}" kalemi eklendi.`
+    );
+  };
+
+  const handleAddTreasuryEntry = (entry: Omit<TreasuryLedgerEntry, 'id'>) => {
+    const created: TreasuryLedgerEntry = {
+      id: `tr-${Date.now()}`,
+      ...entry,
+    };
+    setTreasuryLedger((prev) => [created, ...prev]);
+    showToast(
+      `Kasa Defteri Kaydı Eklendi (${entry.type})`,
+      `${entry.title} (${formatTL(entry.amount)}) Kulüp Kasa & Gelir-Gider Defterine işlendi.`
+    );
+  };
+
+  const handleDownloadFinanceCsvNotify = () => {
+    showToast(
+      'Tüm Üyeler Cari Matrisi CSV İndirildi',
+      'Galata_Rotary_Tum_Uyeler_Cari_Bakiye_Matrisi.csv dosyası bilgisayarınıza indirildi.'
+    );
+  };
+
   const handleSupportProject = (
     projectId: string,
     amount: number,
@@ -548,6 +778,67 @@ export default function App() {
         `${formatTL(amount)} (${supportType}) katkınız proje termometresine anında yansıtıldı.`
       );
     }
+  };
+
+  const handleCreateProject = (
+    newProject: Omit<GalataProject, 'id' | 'collectedAmount' | 'supportersCount'>
+  ) => {
+    const created: GalataProject = {
+      id: `proj-${Date.now()}`,
+      ...newProject,
+      collectedAmount: newProject.ticketPrice * 2,
+      supportersCount: 2,
+    };
+    setProjects((prev) => [created, ...prev]);
+    showToast(
+      `Yeni Hizmet Projesi Başlatıldı: ${newProject.title}`,
+      `Hedef bütçesi ${formatTL(newProject.targetBudget)} olan proje bağış termometresiyle yayına alındı.`
+    );
+  };
+
+  const handleSponsorScholarMonth = (scholarId: string) => {
+    const target = scholars.find((s) => s.id === scholarId);
+    setScholars((prev) =>
+      prev.map((s) => {
+        if (s.id !== scholarId) return s;
+        const nextFunded = Math.min(s.totalMonths, s.fundedMonths + 1);
+        return {
+          ...s,
+          fundedMonths: nextFunded,
+          statusNote:
+            nextFunded >= s.totalMonths
+              ? 'Dönem Bursu Tamamlandı'
+              : s.statusNote,
+        };
+      })
+    );
+    if (target) {
+      setTreasuryLedger((prev) => [
+        {
+          id: `tr-${Date.now()}`,
+          date: '22 Ekim 2026',
+          type: 'Gelir',
+          category: 'Burs & Proje Fonu',
+          title: `${target.fullName} (${target.university}) 1 Aylık Burs Katkısı`,
+          counterparty: 'Rtn. Rifat Akın',
+          amount: target.monthlyStipend,
+          referenceNo: `GLR-BURS-${Math.floor(100 + Math.random() * 899)}`,
+        },
+        ...prev,
+      ]);
+      showToast(
+        `1 Aylık Eğitim Bursu Üstlenildi: ${target.fullName}`,
+        `${target.university} öğrencimiz için ${formatTL(target.monthlyStipend)} burs katkınız kaydedildi.`
+      );
+    }
+  };
+
+  const handleAddNewMember = (newMember: RotaryMember) => {
+    setMembers((prev) => [newMember, ...prev]);
+    showToast(
+      `Yeni Kulüp Üyesi Eklendi: Rtn. ${newMember.fullName}`,
+      `${newMember.classification} sınıflandırmasıyla Galata Rotary Üye Rehberine ve LCV/Cari matrislere kaydedildi.`
+    );
   };
 
   const handleTriggerRollover = () => {
@@ -617,7 +908,10 @@ export default function App() {
           <HomeTab
             activeRole={activeRole}
             onSelectRole={handleSelectRole}
-            meeting={meeting}
+            meetings={meetings}
+            selectedMeetingNo={selectedMeetingNo}
+            onSelectMeetingNo={setSelectedMeetingNo}
+            onCreateNewMeeting={handleCreateNewMeeting}
             rsvpStatus={rsvpStatus}
             onChangeRsvpStatus={handleChangeRsvpStatus}
             menuPreference={menuPreference}
@@ -634,6 +928,10 @@ export default function App() {
             speakerProposals={speakerProposals}
             onToggleVoteSpeaker={handleToggleVoteSpeaker}
             onAddSpeakerProposal={handleAddSpeakerProposal}
+            members={members}
+            onUpdateMemberRsvp={handleUpdateMemberRsvp}
+            onRemindUnrespondedMembers={handleRemindUnrespondedMembers}
+            onDownloadKuverCsvNotify={handleDownloadKuverCsvNotify}
           />
         )}
 
@@ -652,6 +950,8 @@ export default function App() {
             }
             firesideGroups={firesideGroups}
             onSubmitFiresideReport={handleSubmitFiresideReport}
+            members={members}
+            onCreateFiresideGroup={handleCreateFiresideGroup}
           />
         )}
 
@@ -663,19 +963,30 @@ export default function App() {
             financeSummary={financeSummary}
             paymentNotifications={paymentNotifications}
             overdueMembers={overdueMembers}
+            members={members}
+            treasuryLedger={treasuryLedger}
             onCopyIban={handleCopyIban}
             onSubmitPaymentNotification={handleSubmitPaymentNotification}
             onApprovePayment={handleApprovePayment}
             onRejectPayment={handleRejectPayment}
             onSendGentleReminder={handleSendGentleReminder}
+            onRemindMemberBalance={handleRemindMemberBalance}
+            onBulkAccrual={handleBulkAccrual}
+            onAddTreasuryEntry={handleAddTreasuryEntry}
+            onDownloadFinanceCsvNotify={handleDownloadFinanceCsvNotify}
           />
         )}
 
         {activeTab === 'projects' && (
           <ProjectsTab
+            activeRole={activeRole}
+            onSelectRole={handleSelectRole}
             projects={projects}
             galleryPhotos={GALLERY_ARCHIVE_PHOTOS}
+            scholars={scholars}
             onSupportProject={handleSupportProject}
+            onCreateProject={handleCreateProject}
+            onSponsorScholarMonth={handleSponsorScholarMonth}
           />
         )}
 
@@ -684,9 +995,12 @@ export default function App() {
             activeRole={activeRole}
             onSelectRole={handleSelectRole}
             members={members}
+            committees={committees}
+            pastPresidents={pastPresidents}
             termInfo={termInfo}
             onTriggerRollover={handleTriggerRollover}
             onOpenWalletModalForMember={(member) => setWalletModalMember(member)}
+            onAddNewMember={handleAddNewMember}
           />
         )}
       </main>

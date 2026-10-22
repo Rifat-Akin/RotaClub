@@ -5,7 +5,9 @@ import {
   PaymentNotification,
   RotaryMember,
   RsvpStatus,
+  SpeakerProposal,
   TermBoardInfo,
+  TreasuryLedgerEntry,
 } from '../types/rotary';
 
 export interface KuverSummaryResult {
@@ -13,6 +15,7 @@ export interface KuverSummaryResult {
   spousesCount: number;
   guestsCount: number;
   excusedMembers: number;
+  pendingMembers: number;
   totalKuver: number;
   menuBreakdown: Record<MenuPreference, number>;
 }
@@ -45,6 +48,7 @@ export function calculateKuverSummary(
   let spousesCount = 0;
   let guestsCount = 0;
   let excusedMembers = 0;
+  let pendingMembers = 0;
 
   const menuBreakdown: Record<MenuPreference, number> = {
     Standart: 0,
@@ -55,6 +59,10 @@ export function calculateKuverSummary(
   for (const rsvp of allRsvps) {
     if (rsvp.status === 'excused') {
       excusedMembers += 1;
+      continue;
+    }
+    if (rsvp.status === 'pending') {
+      pendingMembers += 1;
       continue;
     }
 
@@ -78,8 +86,143 @@ export function calculateKuverSummary(
     spousesCount,
     guestsCount,
     excusedMembers,
+    pendingMembers,
     totalKuver,
     menuBreakdown,
+  };
+}
+
+/**
+ * Generates RFC-4180 compliant CSV string for Pera Palace Hotel Kuver & Menu Matrix.
+ */
+export function generateKuverCsvContent(members: RotaryMember[], meetingNo: number): string {
+  const headers = [
+    'Rotary ID',
+    'Üye Adı Soyadı',
+    'LCV Durumu',
+    'Menü Tercihi',
+    'Eş / Konuk Adı',
+    'Toplam Kuver',
+  ];
+
+  const statusLabels: Record<RsvpStatus, string> = {
+    attending: 'Katılıyor (1 Kişi)',
+    with_spouse: 'Eşli Katılıyor (+1)',
+    with_guest: 'Konuklu Katılıyor (+1)',
+    excused: 'Mazeretli',
+    pending: 'Yanıt Bekleniyor',
+  };
+
+  const rows = members.map((m) => {
+    const kuverCount =
+      m.rsvpStatus === 'with_spouse' || m.rsvpStatus === 'with_guest'
+        ? 2
+        : m.rsvpStatus === 'attending'
+        ? 1
+        : 0;
+    const companion =
+      m.rsvpStatus === 'with_spouse'
+        ? m.spouseName || 'Eşi'
+        : m.rsvpStatus === 'with_guest'
+        ? m.guestName || 'Konuğu'
+        : '-';
+    return [
+      m.rotaryId,
+      m.fullName,
+      statusLabels[m.rsvpStatus],
+      m.rsvpStatus === 'excused' || m.rsvpStatus === 'pending' ? '-' : m.mealPreference,
+      companion,
+      String(kuverCount),
+    ]
+      .map((cell) => `"${String(cell).replace(/"/g, '""')}"`)
+      .join(',');
+  });
+
+  return `# Toplantı #${meetingNo} Pera Palace Kuver Listesi\n` + [headers.join(','), ...rows].join('\n');
+}
+
+/**
+ * Generates CSV string for All Members Financial Balance Matrix (Tüm Üyeler Cari Matrisi).
+ */
+export function generateMembersFinanceCsvContent(members: RotaryMember[]): string {
+  const headers = [
+    'Rotary ID',
+    'Üye Adı Soyadı',
+    'Sınıflandırma',
+    'Aidat Borcu (TL)',
+    'Kuver Borcu (TL)',
+    'Vakıf/Proje Borcu (TL)',
+    'Toplam Borç (TL)',
+  ];
+
+  const rows = members.map((m) => {
+    const total = m.duesBalance + m.mealBalance + m.foundationBalance;
+    return [
+      m.rotaryId,
+      m.fullName,
+      m.classification,
+      String(m.duesBalance),
+      String(m.mealBalance),
+      String(m.foundationBalance),
+      String(total),
+    ]
+      .map((cell) => `"${String(cell).replace(/"/g, '""')}"`)
+      .join(',');
+  });
+
+  return [headers.join(','), ...rows].join('\n');
+}
+
+/**
+ * Applies a bulk accrual (Toplu Tahakkuk / Borçlandırma) to all members by category.
+ */
+export function applyBulkMemberAccrual(
+  members: RotaryMember[],
+  category: 'Dönem Aidatı' | 'Toplantı Kuver Bakiyesi' | 'Vakıf / Proje Katkı Payı',
+  amount: number
+): RotaryMember[] {
+  if (amount <= 0) return members;
+  return members.map((m) => {
+    if (category === 'Dönem Aidatı') {
+      return { ...m, duesBalance: m.duesBalance + amount };
+    }
+    if (category === 'Toplantı Kuver Bakiyesi') {
+      return { ...m, mealBalance: m.mealBalance + amount };
+    }
+    return { ...m, foundationBalance: m.foundationBalance + amount };
+  });
+}
+
+/**
+ * Calculates Club Treasury Ledger summary (total bank balance, total income, total expenses, total member receivables).
+ */
+export function calculateTreasurySummary(
+  ledger: TreasuryLedgerEntry[],
+  members: RotaryMember[],
+  initialOpeningBalance: number = 1420000
+): {
+  totalIncome: number;
+  totalExpense: number;
+  netBankBalance: number;
+  totalMemberReceivables: number;
+} {
+  const totalIncome = ledger
+    .filter((e) => e.type === 'Gelir')
+    .reduce((acc, e) => acc + e.amount, 0);
+  const totalExpense = ledger
+    .filter((e) => e.type === 'Gider')
+    .reduce((acc, e) => acc + e.amount, 0);
+  const netBankBalance = initialOpeningBalance + totalIncome - totalExpense;
+  const totalMemberReceivables = members.reduce(
+    (acc, m) => acc + m.duesBalance + m.mealBalance + m.foundationBalance,
+    0
+  );
+
+  return {
+    totalIncome,
+    totalExpense,
+    netBankBalance,
+    totalMemberReceivables,
   };
 }
 
@@ -181,6 +324,8 @@ export function filterMembersByQueryAndClassification(
       member.bloodGroup,
       member.phfLevel,
       member.clubTitle,
+      member.spouseName || '',
+      member.committees.join(' '),
     ]
       .join(' ')
       .toLocaleLowerCase('tr-TR');

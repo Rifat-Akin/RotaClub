@@ -62,7 +62,7 @@ export const HeaderAndRoleBar: React.FC<HeaderAndRoleBarProps> = ({
                   RotaClub
                 </span>
                 <span className="text-xs text-[#F7A81B] font-mono-num font-semibold">
-                  v2.0
+                  v3.0
                 </span>
               </div>
 
