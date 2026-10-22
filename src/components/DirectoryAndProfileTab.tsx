@@ -30,6 +30,7 @@ import {
 import {
   filterMembersByQueryAndClassification,
   formatTL,
+  maskPhoneForKvkk,
 } from '../utils/rotaryLogic';
 import { RotaryWheelIcon } from './RotaryArtwork';
 
@@ -43,6 +44,7 @@ interface DirectoryAndProfileTabProps {
   onTriggerRollover: () => void;
   onOpenWalletModalForMember: (member: RotaryMember) => void;
   onAddNewMember: (newMember: RotaryMember) => void;
+  kvkkMaskPhone?: boolean;
 }
 
 type DirectorySubTab = 'members' | 'committees' | 'past_presidents' | 'four_way_test';
@@ -68,6 +70,7 @@ export const DirectoryAndProfileTab: React.FC<DirectoryAndProfileTabProps> = ({
   onTriggerRollover,
   onOpenWalletModalForMember,
   onAddNewMember,
+  kvkkMaskPhone = false,
 }) => {
   const [activeSubTab, setActiveSubTab] = useState<DirectorySubTab>('members');
   const [searchQuery, setSearchQuery] = useState('');
@@ -351,6 +354,10 @@ export const DirectoryAndProfileTab: React.FC<DirectoryAndProfileTabProps> = ({
                               <span>
                                 {member.joinYear} · {member.committees[0] || 'Kulüp Üyesi'}
                               </span>
+                            </div>
+                            <div className="font-mono-num">
+                              <span className="font-semibold text-slate-800 font-sans">İletişim: </span>
+                              <span>{maskPhoneForKvkk(member.phone, Boolean(kvkkMaskPhone))}</span>
                             </div>
                           </div>
                         </div>
@@ -817,7 +824,7 @@ export const DirectoryAndProfileTab: React.FC<DirectoryAndProfileTabProps> = ({
 
             <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-100">
               <div className="text-xs text-slate-500 font-mono-num">
-                {selectedProfileMember.phone} · {selectedProfileMember.email}
+                {maskPhoneForKvkk(selectedProfileMember.phone, Boolean(kvkkMaskPhone))} · {selectedProfileMember.email}
               </div>
               <button
                 type="button"

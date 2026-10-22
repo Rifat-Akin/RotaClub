@@ -1,0 +1,11 @@
+{
+  "name": "RotaClub — Dijital Rotary Kulüp & Üye Ağı",
+  "short_name": "RotaClub",
+  "description": "Uluslararası Rotary 2420. Bölge Galata Rotary Kulübü için dijital kulüp, LCV, make-up, şeffaf saymanlık ve üye ağı platformu.",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#091E42",
+  "theme_color": "#0C3C7C",
+  "lang": "tr-TR"
+}

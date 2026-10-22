@@ -191,6 +191,7 @@ export interface GalataProject {
   ticketPrice: number;
   visualTheme: 'galatart' | 'concert' | 'school' | 'ryla';
   impactMetrics: string[];
+  volunteers?: string[];
 }
 
 export interface RotaryMember {
@@ -284,4 +285,15 @@ export interface AuditLogEntry {
   detail: string;
   verifiedByServer: boolean;
 }
+
+export interface BoardResolutionItem {
+  id: string;
+  resolutionNo: string;
+  date: string;
+  title: string;
+  summary: string;
+  voteStatus: 'Oybirliği ile Kabul' | 'Oyçokluğu ile Kabul';
+  signedBy: string;
+}
+
 

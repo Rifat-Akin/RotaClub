@@ -5,8 +5,9 @@ import {
   HeartHandshake,
   MapPin,
   Plus,
-  Sparkles,
   Ticket,
+  UserCheck,
+  Users,
 } from 'lucide-react';
 import {
   ClubRole,
@@ -26,6 +27,7 @@ interface ProjectsTabProps {
   onSupportProject: (projectId: string, amount: number, supportType: string) => void;
   onCreateProject: (newProject: Omit<GalataProject, 'id' | 'collectedAmount' | 'supportersCount'>) => void;
   onSponsorScholarMonth: (scholarId: string) => void;
+  onToggleProjectVolunteer?: (projectId: string) => void;
 }
 
 export const ProjectsTab: React.FC<ProjectsTabProps> = ({
@@ -37,6 +39,7 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({
   onSupportProject,
   onCreateProject,
   onSponsorScholarMonth,
+  onToggleProjectVolunteer,
 }) => {
   const [selectedProject, setSelectedProject] = useState<GalataProject | null>(null);
   const [supportTier, setSupportTier] = useState<'ticket' | 'double_ticket' | 'patron'>('ticket');
@@ -190,11 +193,25 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({
                   <div className="pt-1 text-xs font-medium text-slate-700">
                     {project.impactMetrics.join(' · ')}
                   </div>
+
+                  {/* Volunteer Roster (Epic #8) */}
+                  <div className="pt-2 border-t border-slate-100 flex items-center justify-between gap-2 text-xs text-slate-600">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <Users className="w-3.5 h-3.5 text-[#0C3C7C] shrink-0" />
+                      <span className="truncate">
+                        <strong className="text-slate-800">Saha Gönüllüleri: </strong>
+                        {(project.volunteers && project.volunteers.length > 0
+                          ? project.volunteers
+                          : ['Rtn. Deniz Arslan', 'Rtn. Zeynep Yıldırım']
+                        ).join(', ')}
+                      </span>
+                    </div>
+                  </div>
                 </div>
               </div>
 
               {/* Live Budget / Donation Thermometer & CTA */}
-              <div className="p-5 sm:p-6 pt-0 space-y-4">
+              <div className="p-5 sm:p-6 pt-0 space-y-3">
                 <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2.5">
                   <div className="flex items-baseline justify-between gap-2">
                     <div>
@@ -232,16 +249,37 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({
                   </div>
                 </div>
 
-                <button
-                  type="button"
-                  onClick={() => openSupportModal(project)}
-                  className="w-full min-h-[46px] py-2.5 px-4 rounded-xl bg-[#0C3C7C] hover:bg-[#17458F] text-white text-xs font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer"
-                >
-                  <Ticket className="w-4 h-4 text-[#F7A81B]" />
-                  <span>
-                    Projeye Destek Ol / Davetiye Al ({formatTL(project.ticketPrice)})
-                  </span>
-                </button>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => openSupportModal(project)}
+                    className="w-full min-h-[44px] py-2.5 px-3 rounded-xl bg-[#0C3C7C] hover:bg-[#17458F] text-white text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <Ticket className="w-4 h-4 text-[#F7A81B] shrink-0" />
+                    <span>
+                      Destek Ol / Davetiye ({formatTL(project.ticketPrice)})
+                    </span>
+                  </button>
+
+                  {onToggleProjectVolunteer && (
+                    <button
+                      type="button"
+                      onClick={() => onToggleProjectVolunteer(project.id)}
+                      className={`w-full min-h-[44px] py-2.5 px-3 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 border transition-colors cursor-pointer ${
+                        (project.volunteers || []).includes('Rtn. Rifat Akın')
+                          ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                          : 'bg-slate-100 hover:bg-slate-200 text-slate-800 border-slate-200'
+                      }`}
+                    >
+                      <UserCheck className="w-4 h-4 text-[#0C3C7C] shrink-0" />
+                      <span>
+                        {(project.volunteers || []).includes('Rtn. Rifat Akın')
+                          ? 'Saha Gönüllüsüsünüz (Make-up)'
+                          : 'Projede Saha Gönüllüsü Ol'}
+                      </span>
+                    </button>
+                  )}
+                </div>
               </div>
             </article>
           );

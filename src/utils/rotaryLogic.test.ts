@@ -11,7 +11,9 @@ import {
   executeJulyFirstRollover,
   filterMembersByQueryAndClassification,
   generateKuverCsvContent,
+  generateMeetingIcsContent,
   generateMembersFinanceCsvContent,
+  maskPhoneForKvkk,
   toggleVoteSpeakerProposal,
 } from './rotaryLogic';
 import {
@@ -270,4 +272,25 @@ test('applyBulkMemberAccrual, calculateTreasurySummary and CSV generators work a
 
   const financeCsv = generateMembersFinanceCsvContent(SAMPLE_MEMBERS);
   assert.ok(financeCsv.includes('TR-2420-88412'));
+
+  const masked = maskPhoneForKvkk('+90 532 411 24 20', true);
+  assert.ok(masked.includes('***'));
+  assert.equal(maskPhoneForKvkk('+90 532 411 24 20', false), '+90 532 411 24 20');
+
+  const ics = generateMeetingIcsContent({
+    meetingNo: 1842,
+    date: '27 Ekim 2026 Salı',
+    time: '19:30 – 21:45',
+    venue: 'Pera Palace Hotel',
+    hall: 'Galata Salonu',
+    speakerName: 'Prof. Dr. Çiğdem Kafescioğlu',
+    speakerTitle: 'Boğaziçi Üniversitesi Tarih Bölümü',
+    topic: 'Ceneviz Sur İçi ve Galata Kulesi',
+    speakerBio: 'Tarihçi',
+    certificateStatus: 'Hazır — İmzalandı',
+    certificateDonationTree: 'End Polio Now 50 Aşı Bağışı',
+  });
+  assert.ok(ics.includes('BEGIN:VCALENDAR'));
+  assert.ok(ics.includes('Pera Palace Hotel'));
 });
+

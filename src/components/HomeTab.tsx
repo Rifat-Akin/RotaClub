@@ -33,6 +33,7 @@ import {
 } from '../types/rotary';
 import {
   generateKuverCsvContent,
+  generateMeetingIcsContent,
   KuverSummaryResult,
 } from '../utils/rotaryLogic';
 import { PeraPalaceBannerIllustration } from './RotaryArtwork';
@@ -218,6 +219,24 @@ export const HomeTab: React.FC<HomeTabProps> = ({
     onDownloadKuverCsvNotify(meeting.meetingNo);
   };
 
+  const handleDownloadMeetingIcs = () => {
+    const icsContent = generateMeetingIcsContent(meeting);
+    const blob = new Blob([icsContent], {
+      type: 'text/calendar;charset=utf-8;',
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute(
+      'download',
+      `galata-rotary-toplanti-${meeting.meetingNo}.ics`
+    );
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <div className="space-y-6">
       {/* Top Meeting Selector Bar (#1840, #1841 Bülten Özeti, #1842 Aktif Toplantı & + Yeni Toplantı Planla) */}
@@ -298,21 +317,31 @@ export const HomeTab: React.FC<HomeTabProps> = ({
             </div>
 
             <div className="p-5 sm:p-6 space-y-5">
-              {/* Date, Time & Venue Metadata */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pb-4 border-b border-slate-100 text-sm">
-                <div className="flex items-start gap-2.5">
+              {/* Date, Time & Venue Metadata + ICS Calendar Export (#9) */}
+              <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 pb-4 border-b border-slate-100 text-sm items-center">
+                <div className="sm:col-span-4 flex items-start gap-2.5">
                   <Calendar className="w-4 h-4 text-[#0C3C7C] mt-0.5 shrink-0" />
                   <div>
                     <div className="font-semibold text-slate-900">{meeting.date}</div>
                     <div className="text-xs text-slate-500">{meeting.time}</div>
                   </div>
                 </div>
-                <div className="flex items-start gap-2.5">
+                <div className="sm:col-span-5 flex items-start gap-2.5">
                   <MapPin className="w-4 h-4 text-[#0C3C7C] mt-0.5 shrink-0" />
                   <div>
                     <div className="font-semibold text-slate-900">{meeting.venue}</div>
                     <div className="text-xs text-slate-500">{meeting.hall}</div>
                   </div>
+                </div>
+                <div className="sm:col-span-3 sm:text-right">
+                  <button
+                    type="button"
+                    onClick={handleDownloadMeetingIcs}
+                    className="min-h-[36px] px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-[#0C3C7C] hover:text-white text-[#0C3C7C] text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <CalendarPlus className="w-3.5 h-3.5" />
+                    <span>Takvime Ekle (.ICS)</span>
+                  </button>
                 </div>
               </div>
 

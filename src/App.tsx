@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { CheckCircle2, X } from 'lucide-react';
 import {
   AuditLogEntry,
+  BoardResolutionItem,
   CelebrationItem,
   ClubCommittee,
   ClubRole,
@@ -29,6 +30,7 @@ import {
 import {
   GALATA_ROTARY_MEMBERS,
   GALLERY_ARCHIVE_PHOTOS,
+  INITIAL_BOARD_RESOLUTIONS,
   INITIAL_CELEBRATIONS,
   INITIAL_CLUB_COMMITTEES,
   INITIAL_FINANCIAL_ITEMS,
@@ -89,9 +91,12 @@ function loadPersistedState<T>(key: string, fallback: T): T {
 }
 
 export default function App() {
-  // Core Navigation & Role State
+  // Core Navigation, Multi-Tenant & Role State
   const [activeRole, setActiveRole] = useState<ClubRole>(() =>
     loadPersistedState('activeRole', 'uye')
+  );
+  const [activeTenantClubName, setActiveTenantClubName] = useState<string>(() =>
+    loadPersistedState('activeTenantClubName', 'Galata Rotary Kulübü')
   );
   const [activeTab, setActiveTab] = useState<TabId>('home');
   const [toast, setToast] = useState<ToastMessage | null>(null);
@@ -181,6 +186,12 @@ export default function App() {
   );
   const [isAuditModalOpen, setIsAuditModalOpen] = useState(false);
   const [serverSyncedAt, setServerSyncedAt] = useState<string | null>(null);
+  const [boardResolutions, setBoardResolutions] = useState<BoardResolutionItem[]>(() =>
+    loadPersistedState('boardResolutions', INITIAL_BOARD_RESOLUTIONS)
+  );
+  const [kvkkMaskPhone, setKvkkMaskPhone] = useState<boolean>(() =>
+    loadPersistedState('kvkkMaskPhone', false)
+  );
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>(() =>
     loadPersistedState('auditLogs', [
       {
@@ -228,7 +239,10 @@ export default function App() {
 
   // Sync document.title and hydrate shared state from Pilot Express Server on mount
   useEffect(() => {
-    document.title = 'RotaClub — Galata Rotary Kulübü · 2420. Bölge';
+    document.title = `RotaClub — ${activeTenantClubName} · 2420. Bölge`;
+  }, [activeTenantClubName]);
+
+  useEffect(() => {
     const hasLocalOverride = Boolean(window.localStorage.getItem(STORAGE_KEY));
     fetch('/api/pilot/state')
       .then((res) => (res.ok ? res.json() : null))
@@ -249,6 +263,7 @@ export default function App() {
           if (serverData.treasuryLedger) setTreasuryLedger(serverData.treasuryLedger);
           if (serverData.projects) setProjects(serverData.projects);
           if (serverData.scholars) setScholars(serverData.scholars);
+          if (serverData.boardResolutions) setBoardResolutions(serverData.boardResolutions);
         }
       })
       .catch(() => {
@@ -260,6 +275,7 @@ export default function App() {
     try {
       const stateToPersist = {
         activeRole,
+        activeTenantClubName,
         termInfo,
         meetings,
         selectedMeetingNo,
@@ -282,6 +298,8 @@ export default function App() {
         members,
         committees,
         pastPresidents,
+        boardResolutions,
+        kvkkMaskPhone,
         auditLogs,
       };
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToPersist));
@@ -290,6 +308,7 @@ export default function App() {
     }
   }, [
     activeRole,
+    activeTenantClubName,
     termInfo,
     meetings,
     selectedMeetingNo,
@@ -312,6 +331,8 @@ export default function App() {
     members,
     committees,
     pastPresidents,
+    boardResolutions,
+    kvkkMaskPhone,
     auditLogs,
   ]);
 
@@ -358,6 +379,8 @@ export default function App() {
           members,
           committees,
           pastPresidents,
+          boardResolutions,
+          kvkkMaskPhone,
         },
       }),
     })
@@ -385,6 +408,7 @@ export default function App() {
       // ignore
     }
     setActiveRole('uye');
+    setActiveTenantClubName('Galata Rotary Kulübü');
     setTermInfo(INITIAL_TERM_BOARD);
     setMeetings(INITIAL_MEETINGS_LIST);
     setSelectedMeetingNo(1842);
@@ -407,6 +431,8 @@ export default function App() {
     setMembers(GALATA_ROTARY_MEMBERS);
     setCommittees(INITIAL_CLUB_COMMITTEES);
     setPastPresidents(INITIAL_PAST_PRESIDENTS);
+    setBoardResolutions(INITIAL_BOARD_RESOLUTIONS);
+    setKvkkMaskPhone(false);
     fetch('/api/pilot/reset', {
       method: 'POST',
       headers: { 'x-rotaclub-role': activeRole },
@@ -433,6 +459,50 @@ export default function App() {
     showToast(
       'Tam Veritabanı Yedeği İndirildi (.JSON)',
       'RotaClub_Galata_Pilot_Backup_v4.json dosyası sunucudan bilgisayarınıza indirildi.'
+    );
+  };
+
+  const handleAddBoardResolution = (payload: {
+    resolutionNo: string;
+    title: string;
+    summary: string;
+    category: BoardResolutionItem['category'];
+  }) => {
+    const created: BoardResolutionItem = {
+      id: `yk-${Date.now()}`,
+      resolutionNo: payload.resolutionNo,
+      date: '22 Ekim 2026',
+      title: payload.title,
+      summary: payload.summary,
+      category: payload.category,
+      status: 'Oybirliği ile Kabul',
+    };
+    setBoardResolutions((prev) => [created, ...prev]);
+    recordServerAudit(
+      'Yönetim & Güvenlik',
+      `YK Karar Defterine Kayıt: ${payload.resolutionNo}`,
+      `${payload.title} (${payload.category}) Yönetim Kurulu Karar Defterine işlendi.`,
+      ['sekreter', 'baskan']
+    );
+    showToast(
+      `YK Kararı Kaydedildi (${payload.resolutionNo})`,
+      `"${payload.title}" oybirliği ile Yönetim Kurulu Karar Defterine eklendi.`
+    );
+  };
+
+  const handleToggleKvkkMaskPhone = () => {
+    const nextState = !kvkkMaskPhone;
+    setKvkkMaskPhone(nextState);
+    recordServerAudit(
+      'Yönetim & Güvenlik',
+      `KVKK Telefon Maskeleme ${nextState ? 'Aktif Edildi' : 'Kapatıldı'}`,
+      `Üye rehberi telefon numaraları KVKK gizlilik modu kapsamında ${nextState ? 'maskelendi' : 'tam görünüme açıldı'}.`
+    );
+    showToast(
+      nextState ? 'KVKK Telefon Maskeleme Aktif' : 'KVKK Telefon Maskeleme Kapatıldı',
+      nextState
+        ? 'Rehberdeki üye telefon numaraları KVKK kapsamında maskelendi (+90 532 *** ** 18).'
+        : 'Yetkili oturum için telefon numaraları tam görünüme açıldı.'
     );
   };
 
@@ -494,6 +564,7 @@ export default function App() {
   };
 
   const handleSelectTenantClub = (tenant: TenantClubOption) => {
+    setActiveTenantClubName(tenant.name);
     if (tenant.id === 'club-galata') {
       showToast(
         'Galata Rotary Kulübü (Aktif Oturum)',
@@ -501,8 +572,8 @@ export default function App() {
       );
     } else {
       showToast(
-        `RotaClub Bölge Demosu: ${tenant.name}`,
-        `${tenant.district} (${tenant.meetingDay}) modülü RotaClub SaaS altyapısında hazır durumda.`
+        `RotaClub Çoklu Kulüp Geçişi: ${tenant.name}`,
+        `${tenant.district} (${tenant.meetingDay}) kulüp çalışma alanı RotaClub SaaS altyapısında aktif edildi.`
       );
     }
   };
@@ -603,7 +674,13 @@ export default function App() {
     setSelectedMeetingNo(newMeeting.meetingNo);
     showToast(
       `Yeni Toplantı Planlandı (#${newMeeting.meetingNo})`,
-      `${newMeeting.dateLabel} tarihli "${newMeeting.speakerTopic}" toplantısı bülten takvimine eklendi.`
+      `${newMeeting.date} tarihli "${newMeeting.topic}" toplantısı bülten takvimine eklendi.`
+    );
+    recordServerAudit(
+      'LCV & Kuver',
+      `Yeni Haftalık Toplantı Planlandı (#${newMeeting.meetingNo})`,
+      `${newMeeting.date} · ${newMeeting.speakerName} (${newMeeting.topic}) bülten takvimine eklendi.`,
+      ['sekreter', 'baskan']
     );
   };
 
@@ -961,7 +1038,41 @@ export default function App() {
         `${target.title} Desteğiniz Kaydedildi`,
         `${formatTL(amount)} (${supportType}) katkınız proje termometresine anında yansıtıldı.`
       );
+      recordServerAudit(
+        'Projeler & Burslar',
+        `Proje Bağış & Davetiye Katkısı: ${target.title}`,
+        `Rtn. Rifat Akın tarafından ${formatTL(amount)} (${supportType}) proje katkısı işlendi.`
+      );
     }
+  };
+
+  const handleToggleProjectVolunteer = (projectId: string) => {
+    const target = projects.find((p) => p.id === projectId);
+    if (!target) return;
+    const currentList = target.volunteers || ['Rtn. Deniz Arslan', 'Rtn. Zeynep Yıldırım'];
+    const isAlreadyVolunteer = currentList.includes('Rtn. Rifat Akın');
+    const nextList = isAlreadyVolunteer
+      ? currentList.filter((v) => v !== 'Rtn. Rifat Akın')
+      : [...currentList, 'Rtn. Rifat Akın'];
+
+    setProjects((prev) =>
+      prev.map((p) =>
+        p.id === projectId ? { ...p, volunteers: nextList } : p
+      )
+    );
+    showToast(
+      isAlreadyVolunteer
+        ? `Gönüllü Kaydı Güncellendi: ${target.title}`
+        : `Saha Gönüllüsü Oldunuz: ${target.title}`,
+      isAlreadyVolunteer
+        ? 'Proje saha gönüllüsü kaydınız kaldırıldı.'
+        : 'Rtn. Rifat Akın saha gönüllüsü listesine eklendi ve katılımınız Make-up olarak kaydedildi.'
+    );
+    recordServerAudit(
+      'Projeler & Burslar',
+      `Proje Saha Gönüllüsü Kaydı: ${target.title}`,
+      `Rtn. Rifat Akın "${target.title}" saha gönüllüsü listesine ${isAlreadyVolunteer ? 'çıkarıldı' : 'eklendi'}.`
+    );
   };
 
   const handleCreateProject = (
@@ -972,6 +1083,7 @@ export default function App() {
       ...newProject,
       collectedAmount: newProject.ticketPrice * 2,
       supportersCount: 2,
+      volunteers: [newProject.committeeChair, 'Rtn. Rifat Akın'],
     };
     setProjects((prev) => [created, ...prev]);
     showToast(
@@ -1032,6 +1144,12 @@ export default function App() {
       '1 Temmuz Dönem Devir-Teslimi Tamamlandı',
       '2026-2027 Dönemi "Galata Dijital Yıllığı" olarak arşivlendi ve 2027-2028 Yönetim Kurulu aktif edildi.'
     );
+    recordServerAudit(
+      'Yönetim & Güvenlik',
+      '1 Temmuz Dönem Devir-Teslim (Rollover) Tamamlandı',
+      '2026-2027 Dönemi Galata Dijital Yıllığı olarak arşivlendi ve 2027-2028 Yönetim Kurulu aktif edildi.',
+      ['sekreter', 'baskan']
+    );
   };
 
   const handleCopyVCard = (member: RotaryMember) => {
@@ -1059,6 +1177,7 @@ export default function App() {
         onSelectTenantClub={handleSelectTenantClub}
         onOpenAuditModal={() => setIsAuditModalOpen(true)}
         auditCount={auditLogs.length}
+        activeTenantClubName={activeTenantClubName}
       />
 
       {/* Live Toast Feedback Banner */}
@@ -1173,6 +1292,7 @@ export default function App() {
             onSupportProject={handleSupportProject}
             onCreateProject={handleCreateProject}
             onSponsorScholarMonth={handleSponsorScholarMonth}
+            onToggleProjectVolunteer={handleToggleProjectVolunteer}
           />
         )}
 
@@ -1187,6 +1307,7 @@ export default function App() {
             onTriggerRollover={handleTriggerRollover}
             onOpenWalletModalForMember={(member) => setWalletModalMember(member)}
             onAddNewMember={handleAddNewMember}
+            kvkkMaskPhone={kvkkMaskPhone}
           />
         )}
       </main>
@@ -1202,10 +1323,14 @@ export default function App() {
       {/* Full-Screen iOS Splash / Lock Screen Modal */}
       <SplashLockScreenModal
         isOpen={isSplashModalOpen}
-        onUnlock={() => {
+        activeRole={activeRole}
+        onUnlock={(selectedRole) => {
           setIsSplashModalOpen(false);
+          if (selectedRole && selectedRole !== activeRole) {
+            setActiveRole(selectedRole);
+          }
           showToast(
-            'Face ID ile Giriş Başarılı',
+            'Face ID & KVKK Doğrulaması Başarılı',
             'RotaClub — Galata Rotary Kulübü güvenli oturumu doğrulandı.'
           );
         }}
@@ -1218,12 +1343,16 @@ export default function App() {
         onClose={() => setActiveCertificateCard(null)}
       />
 
-      {/* Server RBAC, Audit Log & JSON Backup Modal (#14, #18, #19, #22, #23) */}
+      {/* Server RBAC, Audit Log, YK Karar Defteri & KVKK Modal (Epics #2, #3, #7) */}
       <PilotAuditAndBackupModal
         isOpen={isAuditModalOpen}
         onClose={() => setIsAuditModalOpen(false)}
         activeRole={activeRole}
         auditLogs={auditLogs}
+        boardResolutions={boardResolutions}
+        onAddBoardResolution={handleAddBoardResolution}
+        kvkkMaskPhone={kvkkMaskPhone}
+        onToggleKvkkMaskPhone={handleToggleKvkkMaskPhone}
         serverSyncedAt={serverSyncedAt}
         onDownloadBackup={handleDownloadBackup}
       />
@@ -1237,3 +1366,4 @@ export default function App() {
     </div>
   );
 }
+

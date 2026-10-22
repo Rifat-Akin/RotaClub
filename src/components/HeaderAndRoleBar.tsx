@@ -30,6 +30,7 @@ interface HeaderAndRoleBarProps {
   onSelectTenantClub: (tenant: TenantClubOption) => void;
   onOpenAuditModal: () => void;
   auditCount: number;
+  activeTenantClubName?: string;
 }
 
 interface ClubNotificationItem {
@@ -92,6 +93,7 @@ export const HeaderAndRoleBar: React.FC<HeaderAndRoleBarProps> = ({
   onSelectTenantClub,
   onOpenAuditModal,
   auditCount,
+  activeTenantClubName = 'Galata Rotary Kulübü',
 }) => {
   const [isClubMenuOpen, setIsClubMenuOpen] = useState(false);
   const [isNotifOpen, setIsNotifOpen] = useState(false);
@@ -153,7 +155,7 @@ export const HeaderAndRoleBar: React.FC<HeaderAndRoleBarProps> = ({
                 className="mt-0.5 flex items-center gap-1.5 text-xs text-slate-200 hover:text-[#F7A81B] transition-colors cursor-pointer group"
               >
                 <span className="font-semibold text-white group-hover:text-[#F7A81B]">
-                  Galata Rotary Kulübü · {termInfo.district}
+                  {activeTenantClubName} · {termInfo.district}
                 </span>
                 <span className="hidden md:inline text-slate-300">
                   ({termInfo.termLabel})
@@ -184,7 +186,7 @@ export const HeaderAndRoleBar: React.FC<HeaderAndRoleBarProps> = ({
 
                 <div className="space-y-1">
                   {ROTA_CLUB_TENANTS.map((tenant) => {
-                    const isActive = tenant.id === 'club-galata';
+                    const isActive = tenant.name === activeTenantClubName;
                     return (
                       <button
                         key={tenant.id}

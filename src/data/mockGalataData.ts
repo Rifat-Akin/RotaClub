@@ -1060,3 +1060,37 @@ export const GALATA_ROTARY_MEMBERS: RotaryMember[] = [
     guestName: 'Av. Elif Sancak (Konuk)',
   },
 ];
+
+export const INITIAL_BOARD_RESOLUTIONS = [
+  {
+    id: 'res-16',
+    resolutionNo: 'YK-2026/16',
+    date: '20 Ekim 2026',
+    title: 'GALATART 2026 Çağdaş Sanat Sergisi Gelirlerinin Üniversite Burs Fonuna Aktarımı',
+    summary:
+      'Tophane-i Amire’de düzenlenecek GALATART 2026 sergisinden elde edilecek net bağış gelirinin %100’ünün Mimar Sinan Güzel Sanatlar Üniversitesi ve İTÜ bursiyer fonuna tahsis edilmesine karar verildi.',
+    voteStatus: 'Oybirliği ile Kabul' as const,
+    signedBy: 'Dönem Bşk. Mimar Emre Karaca & Genel Sekreter Av. Nazlı Denizmen',
+  },
+  {
+    id: 'res-15',
+    resolutionNo: 'YK-2026/15',
+    date: '06 Ekim 2026',
+    title: 'KVKK Aydınlatma Metni ve RotaClub Ortak Sunucu Güvenlik Protokolü Onayı',
+    summary:
+      'Kulüp üye rehberi ve LCV/Saymanlık verilerinin 6698 sayılı KVKK kapsamında yetkilendirilmiş sunucu tabanlı (RBAC) RotaClub altyapısında saklanmasına ve üçüncü taraflarla paylaşılmamasına karar verildi.',
+    voteStatus: 'Oybirliği ile Kabul' as const,
+    signedBy: 'Dönem Bşk. Mimar Emre Karaca & Genel Sekreter Av. Nazlı Denizmen',
+  },
+  {
+    id: 'res-14',
+    resolutionNo: 'YK-2026/14',
+    date: '15 Eylül 2026',
+    title: 'Pera Palace Hotel 2026-2027 Dönemi Banket ve Kuver Sözleşmesi Yenilemesi',
+    summary:
+      'Salı akşamı olağan kulüp toplantıları için Pera Palace Hotel Galata Salonu ile kişi başı kuver bedelinin sabitlenmesine ve LCV bildirimlerinin Salı saat 14:00’te kapatılmasına karar verildi.',
+    voteStatus: 'Oybirliği ile Kabul' as const,
+    signedBy: 'Dönem Bşk. Mimar Emre Karaca & Sayman YMM Levent Soydan',
+  },
+];
+

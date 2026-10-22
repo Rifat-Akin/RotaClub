@@ -8,6 +8,7 @@ import {
   SpeakerProposal,
   TermBoardInfo,
   TreasuryLedgerEntry,
+  WeeklyMeeting,
 } from '../types/rotary';
 
 export interface KuverSummaryResult {
@@ -420,3 +421,45 @@ export function createSpeakerProposal(
   };
   return [newEntry, ...proposals].sort((a, b) => b.votes - a.votes);
 }
+
+/**
+ * Generates RFC-5545 compliant iCalendar (.ics) file content for a Rotary club meeting (Epic #9).
+ */
+export function generateMeetingIcsContent(
+  meeting: WeeklyMeeting,
+  clubName: string = 'Galata Rotary Kulübü (UR 2420. Bölge)'
+): string {
+  const summary = `${clubName} — #${meeting.meetingNo}. Haftalık Toplantı: ${meeting.speakerName}`;
+  const description = `Konuk Konuşmacı: ${meeting.speakerName} (${meeting.speakerTitle})\\nKonu: ${meeting.topic}\\nMekan: ${meeting.venue} (${meeting.hall})`;
+  const location = `${meeting.venue} - ${meeting.hall}`;
+
+  return [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//RotaClub//Galata Rotary 2420//TR',
+    'CALSCALE:GREGORIAN',
+    'METHOD:PUBLISH',
+    'BEGIN:VEVENT',
+    `UID:rotaclub-meeting-${meeting.meetingNo}@galatarotary.org`,
+    'DTSTAMP:20261022T120000Z',
+    'DTSTART:20261027T163000Z',
+    'DTEND:20261027T190000Z',
+    `SUMMARY:${summary}`,
+    `DESCRIPTION:${description}`,
+    `LOCATION:${location}`,
+    'STATUS:CONFIRMED',
+    'END:VEVENT',
+    'END:VCALENDAR',
+  ].join('\r\n');
+}
+
+/**
+ * Masks a phone number under KVKK privacy settings when masking is enabled (Epic #2).
+ */
+export function maskPhoneForKvkk(phone: string, maskEnabled: boolean): string {
+  if (!maskEnabled) return phone;
+  const trimmed = phone.trim();
+  if (trimmed.length < 7) return '*** ** **';
+  return `${trimmed.slice(0, 7)} *** ** ${trimmed.slice(-2)}`;
+}
+
