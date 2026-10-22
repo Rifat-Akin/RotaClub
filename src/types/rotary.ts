@@ -273,3 +273,15 @@ export interface TenantClubOption {
   membersCount: number;
   meetingDay: string;
 }
+
+export interface AuditLogEntry {
+  id: string;
+  timestamp: string;
+  actorName: string;
+  actorRole: ClubRole;
+  module: 'LCV & Kuver' | 'QR Yoklama & Make-up' | 'Saymanlık & Kasa' | 'Yönetim & Güvenlik';
+  action: string;
+  detail: string;
+  verifiedByServer: boolean;
+}
+

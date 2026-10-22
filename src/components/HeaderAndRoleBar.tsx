@@ -1,13 +1,19 @@
 import React, { useState } from 'react';
 import {
   Award,
+  Bell,
   Building2,
-  Check,
+  Calendar,
+  CheckCheck,
   ChevronDown,
+  Database,
+  Flame,
+  Gift,
   Lock,
   RotateCcw,
   ShieldCheck,
   UserCheck,
+  Wallet,
 } from 'lucide-react';
 import { ClubRole, TenantClubOption, TermBoardInfo } from '../types/rotary';
 import { ROTA_CLUB_TENANTS } from '../data/mockGalataData';
@@ -22,7 +28,48 @@ interface HeaderAndRoleBarProps {
   onOpenSplashModal: () => void;
   onResetDemoData: () => void;
   onSelectTenantClub: (tenant: TenantClubOption) => void;
+  onOpenAuditModal: () => void;
+  auditCount: number;
 }
+
+interface ClubNotificationItem {
+  id: string;
+  category: 'Toplantı & LCV' | 'Mutlu Günler' | 'Saymanlık & Ocakbaşı';
+  title: string;
+  detail: string;
+  timeLabel: string;
+  unread: boolean;
+}
+
+const INITIAL_NOTIFICATIONS: ClubNotificationItem[] = [
+  {
+    id: 'notif-lcv',
+    category: 'Toplantı & LCV',
+    title: '1842. Toplantı LCV & Kuver Hatırlatması',
+    detail:
+      '27 Ekim Salı 19:30 Pera Palace Hotel (Prof. Dr. Çiğdem Kafescioğlu) toplantısı için mutfak kuver bildirim süresi yarın 14:00’te kapanıyor.',
+    timeLabel: '15 dk önce',
+    unread: true,
+  },
+  {
+    id: 'notif-celebrations',
+    category: 'Mutlu Günler',
+    title: 'Bu Hafta Doğum Günü & Evlilik Yıldönümü Olan Üyeler',
+    detail:
+      'Rtn. Defne Serezli (Doğum Günü · 28 Ekim), GDB. Dr. Sinan Vardar & Eşi Elif Vardar (18. Evlilik Yıldönümü · 29 Ekim) ve Rtn. Rifat Akın (7. Kulüp Yılı · 30 Ekim).',
+    timeLabel: '1 saat önce',
+    unread: true,
+  },
+  {
+    id: 'notif-ops-finance',
+    category: 'Saymanlık & Ocakbaşı',
+    title: 'Bekleyen Saymanlık Dekontları & Ocakbaşı Raporu',
+    detail:
+      'Sayman onayında bekleyen 2 yeni FAST dekontu (Rtn. Kerem Soylu & Rtn. Defne Serezli) ve 3. Grup Bebek Ocakbaşı toplantı tutanağı bekleniyor.',
+    timeLabel: 'Bugün · 09:40',
+    unread: true,
+  },
+];
 
 const ROLE_OPTIONS: {
   id: ClubRole;
@@ -43,13 +90,41 @@ export const HeaderAndRoleBar: React.FC<HeaderAndRoleBarProps> = ({
   onOpenSplashModal,
   onResetDemoData,
   onSelectTenantClub,
+  onOpenAuditModal,
+  auditCount,
 }) => {
   const [isClubMenuOpen, setIsClubMenuOpen] = useState(false);
+  const [isNotifOpen, setIsNotifOpen] = useState(false);
+  const [notifications, setNotifications] = useState<ClubNotificationItem[]>(
+    INITIAL_NOTIFICATIONS
+  );
+
+  const unreadCount = notifications.filter((n) => n.unread).length;
+
+  const handleMarkAllAsRead = () => {
+    setNotifications((prev) => prev.map((n) => ({ ...n, unread: false })));
+  };
+
+  const handleMarkSingleAsRead = (id: string) => {
+    setNotifications((prev) =>
+      prev.map((n) => (n.id === id ? { ...n, unread: false } : n))
+    );
+  };
+
+  const renderCategoryIcon = (category: ClubNotificationItem['category']) => {
+    if (category === 'Toplantı & LCV') {
+      return <Calendar className="w-4 h-4 text-[#F7A81B] shrink-0" />;
+    }
+    if (category === 'Mutlu Günler') {
+      return <Gift className="w-4 h-4 text-rose-400 shrink-0" />;
+    }
+    return <Wallet className="w-4 h-4 text-emerald-400 shrink-0" />;
+  };
 
   return (
     <header className="bg-gradient-to-r from-[#091E42] via-[#0C3C7C] to-[#17458F] text-white border-b border-white/10 shadow-sm relative z-30">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3">
-        {/* Top Row: RotaClub Brand + Multi-Tenant Club Switcher + Splash Screen & Digital ID */}
+        {/* Top Row: RotaClub Brand + Multi-Tenant Club Switcher + Notification Center + Splash Screen & Digital ID */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="relative flex items-center gap-3 min-w-0">
             <div className="w-10 h-10 rounded-xl bg-white/10 border border-[#F7A81B]/40 flex items-center justify-center text-[#F7A81B] shrink-0">
@@ -69,7 +144,10 @@ export const HeaderAndRoleBar: React.FC<HeaderAndRoleBarProps> = ({
               {/* Clickable Active Club Switcher Trigger */}
               <button
                 type="button"
-                onClick={() => setIsClubMenuOpen((prev) => !prev)}
+                onClick={() => {
+                  setIsClubMenuOpen((prev) => !prev);
+                  setIsNotifOpen(false);
+                }}
                 aria-expanded={isClubMenuOpen}
                 aria-label="RotaClub Kulüp Değiştirici Menüsünü Aç"
                 className="mt-0.5 flex items-center gap-1.5 text-xs text-slate-200 hover:text-[#F7A81B] transition-colors cursor-pointer group"
@@ -142,16 +220,128 @@ export const HeaderAndRoleBar: React.FC<HeaderAndRoleBarProps> = ({
             )}
           </div>
 
-          {/* Right Controls: Attendance + Splash Screen Button + Digital Wallet ID Button */}
-          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+          {/* Right Controls: Attendance + Notification Center Bell + Splash Screen Button + Digital Wallet ID Button */}
+          <div className="flex items-center gap-2 sm:gap-2.5 shrink-0 relative">
             <div
-              className="text-right mr-1"
+              className="text-right mr-1 hidden sm:block"
               aria-label={`Devamlılık Oranı Yüzde ${attendancePercent}`}
             >
               <div className="text-[11px] text-slate-300">Devamlılık Oranı</div>
               <div className="text-sm font-semibold font-mono-num text-[#F7A81B]">
                 %{attendancePercent} Katılım
               </div>
+            </div>
+
+            {/* Notification Center Trigger Button (Bell Icon) */}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => {
+                  setIsNotifOpen((prev) => !prev);
+                  setIsClubMenuOpen(false);
+                }}
+                aria-expanded={isNotifOpen}
+                aria-label={`Bildirim Merkezi (${unreadCount} okunmamış bildirim)`}
+                className="relative min-h-[42px] px-3 py-2 rounded-xl bg-white/10 hover:bg-white/20 border border-white/15 text-white font-semibold text-xs transition-colors flex items-center gap-1.5 cursor-pointer"
+              >
+                <Bell className="w-4 h-4 text-[#F7A81B] shrink-0" />
+                <span className="hidden md:inline">Bildirimler</span>
+                {unreadCount > 0 && (
+                  <span
+                    aria-label={`${unreadCount} okunmamış`}
+                    className="min-w-[18px] h-[18px] px-1 rounded-md bg-[#F7A81B] text-[#0F172A] font-mono-num text-[11px] font-bold flex items-center justify-center"
+                  >
+                    {unreadCount}
+                  </span>
+                )}
+              </button>
+
+              {/* Notification Center Popover Panel */}
+              {isNotifOpen && (
+                <div
+                  role="dialog"
+                  aria-label="RotaClub Bildirim Merkezi"
+                  className="absolute right-0 top-full mt-2 w-80 sm:w-96 rounded-2xl bg-[#0F172A] text-white border border-white/15 shadow-2xl p-4 space-y-3 z-50"
+                >
+                  <div className="flex items-center justify-between gap-2 border-b border-white/10 pb-2.5">
+                    <div>
+                      <div className="text-xs font-bold text-[#F7A81B]">
+                        Bildirim Merkezi · Galata Rotary
+                      </div>
+                      <div className="text-[11px] text-slate-400">
+                        {unreadCount > 0
+                          ? `${unreadCount} okunmamış kulüp bildirimi`
+                          : 'Tüm bildirimler okundu'}
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={handleMarkAllAsRead}
+                      disabled={unreadCount === 0}
+                      className={`min-h-[32px] px-2.5 py-1 rounded-lg text-[11px] font-semibold flex items-center gap-1 transition-colors cursor-pointer ${
+                        unreadCount > 0
+                          ? 'bg-[#0C3C7C] hover:bg-[#17458F] text-[#F7A81B]'
+                          : 'bg-white/5 text-slate-500 cursor-default'
+                      }`}
+                    >
+                      <CheckCheck className="w-3.5 h-3.5" />
+                      <span>Tümünü Okundu İşaretle</span>
+                    </button>
+                  </div>
+
+                  <div className="space-y-2 max-h-80 overflow-y-auto pr-0.5">
+                    {notifications.map((notif) => (
+                      <button
+                        key={notif.id}
+                        type="button"
+                        onClick={() => handleMarkSingleAsRead(notif.id)}
+                        className={`w-full text-left p-3 rounded-xl border transition-colors cursor-pointer space-y-1 ${
+                          notif.unread
+                            ? 'bg-[#0C3C7C]/40 border-[#F7A81B]/40 hover:bg-[#0C3C7C]/60'
+                            : 'bg-white/5 border-white/10 text-slate-300 hover:bg-white/10'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-1.5 text-[11px] font-semibold text-[#F7A81B]">
+                            {renderCategoryIcon(notif.category)}
+                            <span>{notif.category}</span>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[10px] font-mono-num text-slate-400">
+                              {notif.timeLabel}
+                            </span>
+                            {notif.unread && (
+                              <span
+                                className="w-2 h-2 rounded-full bg-[#F7A81B]"
+                                title="Okunmadı"
+                              />
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="text-xs font-bold text-white">
+                          {notif.title}
+                        </div>
+                        <p className="text-[11px] text-slate-300 leading-relaxed">
+                          {notif.detail}
+                        </p>
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="pt-1 border-t border-white/10 flex items-center justify-between text-[11px] text-slate-400">
+                    <span>UR 2420. Bölge Canlı Senkronizasyon</span>
+                    <button
+                      type="button"
+                      onClick={() => setIsNotifOpen(false)}
+                      className="text-slate-300 hover:text-white font-semibold cursor-pointer"
+                    >
+                      Paneli Kapat
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
 
             <button
@@ -161,7 +351,7 @@ export const HeaderAndRoleBar: React.FC<HeaderAndRoleBarProps> = ({
             >
               <Lock className="w-3.5 h-3.5 text-[#F7A81B] shrink-0" />
               <span className="hidden sm:inline">Giriş / Kilit Ekranı</span>
-              <span className="sm:hidden">Kilit Ekranı</span>
+              <span className="sm:hidden">Kilit</span>
             </button>
 
             <button
@@ -177,11 +367,16 @@ export const HeaderAndRoleBar: React.FC<HeaderAndRoleBarProps> = ({
 
         {/* Bottom Row: Instant Role Simulator Bar + Demo Reset Action */}
         <div className="mt-3 pt-2.5 border-t border-white/15 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-          <div className="flex items-center gap-2 text-xs text-slate-200">
-            <ShieldCheck className="w-4 h-4 text-[#F7A81B] shrink-0" />
-            <span className="font-medium">Rol Simülatörü:</span>
-            <span className="text-slate-300 hidden md:inline">
-              Yetkili ekranları test etmek için rol seçin
+          <div className="flex items-center justify-between sm:justify-start gap-2 text-xs text-slate-200">
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 text-[#F7A81B] shrink-0" />
+              <span className="font-medium">Rol Simülatörü:</span>
+              <span className="text-slate-300 hidden md:inline">
+                Yetkili ekranları test etmek için rol seçin
+              </span>
+            </div>
+            <span className="sm:hidden font-mono-num text-[#F7A81B] font-semibold">
+              %{attendancePercent} Katılım
             </span>
           </div>
 
@@ -214,7 +409,21 @@ export const HeaderAndRoleBar: React.FC<HeaderAndRoleBarProps> = ({
 
             <button
               type="button"
-              onClick={onResetDemoData}
+              onClick={onOpenAuditModal}
+              title="Sunucu RBAC yetkilendirme durumu, denetim geçmişi ve tam JSON yedekleme"
+              aria-label="Denetim Geçmişi ve Yedekleme"
+              className="min-h-[38px] px-2.5 py-1.5 rounded-xl bg-white/10 hover:bg-white/20 border border-white/10 text-xs font-semibold text-slate-200 hover:text-white flex items-center gap-1.5 transition-colors cursor-pointer shrink-0"
+            >
+              <Database className="w-3.5 h-3.5 text-[#F7A81B]" />
+              <span>Denetim & Yedek ({auditCount})</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setNotifications(INITIAL_NOTIFICATIONS);
+                onResetDemoData();
+              }}
               title="Sunum öncesi tüm demo verilerini ilk haline sıfırla"
               aria-label="Demoyu Sıfırla"
               className="min-h-[38px] px-2.5 py-1.5 rounded-xl bg-white/10 hover:bg-rose-500/20 border border-white/10 text-xs font-semibold text-slate-200 hover:text-white flex items-center gap-1.5 transition-colors cursor-pointer shrink-0"

@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { CheckCircle2, X } from 'lucide-react';
 import {
+  AuditLogEntry,
   CelebrationItem,
   ClubCommittee,
   ClubRole,
@@ -66,6 +67,7 @@ import { DirectoryAndProfileTab } from './components/DirectoryAndProfileTab';
 import { AppleWalletModal } from './components/AppleWalletModal';
 import { SplashLockScreenModal } from './components/SplashLockScreenModal';
 import { OfficialMakeupCertificateModal } from './components/OfficialMakeupCertificateModal';
+import { PilotAuditAndBackupModal } from './components/PilotAuditAndBackupModal';
 
 interface ToastMessage {
   id: string;
@@ -177,10 +179,81 @@ export default function App() {
   const [walletModalMember, setWalletModalMember] = useState<RotaryMember | null>(
     null
   );
+  const [isAuditModalOpen, setIsAuditModalOpen] = useState(false);
+  const [serverSyncedAt, setServerSyncedAt] = useState<string | null>(null);
+  const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>(() =>
+    loadPersistedState('auditLogs', [
+      {
+        id: 'aud-1004',
+        timestamp: '22 Ekim 2026 · 14:20',
+        actorName: 'Rtn. Av. Nazlı Denizmen (Genel Sekreter)',
+        actorRole: 'sekreter',
+        module: 'LCV & Kuver',
+        action: '1842. Toplantı Kuver Matrisi Senkronizasyonu',
+        detail: 'Pera Palace Hotel mutfak kuver listesi (35 Kuver) sunucu veritabanında doğrulandı.',
+        verifiedByServer: true,
+      },
+      {
+        id: 'aud-1003',
+        timestamp: '22 Ekim 2026 · 11:15',
+        actorName: 'Rtn. Kerem Soylu (Üye · TR-2420-83190)',
+        actorRole: 'uye',
+        module: 'Saymanlık & Kasa',
+        action: 'FAST Dekont Bildirimi (#GAR-2026-88341)',
+        detail: '9.000 TL 1. Yarıyıl Aidat 2. Taksit ödemesi Sayman onay kuyruğuna eklendi.',
+        verifiedByServer: true,
+      },
+      {
+        id: 'aud-1002',
+        timestamp: '20 Ekim 2026 · 18:45',
+        actorName: 'Rtn. YMM Levent Soydan (Sayman)',
+        actorRole: 'sayman',
+        module: 'Saymanlık & Kasa',
+        action: 'Kasa Defteri Tahsilat Kaydı (#GAR-2026-99120)',
+        detail: '14 üyenin Ekim ayı aidat ve kuver tahsilatı (168.000 TL) kasa defterine işlendi.',
+        verifiedByServer: true,
+      },
+      {
+        id: 'aud-1001',
+        timestamp: '20 Ekim 2026 · 09:00',
+        actorName: 'Rtn. Mimar Emre Karaca (Dönem Başkanı)',
+        actorRole: 'baskan',
+        module: 'Yönetim & Güvenlik',
+        action: 'Galata Rotary Pilot Veritabanı & RBAC Başlatıldı',
+        detail: 'Sunucu tabanlı rol doğrulama (RBAC), ortak veri saklama ve denetim izi aktif edildi.',
+        verifiedByServer: true,
+      },
+    ])
+  );
 
-  // Sync document.title and persist core state to localStorage under rotaclub_v3_galata_state
+  // Sync document.title and hydrate shared state from Pilot Express Server on mount
   useEffect(() => {
     document.title = 'RotaClub — Galata Rotary Kulübü · 2420. Bölge';
+    const hasLocalOverride = Boolean(window.localStorage.getItem(STORAGE_KEY));
+    fetch('/api/pilot/state')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((serverData) => {
+        if (!serverData) return;
+        if (serverData.updatedAt) setServerSyncedAt(serverData.updatedAt);
+        if (Array.isArray(serverData.auditLogs) && serverData.auditLogs.length > 0) {
+          setAuditLogs(serverData.auditLogs);
+        }
+        if (!hasLocalOverride) {
+          if (serverData.termInfo) setTermInfo(serverData.termInfo);
+          if (serverData.meetings) setMeetings(serverData.meetings);
+          if (serverData.selectedMeetingNo) setSelectedMeetingNo(serverData.selectedMeetingNo);
+          if (serverData.rsvpStatus) setRsvpStatus(serverData.rsvpStatus);
+          if (serverData.menuPreference) setMenuPreference(serverData.menuPreference);
+          if (serverData.members) setMembers(serverData.members);
+          if (serverData.paymentNotifications) setPaymentNotifications(serverData.paymentNotifications);
+          if (serverData.treasuryLedger) setTreasuryLedger(serverData.treasuryLedger);
+          if (serverData.projects) setProjects(serverData.projects);
+          if (serverData.scholars) setScholars(serverData.scholars);
+        }
+      })
+      .catch(() => {
+        // Fallback to localStorage state if offline
+      });
   }, []);
 
   useEffect(() => {
@@ -209,6 +282,7 @@ export default function App() {
         members,
         committees,
         pastPresidents,
+        auditLogs,
       };
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToPersist));
     } catch {
@@ -238,7 +312,62 @@ export default function App() {
     members,
     committees,
     pastPresidents,
+    auditLogs,
   ]);
+
+  const recordServerAudit = (
+    module: AuditLogEntry['module'],
+    action: string,
+    detail: string,
+    requiredRoles?: ClubRole[]
+  ) => {
+    fetch('/api/pilot/sync', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-rotaclub-role': activeRole,
+      },
+      body: JSON.stringify({
+        activeRole,
+        auditEvent: {
+          module,
+          action,
+          detail,
+          requiredRoles,
+        },
+        state: {
+          termInfo,
+          meetings,
+          selectedMeetingNo,
+          rsvpStatus,
+          menuPreference,
+          guestNameInput,
+          ritualSteps,
+          celebrations,
+          speakerProposals,
+          qrCheckedIn,
+          makeupSubmissions,
+          guestMakeupCards,
+          firesideGroups,
+          financialItems,
+          paymentNotifications,
+          overdueMembers,
+          treasuryLedger,
+          projects,
+          scholars,
+          members,
+          committees,
+          pastPresidents,
+        },
+      }),
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data?.auditLogs) setAuditLogs(data.auditLogs);
+        if (data?.updatedAt) setServerSyncedAt(data.updatedAt);
+      })
+      .catch(() => {});
+  };
 
   const showToast = (title: string, detail: string) => {
     setToast({
@@ -278,9 +407,32 @@ export default function App() {
     setMembers(GALATA_ROTARY_MEMBERS);
     setCommittees(INITIAL_CLUB_COMMITTEES);
     setPastPresidents(INITIAL_PAST_PRESIDENTS);
+    fetch('/api/pilot/reset', {
+      method: 'POST',
+      headers: { 'x-rotaclub-role': activeRole },
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data?.auditLogs) setAuditLogs(data.auditLogs);
+        if (data?.updatedAt) setServerSyncedAt(data.updatedAt);
+      })
+      .catch(() => {});
     showToast(
-      'RotaClub v3.0 Demo Verileri Sıfırlandı',
-      'Tüm LCV matrisi, kasa defteri, bursiyer fonu, toplantı bültenleri ve üye verileri başlangıç durumuna döndürüldü.'
+      'RotaClub Pilot Veritabanı Sıfırlandı',
+      'Tüm LCV matrisi, kasa defteri, bursiyer fonu, toplantı bültenleri ve sunucu verileri başlangıç durumuna döndürüldü.'
+    );
+  };
+
+  const handleDownloadBackup = () => {
+    window.location.href = '/api/pilot/backup';
+    recordServerAudit(
+      'Yönetim & Güvenlik',
+      'Tam Veritabanı & Denetim İzi Yedeği İndirildi (.JSON)',
+      'Galata Rotary Kulübü ortak veritabanı ve denetim geçmişi dışa aktarıldı.'
+    );
+    showToast(
+      'Tam Veritabanı Yedeği İndirildi (.JSON)',
+      'RotaClub_Galata_Pilot_Backup_v4.json dosyası sunucudan bilgisayarınıza indirildi.'
     );
   };
 
@@ -371,6 +523,11 @@ export default function App() {
       `LCV Güncellendi: ${statusLabels[status]}`,
       'Pera Palace Hotel canlı kuver listesi ve İsim İsim LCV Matrisi anında güncellendi.'
     );
+    recordServerAudit(
+      'LCV & Kuver',
+      `LCV Bildirimi Güncellendi (${statusLabels[status]})`,
+      `Rtn. Rifat Akın #${selectedMeetingNo} toplantı LCV durumunu "${statusLabels[status]}" olarak güncelledi.`
+    );
   };
 
   const handleChangeMenuPreference = (menu: MenuPreference) => {
@@ -381,6 +538,11 @@ export default function App() {
     showToast(
       `Menü Tercihi: ${menu}`,
       `Toplantı akşam yemeği tercihiniz "${menu} Menü" olarak kaydedildi.`
+    );
+    recordServerAudit(
+      'LCV & Kuver',
+      `Menü Tercihi Güncellendi (${menu})`,
+      `Rtn. Rifat Akın akşam yemeği menü tercihini "${menu}" olarak güncelledi.`
     );
   };
 
@@ -409,6 +571,12 @@ export default function App() {
       showToast(
         `Üye LCV Durumu Güncellendi: ${target.fullName}`,
         'Pera Palace Hotel canlı kuver toplamı yeni LCV durumuna göre yeniden hesaplandı.'
+      );
+      recordServerAudit(
+        'LCV & Kuver',
+        `Sekreterlik Kuver Matrisi Güncellemesi: ${target.fullName}`,
+        `${target.fullName} üyesinin LCV durumu "${status}" olarak Sekreterlik/Başkanlık tarafından güncellendi.`,
+        ['sekreter', 'baskan']
       );
     }
   };
@@ -519,6 +687,11 @@ export default function App() {
       'QR Yoklama Başarılı (+%2 Katılım)',
       '1842. Haftalık Toplantı yoklamanız işlendi ve devam yüzdeniz güncellendi.'
     );
+    recordServerAudit(
+      'QR Yoklama & Make-up',
+      'Pera Palace Masa QR Yoklama Okutuldu (+%2)',
+      'TR-2420-88412 (Rtn. Rifat Akın) #1842. Haftalık Toplantı salon giriş yoklaması sunucuya işlendi.'
+    );
   };
 
   const handleAddMakeupSubmission = (
@@ -538,6 +711,11 @@ export default function App() {
     showToast(
       'Make-up Bildirimi Onaylandı (+%3 Katılım)',
       `${payload.targetClubOrEvent} katılımınız devam oranınıza eklendi.`
+    );
+    recordServerAudit(
+      'QR Yoklama & Make-up',
+      `Make-up Bildirimi Kaydedildi: ${payload.targetClubOrEvent}`,
+      `${payload.activityType} (${payload.date}) katılımı devam oranına +%3 olarak işlendi.`
     );
   };
 
@@ -673,6 +851,12 @@ export default function App() {
       showToast(
         'Ödeme Onaylandı & Cari Bakiyeden Düşüldü',
         `${target.memberName} tarafından bildirilen ${formatTL(target.amount)} ödeme cari matristen düşüldü ve kasa defterine gelir işlendi.`
+      );
+      recordServerAudit(
+        'Saymanlık & Kasa',
+        `Dekont Onaylandı & Cari Hesaptan Düşüldü (${target.receiptRef})`,
+        `${target.memberName} (${formatTL(target.amount)} · ${target.category}) ödemesi Saymanlık tarafından onaylandı.`,
+        ['sayman', 'baskan']
       );
     }
   };
@@ -873,6 +1057,8 @@ export default function App() {
         onOpenSplashModal={() => setIsSplashModalOpen(true)}
         onResetDemoData={handleResetDemoData}
         onSelectTenantClub={handleSelectTenantClub}
+        onOpenAuditModal={() => setIsAuditModalOpen(true)}
+        auditCount={auditLogs.length}
       />
 
       {/* Live Toast Feedback Banner */}
@@ -1030,6 +1216,16 @@ export default function App() {
         card={activeCertificateCard}
         termInfo={termInfo}
         onClose={() => setActiveCertificateCard(null)}
+      />
+
+      {/* Server RBAC, Audit Log & JSON Backup Modal (#14, #18, #19, #22, #23) */}
+      <PilotAuditAndBackupModal
+        isOpen={isAuditModalOpen}
+        onClose={() => setIsAuditModalOpen(false)}
+        activeRole={activeRole}
+        auditLogs={auditLogs}
+        serverSyncedAt={serverSyncedAt}
+        onDownloadBackup={handleDownloadBackup}
       />
 
       {/* iOS / PWA Bottom Navigation Bar */}
