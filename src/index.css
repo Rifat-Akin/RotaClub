@@ -29,3 +29,42 @@
 .tabular-nums {
   font-variant-numeric: tabular-nums;
 }
+
+.perspective-1000 {
+  perspective: 1200px;
+}
+
+.transform-style-3d {
+  transform-style: preserve-3d;
+}
+
+.backface-hidden {
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+
+.rotate-y-180 {
+  transform: rotateY(180deg);
+}
+
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  #printable-makeup-certificate,
+  #printable-makeup-certificate * {
+    visibility: visible;
+  }
+  #printable-makeup-certificate {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 100%;
+    margin: 0;
+    padding: 24px;
+    box-shadow: none !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+}

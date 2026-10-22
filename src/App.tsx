@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { CheckCircle2, Sparkles, X } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { CheckCircle2, X } from 'lucide-react';
 import {
   CelebrationItem,
   ClubRole,
@@ -14,7 +14,9 @@ import {
   RitualStep,
   RotaryMember,
   RsvpStatus,
+  SpeakerProposal,
   TabId,
+  TenantClubOption,
   TermBoardInfo,
   WeeklyMeeting,
 } from './types/rotary';
@@ -31,6 +33,7 @@ import {
   INITIAL_OVERDUE_MEMBERS,
   INITIAL_PAYMENT_NOTIFICATIONS,
   INITIAL_RITUAL_STEPS,
+  INITIAL_SPEAKER_PROPOSALS,
   INITIAL_TERM_BOARD,
   UPCOMING_MEETING,
 } from './data/mockGalataData';
@@ -38,8 +41,10 @@ import {
   calculateKuverSummary,
   calculateMemberFinanceSummary,
   calculateUpdatedAttendance,
+  createSpeakerProposal,
   executeJulyFirstRollover,
   formatTL,
+  toggleVoteSpeakerProposal,
 } from './utils/rotaryLogic';
 import { HeaderAndRoleBar } from './components/HeaderAndRoleBar';
 import { BottomNav } from './components/BottomNav';
@@ -49,6 +54,8 @@ import { FinanceTab } from './components/FinanceTab';
 import { ProjectsTab } from './components/ProjectsTab';
 import { DirectoryAndProfileTab } from './components/DirectoryAndProfileTab';
 import { AppleWalletModal } from './components/AppleWalletModal';
+import { SplashLockScreenModal } from './components/SplashLockScreenModal';
+import { OfficialMakeupCertificateModal } from './components/OfficialMakeupCertificateModal';
 
 interface ToastMessage {
   id: string;
@@ -56,50 +63,139 @@ interface ToastMessage {
   detail: string;
 }
 
+const STORAGE_KEY = 'rotaclub_v2_galata_state';
+
+function loadPersistedState<T>(key: string, fallback: T): T {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw);
+    return parsed && parsed[key] !== undefined ? parsed[key] : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 export default function App() {
   // Core Navigation & Role State
-  const [activeRole, setActiveRole] = useState<ClubRole>('uye');
+  const [activeRole, setActiveRole] = useState<ClubRole>(() =>
+    loadPersistedState('activeRole', 'uye')
+  );
   const [activeTab, setActiveTab] = useState<TabId>('home');
   const [toast, setToast] = useState<ToastMessage | null>(null);
+  const [isSplashModalOpen, setIsSplashModalOpen] = useState(false);
 
   // Term & Rollover State
-  const [termInfo, setTermInfo] = useState<TermBoardInfo>(INITIAL_TERM_BOARD);
+  const [termInfo, setTermInfo] = useState<TermBoardInfo>(() =>
+    loadPersistedState('termInfo', INITIAL_TERM_BOARD)
+  );
 
-  // Tab 1: Home & Meeting Cockpit State
-  const [meeting, setMeeting] = useState<WeeklyMeeting>(UPCOMING_MEETING);
-  const [rsvpStatus, setRsvpStatus] = useState<RsvpStatus>('attending');
-  const [menuPreference, setMenuPreference] = useState<MenuPreference>('Standart');
-  const [guestNameInput, setGuestNameInput] = useState('Mim. Caner Erkin — Kentsel Tasarım');
-  const [ritualSteps, setRitualSteps] = useState<RitualStep[]>(INITIAL_RITUAL_STEPS);
-  const [celebrations, setCelebrations] = useState<CelebrationItem[]>(INITIAL_CELEBRATIONS);
+  // Tab 1: Home, Speaker Pool & Meeting Cockpit State
+  const [meeting, setMeeting] = useState<WeeklyMeeting>(() =>
+    loadPersistedState('meeting', UPCOMING_MEETING)
+  );
+  const [rsvpStatus, setRsvpStatus] = useState<RsvpStatus>(() =>
+    loadPersistedState('rsvpStatus', 'attending')
+  );
+  const [menuPreference, setMenuPreference] = useState<MenuPreference>(() =>
+    loadPersistedState('menuPreference', 'Standart')
+  );
+  const [guestNameInput, setGuestNameInput] = useState<string>(() =>
+    loadPersistedState('guestNameInput', 'Mim. Caner Erkin — Kentsel Tasarım')
+  );
+  const [ritualSteps, setRitualSteps] = useState<RitualStep[]>(() =>
+    loadPersistedState('ritualSteps', INITIAL_RITUAL_STEPS)
+  );
+  const [celebrations, setCelebrations] = useState<CelebrationItem[]>(() =>
+    loadPersistedState('celebrations', INITIAL_CELEBRATIONS)
+  );
+  const [speakerProposals, setSpeakerProposals] = useState<SpeakerProposal[]>(() =>
+    loadPersistedState('speakerProposals', INITIAL_SPEAKER_PROPOSALS)
+  );
 
   // Tab 2: Operations (QR, Make-up, Fireside) State
-  const [qrCheckedIn, setQrCheckedIn] = useState(false);
+  const [qrCheckedIn, setQrCheckedIn] = useState<boolean>(() =>
+    loadPersistedState('qrCheckedIn', false)
+  );
   const [makeupSubmissions, setMakeupSubmissions] = useState<MakeupSubmission[]>(
-    INITIAL_MAKEUP_SUBMISSIONS
+    () => loadPersistedState('makeupSubmissions', INITIAL_MAKEUP_SUBMISSIONS)
   );
   const [guestMakeupCards, setGuestMakeupCards] = useState<GuestRotaryMakeupCard[]>(
-    INITIAL_GUEST_MAKEUP_CARDS
+    () => loadPersistedState('guestMakeupCards', INITIAL_GUEST_MAKEUP_CARDS)
   );
-  const [firesideGroups, setFiresideGroups] = useState<FiresideGroup[]>(
-    INITIAL_FIRESIDE_GROUPS
+  const [activeCertificateCard, setActiveCertificateCard] =
+    useState<GuestRotaryMakeupCard | null>(null);
+  const [firesideGroups, setFiresideGroups] = useState<FiresideGroup[]>(() =>
+    loadPersistedState('firesideGroups', INITIAL_FIRESIDE_GROUPS)
   );
 
   // Tab 3: Finance & Treasurer State
   const [financialItems] = useState<FinancialLineItem[]>(INITIAL_FINANCIAL_ITEMS);
-  const [paymentNotifications, setPaymentNotifications] = useState<PaymentNotification[]>(
-    INITIAL_PAYMENT_NOTIFICATIONS
-  );
-  const [overdueMembers, setOverdueMembers] = useState<OverdueMemberItem[]>(
-    INITIAL_OVERDUE_MEMBERS
+  const [paymentNotifications, setPaymentNotifications] = useState<
+    PaymentNotification[]
+  >(() => loadPersistedState('paymentNotifications', INITIAL_PAYMENT_NOTIFICATIONS));
+  const [overdueMembers, setOverdueMembers] = useState<OverdueMemberItem[]>(() =>
+    loadPersistedState('overdueMembers', INITIAL_OVERDUE_MEMBERS)
   );
 
   // Tab 4: Galata Projects State
-  const [projects, setProjects] = useState<GalataProject[]>(INITIAL_GALATA_PROJECTS);
+  const [projects, setProjects] = useState<GalataProject[]>(() =>
+    loadPersistedState('projects', INITIAL_GALATA_PROJECTS)
+  );
 
   // Tab 5: Classification Directory & Apple Wallet Modal State
   const [members] = useState<RotaryMember[]>(GALATA_ROTARY_MEMBERS);
-  const [walletModalMember, setWalletModalMember] = useState<RotaryMember | null>(null);
+  const [walletModalMember, setWalletModalMember] = useState<RotaryMember | null>(
+    null
+  );
+
+  // Sync document.title and persist core state to localStorage
+  useEffect(() => {
+    document.title = 'RotaClub — Galata Rotary Kulübü · 2420. Bölge';
+  }, []);
+
+  useEffect(() => {
+    try {
+      const stateToPersist = {
+        activeRole,
+        termInfo,
+        meeting,
+        rsvpStatus,
+        menuPreference,
+        guestNameInput,
+        ritualSteps,
+        celebrations,
+        speakerProposals,
+        qrCheckedIn,
+        makeupSubmissions,
+        guestMakeupCards,
+        firesideGroups,
+        paymentNotifications,
+        overdueMembers,
+        projects,
+      };
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToPersist));
+    } catch {
+      // Ignore storage quota errors in restricted contexts
+    }
+  }, [
+    activeRole,
+    termInfo,
+    meeting,
+    rsvpStatus,
+    menuPreference,
+    guestNameInput,
+    ritualSteps,
+    celebrations,
+    speakerProposals,
+    qrCheckedIn,
+    makeupSubmissions,
+    guestMakeupCards,
+    firesideGroups,
+    paymentNotifications,
+    overdueMembers,
+    projects,
+  ]);
 
   const showToast = (title: string, detail: string) => {
     setToast({
@@ -109,12 +205,45 @@ export default function App() {
     });
   };
 
+  // Demo Reset Handler
+  const handleResetDemoData = () => {
+    try {
+      window.localStorage.removeItem(STORAGE_KEY);
+    } catch {
+      // ignore
+    }
+    setActiveRole('uye');
+    setTermInfo(INITIAL_TERM_BOARD);
+    setMeeting(UPCOMING_MEETING);
+    setRsvpStatus('attending');
+    setMenuPreference('Standart');
+    setGuestNameInput('Mim. Caner Erkin — Kentsel Tasarım');
+    setRitualSteps(INITIAL_RITUAL_STEPS);
+    setCelebrations(INITIAL_CELEBRATIONS);
+    setSpeakerProposals(INITIAL_SPEAKER_PROPOSALS);
+    setQrCheckedIn(false);
+    setMakeupSubmissions(INITIAL_MAKEUP_SUBMISSIONS);
+    setGuestMakeupCards(INITIAL_GUEST_MAKEUP_CARDS);
+    setFiresideGroups(INITIAL_FIRESIDE_GROUPS);
+    setPaymentNotifications(INITIAL_PAYMENT_NOTIFICATIONS);
+    setOverdueMembers(INITIAL_OVERDUE_MEMBERS);
+    setProjects(INITIAL_GALATA_PROJECTS);
+    showToast(
+      'RotaClub Demo Verileri Sıfırlandı',
+      'Tüm LCV, bakiye, make-up, proje bağışı ve dönem verileri sunum başlangıç durumuna döndürüldü.'
+    );
+  };
+
   // Derived Calculations via Pure Logic
   const extraMakeupsCount = Math.max(
     0,
     makeupSubmissions.length - INITIAL_MAKEUP_SUBMISSIONS.length
   );
-  const attendancePercent = calculateUpdatedAttendance(92, extraMakeupsCount, qrCheckedIn);
+  const attendancePercent = calculateUpdatedAttendance(
+    92,
+    extraMakeupsCount,
+    qrCheckedIn
+  );
 
   const kuverSummary = calculateKuverSummary(
     INITIAL_OTHER_MEMBER_RSVPS,
@@ -148,6 +277,20 @@ export default function App() {
     );
   };
 
+  const handleSelectTenantClub = (tenant: TenantClubOption) => {
+    if (tenant.id === 'club-galata') {
+      showToast(
+        'Galata Rotary Kulübü (Aktif Oturum)',
+        'RotaClub çoklu kulüp (Multi-Tenant) mimarisinde Galata Rotary Kulübü verileri görüntüleniyor.'
+      );
+    } else {
+      showToast(
+        `RotaClub Bölge Demosu: ${tenant.name}`,
+        `${tenant.district} (${tenant.meetingDay}) modülü RotaClub SaaS altyapısında hazır durumda.`
+      );
+    }
+  };
+
   const handleChangeRsvpStatus = (status: RsvpStatus) => {
     setRsvpStatus(status);
     const statusLabels: Record<RsvpStatus, string> = {
@@ -158,7 +301,7 @@ export default function App() {
     };
     showToast(
       `LCV Güncellendi: ${statusLabels[status]}`,
-      'Pera Palace Hotel canlı kuver listesi anında güncellendi.'
+      'Pera Palace Hotel canlı kuver listesi anında güncellendi ve hafızaya kaydedildi.'
     );
   };
 
@@ -167,6 +310,32 @@ export default function App() {
     showToast(
       `Menü Tercihi: ${menu}`,
       `Toplantı akşam yemeği tercihiniz "${menu} Menü" olarak kaydedildi.`
+    );
+  };
+
+  const handleToggleVoteSpeaker = (proposalId: string) => {
+    setSpeakerProposals((prev) => toggleVoteSpeakerProposal(prev, proposalId));
+    showToast(
+      'Konuk Konuşmacı Oylaması Güncellendi',
+      'Oyunuz Program Komitesi konuşmacı havuzuna işlendi.'
+    );
+  };
+
+  const handleAddSpeakerProposal = (input: {
+    speakerName: string;
+    speakerTitle: string;
+    proposedTopic: string;
+    targetMonth: string;
+  }) => {
+    setSpeakerProposals((prev) =>
+      createSpeakerProposal(prev, {
+        ...input,
+        proposedBy: 'Rtn. Rifat Akın',
+      })
+    );
+    showToast(
+      `Yeni Konuşmacı Önerisi: ${input.speakerName}`,
+      `“${input.proposedTopic}” başlığı konuşmacı havuzuna eklendi ve oylamaya açıldı.`
     );
   };
 
@@ -222,7 +391,10 @@ export default function App() {
   };
 
   const handleAddMakeupSubmission = (
-    payload: Omit<MakeupSubmission, 'id' | 'status' | 'attendanceBoost' | 'memberName'>
+    payload: Omit<
+      MakeupSubmission,
+      'id' | 'status' | 'attendanceBoost' | 'memberName'
+    >
   ) => {
     const newEntry: MakeupSubmission = {
       id: `mk-${Date.now()}`,
@@ -248,9 +420,10 @@ export default function App() {
       verificationCode: `GLR-2420-${Math.floor(1000 + Math.random() * 8999)}`,
     };
     setGuestMakeupCards((prev) => [newCard, ...prev]);
+    setActiveCertificateCard(newCard);
     showToast(
-      'Dijital Make-up Kartı Gönderildi',
-      `${payload.guestName} (${payload.guestClub}) için Galata Rotary antetli resmi belge ${payload.guestEmail} adresine iletildi.`
+      'Resmi Dijital Make-up Sertifikası Hazır',
+      `${payload.guestName} (${payload.guestClub}) için ıslak imzalı ve mühürlü katılım belgesi oluşturuldu.`
     );
   };
 
@@ -395,7 +568,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F8FAFC] text-[#0F172A] pb-24">
-      {/* Top Bar & Role Simulator */}
+      {/* Top Bar, Multi-Tenant Switcher & Role Simulator */}
       <HeaderAndRoleBar
         activeRole={activeRole}
         onSelectRole={handleSelectRole}
@@ -406,6 +579,9 @@ export default function App() {
             members.find((m) => m.id === 'm-rifat') || members[0]
           )
         }
+        onOpenSplashModal={() => setIsSplashModalOpen(true)}
+        onResetDemoData={handleResetDemoData}
+        onSelectTenantClub={handleSelectTenantClub}
       />
 
       {/* Live Toast Feedback Banner */}
@@ -455,6 +631,9 @@ export default function App() {
             onCongratulateMember={handleCongratulateMember}
             onAdvanceCertificateStatus={handleAdvanceCertificateStatus}
             onSendHotelKuverReport={handleSendHotelKuverReport}
+            speakerProposals={speakerProposals}
+            onToggleVoteSpeaker={handleToggleVoteSpeaker}
+            onAddSpeakerProposal={handleAddSpeakerProposal}
           />
         )}
 
@@ -468,6 +647,9 @@ export default function App() {
             onAddMakeupSubmission={handleAddMakeupSubmission}
             guestMakeupCards={guestMakeupCards}
             onSendGuestMakeupCard={handleSendGuestMakeupCard}
+            onOpenOfficialCertificateModal={(card) =>
+              setActiveCertificateCard(card)
+            }
             firesideGroups={firesideGroups}
             onSubmitFiresideReport={handleSubmitFiresideReport}
           />
@@ -509,12 +691,31 @@ export default function App() {
         )}
       </main>
 
-      {/* Apple Wallet Digital Rotary ID Modal */}
+      {/* 3D Flip Apple Wallet Digital Rotary ID Modal */}
       <AppleWalletModal
         member={walletModalMember}
         termInfo={termInfo}
         onClose={() => setWalletModalMember(null)}
         onCopyVCard={handleCopyVCard}
+      />
+
+      {/* Full-Screen iOS Splash / Lock Screen Modal */}
+      <SplashLockScreenModal
+        isOpen={isSplashModalOpen}
+        onUnlock={() => {
+          setIsSplashModalOpen(false);
+          showToast(
+            'Face ID ile Giriş Başarılı',
+            'RotaClub — Galata Rotary Kulübü güvenli oturumu doğrulandı.'
+          );
+        }}
+      />
+
+      {/* Printable Official Digital Make-up Certificate Modal */}
+      <OfficialMakeupCertificateModal
+        card={activeCertificateCard}
+        termInfo={termInfo}
+        onClose={() => setActiveCertificateCard(null)}
       />
 
       {/* iOS / PWA Bottom Navigation Bar */}

@@ -184,3 +184,23 @@ export interface TermBoardInfo {
     archivedAt: string;
   };
 }
+
+export interface SpeakerProposal {
+  id: string;
+  speakerName: string;
+  speakerTitle: string;
+  proposedTopic: string;
+  proposedBy: string;
+  votes: number;
+  hasVoted: boolean;
+  targetMonth: string;
+}
+
+export interface TenantClubOption {
+  id: string;
+  name: string;
+  district: string;
+  status: 'Aktif' | 'Yakında' | 'Bölge Merkezi';
+  membersCount: number;
+  meetingDay: string;
+}

@@ -11,9 +11,79 @@ import {
   PaymentNotification,
   RitualStep,
   RotaryMember,
+  SpeakerProposal,
+  TenantClubOption,
   TermBoardInfo,
   WeeklyMeeting,
 } from '../types/rotary';
+
+export const ROTA_CLUB_TENANTS: TenantClubOption[] = [
+  {
+    id: 'club-galata',
+    name: 'Galata Rotary (Aktif)',
+    district: 'UR 2420. Bölge · Kulüp #28419',
+    status: 'Aktif',
+    membersCount: 42,
+    meetingDay: 'Salı 19:30 · Pera Palace Hotel',
+  },
+  {
+    id: 'club-karakoy',
+    name: 'Karaköy Rotary (Yakında)',
+    district: 'UR 2420. Bölge · Kardeş Kulüp',
+    status: 'Yakında',
+    membersCount: 38,
+    meetingDay: 'Çarşamba 19:30 · JW Marriott Bosphorus',
+  },
+  {
+    id: 'club-macka',
+    name: 'Maçka Rotary (Yakında)',
+    district: 'UR 2420. Bölge · Komşu Kulüp',
+    status: 'Yakında',
+    membersCount: 46,
+    meetingDay: 'Perşembe 19:30 · Swissôtel The Bosphorus',
+  },
+  {
+    id: 'club-district2420',
+    name: 'Bölge 2420 Guvernörlük',
+    district: 'UR 2420. Bölge Federasyonu Kokpiti',
+    status: 'Bölge Merkezi',
+    membersCount: 2150,
+    meetingDay: '82 Kulüp · Bölge Veri Senkronizasyonu',
+  },
+];
+
+export const INITIAL_SPEAKER_PROPOSALS: SpeakerProposal[] = [
+  {
+    id: 'spk-101',
+    speakerName: 'Prof. Dr. Bülent Somay',
+    speakerTitle: 'Kültür Araştırmacısı & Yazar',
+    proposedTopic: 'Beyoğlu ve Pera’da Edebiyat, Sinema ve Kent Belleği',
+    proposedBy: 'Rtn. Defne Serezli',
+    votes: 19,
+    hasVoted: false,
+    targetMonth: 'Kasım 2026',
+  },
+  {
+    id: 'spk-102',
+    speakerName: 'Dr. Sertaç Doğanay',
+    speakerTitle: 'Teknoloji Stratejisti & Sürdürülebilirlik Danışmanı',
+    proposedTopic: 'Üretken Yapay Zeka Çağında Etik Liderlik ve İnsani Hizmet',
+    proposedBy: 'Rtn. Rifat Akın',
+    votes: 16,
+    hasVoted: true,
+    targetMonth: 'Kasım 2026',
+  },
+  {
+    id: 'spk-103',
+    speakerName: 'Kaptan Dr. Özlem Çekiç',
+    speakerTitle: 'Deniz Hukuku ve Boğazlar Güvenliği Uzmanı',
+    proposedTopic: 'Türk Boğazlarında Yeşil Denizcilik Koridorları ve Hukuki Boyutu',
+    proposedBy: 'Rtn. Av. Nazlı Denizmen',
+    votes: 12,
+    hasVoted: false,
+    targetMonth: 'Aralık 2026',
+  },
+];
 
 export const INITIAL_TERM_BOARD: TermBoardInfo = {
   termLabel: '2026-2027 Dönemi',

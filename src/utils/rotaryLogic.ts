@@ -229,3 +229,49 @@ export function formatTL(amount: number): string {
   }).format(amount);
   return `${formattedNumber} TL`;
 }
+
+/**
+ * Toggles +1 vote for a speaker proposal in the Guest Speaker Pool and sorts descending by votes.
+ */
+export function toggleVoteSpeakerProposal(
+  proposals: SpeakerProposal[],
+  proposalId: string
+): SpeakerProposal[] {
+  return proposals
+    .map((p) => {
+      if (p.id !== proposalId) return p;
+      const nextHasVoted = !p.hasVoted;
+      return {
+        ...p,
+        hasVoted: nextHasVoted,
+        votes: nextHasVoted ? p.votes + 1 : Math.max(0, p.votes - 1),
+      };
+    })
+    .sort((a, b) => b.votes - a.votes);
+}
+
+/**
+ * Adds a new speaker proposal to the pool with 1 initial vote from the proposer.
+ */
+export function createSpeakerProposal(
+  proposals: SpeakerProposal[],
+  input: {
+    speakerName: string;
+    speakerTitle: string;
+    proposedTopic: string;
+    proposedBy: string;
+    targetMonth: string;
+  }
+): SpeakerProposal[] {
+  const newEntry: SpeakerProposal = {
+    id: `spk-${Date.now()}`,
+    speakerName: input.speakerName.trim(),
+    speakerTitle: input.speakerTitle.trim(),
+    proposedTopic: input.proposedTopic.trim(),
+    proposedBy: input.proposedBy.trim() || 'Rtn. Rifat Akın',
+    votes: 1,
+    hasVoted: true,
+    targetMonth: input.targetMonth.trim() || 'Kasım 2026',
+  };
+  return [newEntry, ...proposals].sort((a, b) => b.votes - a.votes);
+}

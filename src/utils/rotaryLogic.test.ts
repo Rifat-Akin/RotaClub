@@ -5,8 +5,10 @@ import {
   calculateMemberFinanceSummary,
   calculateProjectProgress,
   calculateUpdatedAttendance,
+  createSpeakerProposal,
   executeJulyFirstRollover,
   filterMembersByQueryAndClassification,
+  toggleVoteSpeakerProposal,
 } from './rotaryLogic';
 import {
   FinancialLineItem,
@@ -173,4 +175,32 @@ test('executeJulyFirstRollover transitions term to 2027-2028 and creates digital
   assert.equal(rolled.termLabel, '2027-2028 Dönemi');
   assert.ok(rolled.archivedYearbook);
   assert.equal(rolled.archivedYearbook?.termLabel, '2026-2027 Dönemi');
+});
+
+test('toggleVoteSpeakerProposal and createSpeakerProposal manage speaker pool votes and ordering', () => {
+  const initialPool = [
+    {
+      id: 'sp-1',
+      speakerName: 'Prof. Dr. Özgür Demirtaş',
+      speakerTitle: 'Sabancı Üniversitesi Finans Kürsüsü Başkanı',
+      proposedTopic: 'Küresel Ekonomi ve Yapay Zeka Devrimi',
+      proposedBy: 'Rtn. Selim Koçak',
+      votes: 14,
+      hasVoted: false,
+      targetMonth: 'Kasım 2026',
+    },
+  ];
+
+  const afterVote = toggleVoteSpeakerProposal(initialPool, 'sp-1');
+  assert.equal(afterVote[0].votes, 15);
+  assert.equal(afterVote[0].hasVoted, true);
+
+  const afterAdd = createSpeakerProposal(afterVote, {
+    speakerName: 'Doç. Dr. Ferhat Çelik',
+    speakerTitle: 'İTÜ Denizcilik Fakültesi',
+    proposedTopic: 'Boğaziçi Deniz Ekosistemi',
+    proposedBy: 'Rtn. Rifat Akın',
+    targetMonth: 'Aralık 2026',
+  });
+  assert.equal(afterAdd.length, 2);
 });

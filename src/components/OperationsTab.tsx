@@ -1,15 +1,10 @@
 import React, { useState } from 'react';
 import {
-  CheckCircle2,
   Flame,
-  Mail,
-  MapPin,
   PlusCircle,
+  Printer,
   QrCode,
   Send,
-  ShieldCheck,
-  Sparkles,
-  Users,
 } from 'lucide-react';
 import {
   ClubRole,
@@ -25,9 +20,14 @@ interface OperationsTabProps {
   qrCheckedIn: boolean;
   onSimulateQrCheckIn: () => void;
   makeupSubmissions: MakeupSubmission[];
-  onAddMakeupSubmission: (submission: Omit<MakeupSubmission, 'id' | 'status' | 'attendanceBoost' | 'memberName'>) => void;
+  onAddMakeupSubmission: (
+    submission: Omit<MakeupSubmission, 'id' | 'status' | 'attendanceBoost' | 'memberName'>
+  ) => void;
   guestMakeupCards: GuestRotaryMakeupCard[];
-  onSendGuestMakeupCard: (card: Omit<GuestRotaryMakeupCard, 'id' | 'sentAt' | 'verificationCode'>) => void;
+  onSendGuestMakeupCard: (
+    card: Omit<GuestRotaryMakeupCard, 'id' | 'sentAt' | 'verificationCode'>
+  ) => void;
+  onOpenOfficialCertificateModal: (card: GuestRotaryMakeupCard) => void;
   firesideGroups: FiresideGroup[];
   onSubmitFiresideReport: (groupId: string, summary: string, attendanceRate: string) => void;
 }
@@ -41,14 +41,18 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
   onAddMakeupSubmission,
   guestMakeupCards,
   onSendGuestMakeupCard,
+  onOpenOfficialCertificateModal,
   firesideGroups,
   onSubmitFiresideReport,
 }) => {
-  const [makeupSubTab, setMakeupSubTab] = useState<'member_makeup' | 'guest_makeup'>('member_makeup');
+  const [makeupSubTab, setMakeupSubTab] = useState<'member_makeup' | 'guest_makeup'>(
+    'member_makeup'
+  );
 
   // Member Make-up Form State
   const [targetClub, setTargetClub] = useState('Karaköy Rotary Kulübü Toplantısı');
-  const [activityType, setActivityType] = useState<MakeupSubmission['activityType']>('Kulüp Toplantısı');
+  const [activityType, setActivityType] =
+    useState<MakeupSubmission['activityType']>('Kulüp Toplantısı');
   const [makeupDate, setMakeupDate] = useState('2026-10-22');
   const [makeupDesc, setMakeupDesc] = useState('');
   const [makeupError, setMakeupError] = useState('');
@@ -69,7 +73,9 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
   const handleMemberMakeupSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!targetClub.trim() || !makeupDesc.trim()) {
-      setMakeupError('Lütfen katıldığınız kulüp/etkinlik adını ve kısa açıklamayı giriniz.');
+      setMakeupError(
+        'Lütfen katıldığınız kulüp/etkinlik adını ve kısa açıklamayı giriniz.'
+      );
       return;
     }
     setMakeupError('');
@@ -85,7 +91,9 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
   const handleGuestCardSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!guestName.trim() || !guestClub.trim() || !guestEmail.trim()) {
-      setGuestFormError('Lütfen misafir Rotaryenin adını, kulübünü ve e-posta adresini eksiksiz giriniz.');
+      setGuestFormError(
+        'Lütfen misafir Rotaryenin adını, kulübünü ve e-posta adresini eksiksiz giriniz.'
+      );
       return;
     }
     setGuestFormError('');
@@ -154,7 +162,6 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                     <rect x="90" y="14" width="16" height="16" fill="currentColor" />
                     <rect x="6" y="82" width="32" height="32" fill="none" stroke="currentColor" strokeWidth="6" />
                     <rect x="14" y="90" width="16" height="16" fill="currentColor" />
-                    {/* QR Data Matrix Pattern */}
                     <rect x="46" y="10" width="8" height="8" fill="currentColor" />
                     <rect x="62" y="10" width="8" height="16" fill="currentColor" />
                     <rect x="46" y="26" width="12" height="8" fill="currentColor" />
@@ -188,7 +195,9 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                 <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs space-y-1">
                   <div className="flex justify-between">
                     <span className="text-slate-500">Üye Sicil No:</span>
-                    <span className="font-mono-num font-semibold text-slate-900">TR-2420-88412</span>
+                    <span className="font-mono-num font-semibold text-slate-900">
+                      TR-2420-88412
+                    </span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-slate-500">Toplantı Durumu:</span>
@@ -303,14 +312,18 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                         id="makeup-type-select"
                         value={activityType}
                         onChange={(e) =>
-                          setActivityType(e.target.value as MakeupSubmission['activityType'])
+                          setActivityType(
+                            e.target.value as MakeupSubmission['activityType']
+                          )
                         }
                         className="w-full text-sm bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-slate-900 focus:outline-none focus:bg-white focus:border-[#0C3C7C]"
                       >
                         <option value="Kulüp Toplantısı">Başka Kulüp Toplantısı</option>
                         <option value="Hizmet Projesi">Kulüp Hizmet Projesi</option>
                         <option value="Bölge Semineri">UR 2420. Bölge Semineri</option>
-                        <option value="Komite Toplantısı">Bölge / Kulüp Komite Toplantısı</option>
+                        <option value="Komite Toplantısı">
+                          Bölge / Kulüp Komite Toplantısı
+                        </option>
                       </select>
                     </div>
                   </div>
@@ -371,14 +384,19 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                   </div>
                   <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
                     {makeupSubmissions.map((mk) => (
-                      <div key={mk.id} className="p-3 bg-white flex items-start justify-between gap-3">
+                      <div
+                        key={mk.id}
+                        className="p-3 bg-white flex items-start justify-between gap-3"
+                      >
                         <div className="min-w-0">
                           <div className="text-xs font-semibold text-slate-900">
                             {mk.targetClubOrEvent}
                           </div>
                           <div className="text-[11px] text-slate-500 mt-0.5">
                             <span>{mk.activityType}</span>
-                            <span className="mx-1.5" aria-hidden="true">·</span>
+                            <span className="mx-1.5" aria-hidden="true">
+                              ·
+                            </span>
                             <span className="font-mono-num">{mk.date}</span>
                           </div>
                           <p className="text-xs text-slate-600 mt-1">{mk.description}</p>
@@ -402,7 +420,7 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                 {activeRole !== 'sekreter' && activeRole !== 'baskan' && (
                   <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 flex flex-wrap items-center justify-between gap-3">
                     <p className="text-xs text-amber-900">
-                      Resmi antetli <strong>Dijital Make-up Kartı</strong> gönderimi Genel Sekreter ve Başkan yetkisindedir. Önizlemeyi test edebilir veya tek tuşla Genel Sekreter rolüne geçebilirsiniz.
+                      Resmi antetli <strong>Dijital Make-up Sertifikası</strong> gönderimi Genel Sekreter ve Başkan yetkisindedir. Önizlemeyi test edebilir veya tek tuşla Genel Sekreter rolüne geçebilirsiniz.
                     </p>
                     <button
                       type="button"
@@ -473,7 +491,7 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                   )}
 
                   {/* Official Galata Rotary Letterhead Digital Make-up Card Preview */}
-                  <div className="rounded-2xl border-2 border-[#0C3C7C]/25 bg-gradient-to-br from-white via-slate-50 to-[#F8FAFC] p-5 space-y-4 shadow-xs">
+                  <div className="rounded-2xl border-2 border-[#F7A81B]/60 bg-gradient-to-br from-[#FFFDF9] via-white to-[#F8FAFC] p-5 space-y-4 shadow-xs">
                     <div className="flex items-center justify-between gap-3 border-b border-slate-200 pb-3">
                       <div className="flex items-center gap-2.5">
                         <div className="w-9 h-9 rounded-lg bg-[#0C3C7C] text-[#F7A81B] flex items-center justify-center shrink-0">
@@ -481,10 +499,10 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                         </div>
                         <div>
                           <div className="font-serif-display text-base font-bold text-[#0C3C7C]">
-                            GALATA ROTARY KULÜBÜ — UR 2420. BÖLGE
+                            ROTACLUB · GALATA ROTARY KULÜBÜ (UR 2420. BÖLGE)
                           </div>
                           <div className="text-[11px] text-slate-500">
-                            Resmi Dijital Make-up Katılım Belgesi (Official Attendance Make-up Card)
+                            Resmi Dijital Make-up Katılım Belgesi (Islak İmzalı & Mühürlü Sertifika)
                           </div>
                         </div>
                       </div>
@@ -500,8 +518,10 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                       </p>
                       <p>
                         Kulübünüzün değerli üyesi{' '}
-                        <strong className="text-[#0C3C7C]">{guestName || 'Misafir Rotaryen'}</strong>,
-                        27 Ekim 2026 Salı günü Pera Palace Hotel Galata Salonu’nda gerçekleştirdiğimiz{' '}
+                        <strong className="text-[#0C3C7C]">
+                          {guestName || 'Misafir Rotaryen'}
+                        </strong>
+                        , 27 Ekim 2026 Salı günü Pera Palace Hotel Galata Salonu’nda gerçekleştirdiğimiz{' '}
                         <strong>1842. Haftalık Kulüp Toplantımıza</strong> katılarak bizleri onurlandırmıştır.
                         Üyenizin devam çizelgesinde <strong>Make-up</strong> olarak işlenmesini rica eder,
                         Rotaryen sevgi ve saygılarımızı sunarız.
@@ -517,21 +537,19 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                       </div>
                       <div className="text-right">
                         <span className="font-semibold text-slate-800">
-                          Rtn. Av. Nazlı Denizmen
+                          Dönem Başkanı & Genel Sekreter Islak İmzalı
                         </span>
-                        <span className="mx-1">·</span>
-                        <span>Galata RK Genel Sekreteri</span>
                       </div>
                     </div>
                   </div>
 
                   <button
                     type="submit"
-                    className="w-full min-h-[44px] py-2.5 px-4 rounded-xl bg-[#0C3C7C] text-white text-xs font-semibold hover:bg-[#17458F] transition-colors flex items-center justify-center gap-2 cursor-pointer"
+                    className="w-full min-h-[46px] py-2.5 px-4 rounded-xl bg-[#0C3C7C] text-white text-xs font-semibold hover:bg-[#17458F] transition-colors flex items-center justify-center gap-2 cursor-pointer"
                   >
-                    <Send className="w-4 h-4" />
+                    <Send className="w-4 h-4 text-[#F7A81B]" />
                     <span>
-                      Galata Rotary Antetli Dijital Make-up Kartını Kulübüne Gönder
+                      Resmi Make-up Katılım Belgesini Oluştur, Gönder & Yazdırılabilir Sertifikayı Aç
                     </span>
                   </button>
                 </form>
@@ -539,13 +557,13 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                 {/* Sent Guest Make-up History */}
                 <div className="space-y-2 pt-2 border-t border-slate-100">
                   <div className="text-xs font-semibold text-slate-700">
-                    Gönderilen Misafir Rotaryen Make-up Kartları ({guestMakeupCards.length})
+                    Gönderilen Misafir Rotaryen Make-up Sertifikaları ({guestMakeupCards.length})
                   </div>
                   <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
                     {guestMakeupCards.map((card) => (
                       <div
                         key={card.id}
-                        className="p-3 bg-white flex items-center justify-between gap-3 text-xs"
+                        className="p-3 bg-white flex flex-wrap items-center justify-between gap-3 text-xs"
                       >
                         <div>
                           <div className="font-semibold text-slate-900">
@@ -553,12 +571,24 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                           </div>
                           <div className="text-[11px] text-slate-500">
                             <span>{card.guestEmail}</span>
-                            <span className="mx-1.5" aria-hidden="true">·</span>
+                            <span className="mx-1.5" aria-hidden="true">
+                              ·
+                            </span>
                             <span className="font-mono-num">{card.sentAt}</span>
                           </div>
                         </div>
-                        <div className="text-right font-mono-num text-[11px] text-emerald-700 font-semibold">
-                          İletildi ({card.verificationCode})
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono-num text-[11px] text-emerald-700 font-semibold">
+                            {card.verificationCode}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => onOpenOfficialCertificateModal(card)}
+                            className="min-h-[34px] px-3 py-1 rounded-lg bg-slate-100 hover:bg-[#0C3C7C] hover:text-white text-[#0C3C7C] font-semibold flex items-center gap-1 transition-colors cursor-pointer"
+                          >
+                            <Printer className="w-3.5 h-3.5" />
+                            <span>Sertifikayı Aç / Yazdır</span>
+                          </button>
                         </div>
                       </div>
                     ))}
@@ -618,11 +648,15 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                   <div className="text-xs text-slate-600 space-y-1">
                     <div>
                       <span className="font-semibold text-slate-800">Tarih & Saat: </span>
-                      <span>{group.date} · {group.time}</span>
+                      <span>
+                        {group.date} · {group.time}
+                      </span>
                     </div>
                     <div>
                       <span className="font-semibold text-slate-800">Konum: </span>
-                      <span>{group.location} ({group.addressDetail})</span>
+                      <span>
+                        {group.location} ({group.addressDetail})
+                      </span>
                     </div>
                     <div>
                       <span className="font-semibold text-slate-800">Gündem: </span>
@@ -646,7 +680,9 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                         <span>Ev Sahibi Ocakbaşı Tutanağı</span>
                         <span className="font-mono-num">{group.attendanceRate}</span>
                       </div>
-                      <p className="text-slate-600 leading-relaxed">{group.reportSummary}</p>
+                      <p className="text-slate-600 leading-relaxed">
+                        {group.reportSummary}
+                      </p>
                     </div>
                   )}
 
