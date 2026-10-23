@@ -4,6 +4,7 @@ import {
   Database,
   Download,
   FileCheck2,
+  Hash,
   Lock,
   Plus,
   Scale,
@@ -30,6 +31,8 @@ interface PilotAuditAndBackupModalProps {
   onToggleKvkkMaskPhone: () => void;
   serverSyncedAt: string | null;
   onDownloadBackup: () => void;
+  auditChainValid?: boolean;
+  auditHeadHash?: string;
 }
 
 const ROLE_BADGE_LABELS: Record<ClubRole, string> = {
@@ -50,6 +53,8 @@ export const PilotAuditAndBackupModal: React.FC<PilotAuditAndBackupModalProps> =
   onToggleKvkkMaskPhone,
   serverSyncedAt,
   onDownloadBackup,
+  auditChainValid = true,
+  auditHeadHash = 'SHA256_VERIFIED',
 }) => {
   const [activeSubTab, setActiveSubTab] = useState<
     'audit' | 'board_resolutions' | 'kvkk'
@@ -58,7 +63,7 @@ export const PilotAuditAndBackupModal: React.FC<PilotAuditAndBackupModalProps> =
 
   // New Board Resolution Form State (Epic #7)
   const [resNo, setResNo] = useState(`YK-2026/${17 + boardResolutions.length - 3}`);
-  const [resDate, setResDate] = useState('22 Ekim 2026');
+  const [resDate, setResDate] = useState('23 Ekim 2026');
   const [resTitle, setResTitle] = useState(
     'Karaköy & Maçka Rotary Kulüpleri ile Ortak Boğaziçi Deniz Temizliği Protokolü'
   );
@@ -71,6 +76,8 @@ export const PilotAuditAndBackupModal: React.FC<PilotAuditAndBackupModalProps> =
   if (!isOpen) return null;
 
   const isBoardLeader = activeRole === 'baskan' || activeRole === 'sekreter';
+  const canExportBackup =
+    activeRole === 'baskan' || activeRole === 'sekreter' || activeRole === 'sayman';
 
   const filteredLogs =
     selectedModuleFilter === 'Tümü'
@@ -82,7 +89,7 @@ export const PilotAuditAndBackupModal: React.FC<PilotAuditAndBackupModalProps> =
     if (!resTitle.trim() || !resSummary.trim()) return;
     onAddBoardResolution({
       resolutionNo: resNo.trim() || `YK-2026/${17 + boardResolutions.length}`,
-      date: resDate.trim() || '22 Ekim 2026',
+      date: resDate.trim() || '23 Ekim 2026',
       title: resTitle.trim(),
       summary: resSummary.trim(),
       voteStatus: resVoteStatus,
@@ -106,14 +113,14 @@ export const PilotAuditAndBackupModal: React.FC<PilotAuditAndBackupModalProps> =
             <div className="flex items-center gap-2 text-xs font-semibold text-[#0C3C7C]">
               <Server className="w-4 h-4 text-[#F7A81B]" />
               <span>
-                Galata Rotary Pilot Altyapısı · Kalıcı Sunucu Veritabanı, YK Karar Defteri & KVKK
+                RotaClub v5.0 Hardened · SHA-256 Değiştirilemez Denetim Defteri & Çoklu Kulüp Veritabanı
               </span>
             </div>
             <h2
               id="pilot-audit-modal-title"
               className="font-serif-display text-2xl sm:text-3xl font-bold text-slate-900 mt-0.5"
             >
-              Kurumsal Yönetim, Sunucu RBAC Denetim İzi & Yedekleme
+              Kurumsal Yönetim, Kriptografik Denetim Zinciri & Yedekleme
             </h2>
           </div>
 
@@ -127,57 +134,69 @@ export const PilotAuditAndBackupModal: React.FC<PilotAuditAndBackupModalProps> =
           </button>
         </div>
 
-        {/* Pilot Architecture Status Cards (#13, #14, #18, #19, #22, #23) */}
+        {/* Pilot Architecture Status Cards */}
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 shrink-0">
           <div className="p-3.5 rounded-2xl bg-[#0F172A] text-white space-y-1">
             <div className="flex items-center justify-between text-[11px] text-[#F7A81B] font-semibold">
-              <span>Ortak Sunucu Veritabanı</span>
+              <span>SHA-256 Denetim Zinciri (Append-Only)</span>
               <Database className="w-3.5 h-3.5" />
             </div>
-            <div className="text-sm font-bold">Express API + JSON Kalıcı Depo</div>
-            <div className="text-[11px] text-slate-300 font-mono-num">
-              Son Senkronizasyon:{' '}
-              {serverSyncedAt
-                ? new Date(serverSyncedAt).toLocaleTimeString('tr-TR')
-                : 'Canlı Bağlı'}
+            <div className="text-sm font-bold">
+              {auditChainValid
+                ? 'Zincir Bütünlüğü Doğrulandı'
+                : 'Zincir Uyarısı'}
+            </div>
+            <div className="text-[11px] text-slate-300 font-mono-num truncate">
+              Head Hash: {auditHeadHash.slice(0, 18)}... ({serverSyncedAt ? new Date(serverSyncedAt).toLocaleTimeString('tr-TR') : 'Canlı'})
             </div>
           </div>
 
           <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200 space-y-1">
             <div className="flex items-center justify-between text-[11px] text-[#0C3C7C] font-semibold">
-              <span>Sunucu Rol Doğrulaması (RBAC)</span>
+              <span>HMAC-SHA256 Oturum & RBAC</span>
               <Lock className="w-3.5 h-3.5 text-[#0C3C7C]" />
             </div>
             <div className="text-sm font-bold text-slate-900">
-              Aktif Oturum: {ROLE_BADGE_LABELS[activeRole]}
+              İmzalı Rol: {ROLE_BADGE_LABELS[activeRole]}
             </div>
             <div className="text-[11px] text-slate-600">
-              Sekreter/Sayman/Başkan işlemleri sunucuda doğrulanır
+              İstemci başlığı taklidi (Header Spoofing) sunucuda engellenir
             </div>
           </div>
 
           <div className="p-3.5 rounded-2xl bg-emerald-50/70 border border-emerald-200 flex flex-col justify-between gap-2">
             <div>
               <div className="flex items-center justify-between text-[11px] text-emerald-900 font-semibold">
-                <span>Veritabanı & Denetim Yedeği</span>
+                <span>Yönetim Kurulu Yedekleme (#19, #20)</span>
                 <ShieldCheck className="w-3.5 h-3.5 text-emerald-700" />
               </div>
               <div className="text-xs text-emerald-800 mt-0.5">
-                Tüm kulüp verilerini ve {auditLogs.length} denetim kaydını indir
+                {canExportBackup
+                  ? `Tüm kulüp verilerini ve ${auditLogs.length} hash-zincirli kaydı indir`
+                  : 'Yedek indirme yalnızca Başkan, Sekreter ve Sayman rolüne açıktır'}
               </div>
             </div>
             <button
               type="button"
               onClick={onDownloadBackup}
-              className="w-full min-h-[36px] px-3 py-1.5 rounded-xl bg-[#0C3C7C] hover:bg-[#17458F] text-white text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+              disabled={!canExportBackup}
+              className={`w-full min-h-[36px] px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors ${
+                canExportBackup
+                  ? 'bg-[#0C3C7C] hover:bg-[#17458F] text-white cursor-pointer'
+                  : 'bg-slate-200 text-slate-500 cursor-not-allowed'
+              }`}
             >
               <Download className="w-3.5 h-3.5 text-[#F7A81B]" />
-              <span>Tam Yedeği İndir (.JSON)</span>
+              <span>
+                {canExportBackup
+                  ? 'Tam Yedeği İndir (.JSON)'
+                  : 'Yetki Gerekli (YK Üyesi)'}
+              </span>
             </button>
           </div>
         </div>
 
-        {/* 3 Sub-Tabs: Denetim Geçmişi | YK Karar Defteri (#7) | KVKK & Veri Güvenliği (#2) */}
+        {/* 3 Sub-Tabs */}
         <div
           role="tablist"
           aria-label="Denetim, YK Karar Defteri ve KVKK Alt Sekmeleri"
@@ -194,7 +213,7 @@ export const PilotAuditAndBackupModal: React.FC<PilotAuditAndBackupModalProps> =
                 : 'text-slate-600 hover:text-slate-900'
             }`}
           >
-            Denetim Geçmişi ({auditLogs.length})
+            SHA-256 Denetim Defteri ({auditLogs.length})
           </button>
           <button
             type="button"
@@ -224,7 +243,7 @@ export const PilotAuditAndBackupModal: React.FC<PilotAuditAndBackupModalProps> =
           </button>
         </div>
 
-        {/* SUB-TAB 1: AUDIT TRAIL (#18) */}
+        {/* SUB-TAB 1: HASH-CHAINED AUDIT TRAIL (#18) */}
         {activeSubTab === 'audit' && (
           <>
             <div className="flex flex-wrap items-center justify-between gap-2 shrink-0">
@@ -234,6 +253,7 @@ export const PilotAuditAndBackupModal: React.FC<PilotAuditAndBackupModalProps> =
                   'LCV & Kuver',
                   'QR Yoklama & Make-up',
                   'Saymanlık & Kasa',
+                  'Projeler & Burslar',
                   'Yönetim & Güvenlik',
                 ].map((mod) => (
                   <button
@@ -252,7 +272,7 @@ export const PilotAuditAndBackupModal: React.FC<PilotAuditAndBackupModalProps> =
               </div>
 
               <span className="text-xs font-mono-num text-slate-500">
-                Toplam {filteredLogs.length} Sunucu Onaylı İşlem Kaydı
+                Silinemez (Append-Only) {filteredLogs.length} Kayıt
               </span>
             </div>
 
@@ -264,6 +284,11 @@ export const PilotAuditAndBackupModal: React.FC<PilotAuditAndBackupModalProps> =
                 >
                   <div className="space-y-1 min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
+                      {log.sequenceNo && (
+                        <span className="font-mono-num text-[11px] font-bold px-1.5 py-0.5 rounded bg-slate-100 text-slate-700">
+                          #{log.sequenceNo}
+                        </span>
+                      )}
                       <span className="font-bold text-[#0C3C7C]">{log.module}</span>
                       <span aria-hidden="true" className="text-slate-300">
                         ·
@@ -271,9 +296,17 @@ export const PilotAuditAndBackupModal: React.FC<PilotAuditAndBackupModalProps> =
                       <span className="font-semibold text-slate-900">{log.action}</span>
                     </div>
                     <p className="text-slate-600 leading-relaxed">{log.detail}</p>
-                    <div className="text-[11px] text-slate-500">
-                      İşlemi Yapan:{' '}
-                      <strong className="text-slate-800">{log.actorName}</strong>
+                    <div className="flex flex-wrap items-center gap-3 text-[11px] text-slate-500">
+                      <span>
+                        İşlemi Yapan:{' '}
+                        <strong className="text-slate-800">{log.actorName}</strong>
+                      </span>
+                      {log.entryHash && (
+                        <span className="font-mono-num text-slate-400 inline-flex items-center gap-0.5">
+                          <Hash className="w-3 h-3" />
+                          <span>SHA256: {log.entryHash.slice(0, 12)}…</span>
+                        </span>
+                      )}
                     </div>
                   </div>
 
@@ -284,7 +317,7 @@ export const PilotAuditAndBackupModal: React.FC<PilotAuditAndBackupModalProps> =
                     {log.verifiedByServer && (
                       <div className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700">
                         <CheckCircle2 className="w-3.5 h-3.5" />
-                        <span>Sunucu RBAC Onaylı</span>
+                        <span>İmzalı Sunucu Kaydı</span>
                       </div>
                     )}
                   </div>
@@ -396,10 +429,10 @@ export const PilotAuditAndBackupModal: React.FC<PilotAuditAndBackupModalProps> =
             <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 space-y-2.5">
               <div className="flex items-center gap-2 font-bold text-slate-900 text-sm">
                 <Scale className="w-4 h-4 text-[#0C3C7C]" />
-                <span>6698 Sayılı KVKK Aydınlatma ve Kulüp İçi Veri Güvenliği Politikası</span>
+                <span>6698 Sayılı KVKK Aydınlatma, Rol Bazlı Veri Minimizasyonu ve Maskeleme</span>
               </div>
               <p className="text-slate-600 leading-relaxed">
-                Galata Rotary Kulübü Derneği bünyesinde işlenen üye iletişim, meslek sınıflandırması, eş/mutlu gün ve cari aidat bilgileri; yalnızca kulüp tüzüğü kapsamındaki toplantı kuver planlaması, UR 2420. Bölge raporlaması ve kulüp içi dostluk iletişimi amacıyla RBAC korumalı sunucuda saklanır.
+                Galata Rotary Kulübü sunucusunda (v5.0) <strong>Veri Minimizasyonu</strong> uygulanır: Sıradan <code>uye</code> oturumlarında diğer üyelerin kişisel borç/bakiye dökümleri ve gecikmiş ödeme listeleri sunucu katmanında filtrelenerek gizlenir. Yedek dışa aktarımı yalnızca Yönetim Kurulu (Başkan, Sekreter, Sayman) rollerine açıktır.
               </p>
               <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-200">
                 <div>

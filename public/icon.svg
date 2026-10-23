@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#09152B" />
+      <stop offset="55%" stop-color="#0C3C7C" />
+      <stop offset="100%" stop-color="#17458F" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)" />
+  <circle cx="256" cy="256" r="144" fill="none" stroke="#F7A81B" stroke-width="26" />
+  <circle cx="256" cy="256" r="52" fill="none" stroke="#F7A81B" stroke-width="22" />
+  <g fill="#F7A81B">
+    <rect x="242" y="76" width="28" height="44" rx="8" />
+    <rect x="242" y="392" width="28" height="44" rx="8" />
+    <rect x="76" y="242" width="44" height="28" rx="8" />
+    <rect x="392" y="242" width="44" height="28" rx="8" />
+    <rect x="242" y="76" width="28" height="44" rx="8" transform="rotate(45 256 256)" />
+    <rect x="242" y="392" width="28" height="44" rx="8" transform="rotate(45 256 256)" />
+    <rect x="76" y="242" width="44" height="28" rx="8" transform="rotate(45 256 256)" />
+    <rect x="392" y="242" width="44" height="28" rx="8" transform="rotate(45 256 256)" />
+  </g>
+</svg>

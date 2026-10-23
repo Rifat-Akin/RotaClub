@@ -235,6 +235,7 @@ export interface RotaryMember {
 export type Member = RotaryMember;
 
 export interface TermBoardInfo {
+  clubName?: string;
   termLabel: string;
   district: string;
   themeTitle: string;
@@ -277,13 +278,22 @@ export interface TenantClubOption {
 
 export interface AuditLogEntry {
   id: string;
+  sequenceNo?: number;
+  clubId?: string;
   timestamp: string;
   actorName: string;
   actorRole: ClubRole;
-  module: 'LCV & Kuver' | 'QR Yoklama & Make-up' | 'Saymanlık & Kasa' | 'Yönetim & Güvenlik';
+  module:
+    | 'LCV & Kuver'
+    | 'QR Yoklama & Make-up'
+    | 'Saymanlık & Kasa'
+    | 'Projeler & Burslar'
+    | 'Yönetim & Güvenlik';
   action: string;
   detail: string;
   verifiedByServer: boolean;
+  prevHash?: string;
+  entryHash?: string;
 }
 
 export interface BoardResolutionItem {
@@ -295,5 +305,6 @@ export interface BoardResolutionItem {
   voteStatus: 'Oybirliği ile Kabul' | 'Oyçokluğu ile Kabul';
   signedBy: string;
 }
+
 
 
