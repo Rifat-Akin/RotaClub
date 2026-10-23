@@ -61,6 +61,7 @@ export interface WeeklyMeeting {
 
 export interface MakeupSubmission {
   id: string;
+  memberId?: string;
   memberName: string;
   targetClubOrEvent: string;
   activityType: 'Kulüp Toplantısı' | 'Bölge Semineri' | 'Hizmet Projesi' | 'Komite Toplantısı';

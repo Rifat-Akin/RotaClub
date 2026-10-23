@@ -2246,7 +2246,7 @@ export function createPilotExpressApp(
       const rawTtl =
         req.query.ttlSeconds !== undefined ? Number(req.query.ttlSeconds) : 300;
       const ttlSeconds = Number.isFinite(rawTtl)
-        ? Math.max(-3600, Math.min(900, Math.trunc(rawTtl)))
+        ? Math.max(-3600, Math.min(300, Math.trunc(rawTtl)))
         : 300;
       const nowEpochSec = Math.floor(Date.now() / 1000);
       const expiresAtEpochSec = nowEpochSec + ttlSeconds;
@@ -2349,6 +2349,19 @@ export function createPilotExpressApp(
         }
 
         const meetingKey = String(targetMeetingNo);
+        const alreadyCheckedInMembers = Array.isArray(
+          tenant.meetingAttendances?.[meetingKey]
+        )
+          ? tenant.meetingAttendances![meetingKey]
+          : [];
+        if (alreadyCheckedInMembers.includes(user.memberId)) {
+          res.status(409).json({
+            error: 'ALREADY_CHECKED_IN',
+            message: `Tekrarlı QR yoklama reddedildi (#33): ${user.fullName} Toplantı #${targetMeetingNo} için zaten yoklama yapmış.`,
+          });
+          return;
+        }
+
         const casResult = store.updateTenant(
           authorizedClubId,
           (curr) => {
@@ -2411,6 +2424,81 @@ export function createPilotExpressApp(
       }
     }
   );
+
+  // Issue #36: Cryptographic Guest Make-up Certificate Verification Code Generator & Public/Authenticated Verification Endpoint
+  const computeGuestCertificateVerificationCode = (
+    clubId: string,
+    card: {
+      id: string;
+      guestName: string;
+      guestClub: string;
+      meetingNo: number;
+      meetingDate: string;
+    }
+  ): string => {
+    const digest = crypto
+      .createHmac('sha256', getServerSecret())
+      .update(
+        `RotaclubGuestCertificate:v1:${clubId}:${card.id}:${card.meetingNo}:${card.guestName}:${card.guestClub}:${card.meetingDate}`
+      )
+      .digest('hex')
+      .slice(0, 8)
+      .toUpperCase();
+    return `GLR-2420-${card.meetingNo}-${digest}`;
+  };
+
+  app.get('/api/pilot/verify-certificate', (req, res) => {
+    const clubId =
+      typeof req.query.clubId === 'string' && req.query.clubId.trim()
+        ? req.query.clubId.trim()
+        : 'club-galata';
+    const code =
+      typeof req.query.code === 'string'
+        ? req.query.code.trim().toUpperCase()
+        : '';
+    if (!code) {
+      res.status(400).json({
+        valid: false,
+        error: 'MISSING_VERIFICATION_CODE',
+        message: 'Doğrulama kodu (code) parametresi zorunludur (#36).',
+      });
+      return;
+    }
+    if (!isAllowedTenantClubId(clubId)) {
+      res.status(404).json({
+        valid: false,
+        error: 'CLUB_NOT_FOUND',
+        message: 'Kulüp kaydı bulunamadı.',
+      });
+      return;
+    }
+    const tenant = store.getTenantState(clubId);
+    const card = (tenant.guestMakeupCards || []).find(
+      (c) => String(c.verificationCode || '').toUpperCase() === code
+    );
+    if (!card) {
+      res.status(404).json({
+        valid: false,
+        error: 'CERTIFICATE_NOT_FOUND',
+        message: `Sunucu kayıtlarında "${code}" doğrulama koduna ait geçerli bir katılım belgesi bulunamadı (#36).`,
+      });
+      return;
+    }
+    res.json({
+      valid: true,
+      clubId,
+      verificationCode: card.verificationCode,
+      certificate: {
+        id: card.id,
+        guestName: card.guestName,
+        guestClub: card.guestClub,
+        guestDistrict: card.guestDistrict,
+        meetingNo: card.meetingNo,
+        meetingDate: card.meetingDate,
+        sentAt: card.sentAt,
+      },
+    });
+  });
 
   // 8. Authenticated State Synchronization, Mandatory CAS Revision Check, Immutable Payment Records & Closed Accounting Ledger Bypass (#14, #16, #18, #20, #39, #70, #76)
   app.post('/api/pilot/sync', requireAuth, (req: AuthenticatedRequest, res) => {
@@ -2543,6 +2631,9 @@ export function createPilotExpressApp(
                 return;
               }
               if (
+                (existingMk.memberId &&
+                  incMk.memberId &&
+                  incMk.memberId !== existingMk.memberId) ||
                 stripTitle(incMk.memberName) !==
                   stripTitle(existingMk.memberName) ||
                 incMk.targetClubOrEvent !== existingMk.targetClubOrEvent ||
@@ -2571,7 +2662,10 @@ export function createPilotExpressApp(
                 });
                 return;
               }
-              if (stripTitle(incMk?.memberName || '') !== selfCanonical) {
+              if (
+                (incMk?.memberId && incMk.memberId !== user.memberId) ||
+                stripTitle(incMk?.memberName || '') !== selfCanonical
+              ) {
                 res.status(403).json({
                   error: 'MAKEUP_FORBIDDEN_MUTATION',
                   message: `Make-up yetki sınırı (#35): Standart üye oturumu (${user.fullName}) yalnızca kendi adına make-up bildirimi oluşturabilir.`,
@@ -2581,6 +2675,16 @@ export function createPilotExpressApp(
             }
           }
         }
+      }
+
+      // Issue #36 Fix: Only Club Secretary or President can issue or modify guest make-up certificates
+      if (Array.isArray(incomingPatch.guestMakeupCards) && !isMakeupApprover) {
+        res.status(403).json({
+          error: 'RBAC_FORBIDDEN',
+          message:
+            'Misafir Rotaryen katılım belgesi düzenleme yetkisi (#36): Yalnızca Genel Sekreter veya Dönem Başkanı dijital katılım belgesi düzenleyebilir.',
+        });
+        return;
       }
 
       // Issue #39 Fix: Close ALL direct client write paths to treasuryLedger, bankStatements, financialItems, and overdueMembers!
@@ -3100,16 +3204,34 @@ export function createPilotExpressApp(
               ? incomingPatch.makeupSubmissions.map(
                   (mk: {
                     id: string;
+                    memberId?: string;
                     memberName: string;
                     targetClubOrEvent: string;
                     activityType: MakeupSubmission['activityType'];
                     date: string;
                     description: string;
                     status: MakeupSubmission['status'];
-                  }) => ({
-                    ...mk,
-                    attendanceBoost: mk.status === 'Onaylandı' ? 3 : 0,
-                  })
+                  }) => {
+                    const existingMk = curr.makeupSubmissions.find(
+                      (ex) => ex.id === mk.id
+                    );
+                    const resolvedMemberId =
+                      existingMk?.memberId ||
+                      mk.memberId ||
+                      curr.members.find(
+                        (m) =>
+                          normalizePersonName(m.fullName) ===
+                          normalizePersonName(mk.memberName)
+                      )?.id;
+                    return {
+                      ...existingMk,
+                      ...mk,
+                      ...(resolvedMemberId
+                        ? { memberId: resolvedMemberId }
+                        : {}),
+                      attendanceBoost: mk.status === 'Onaylandı' ? 3 : 0,
+                    };
+                  }
                 )
               : [
                   ...incomingPatch.makeupSubmissions
@@ -3126,6 +3248,7 @@ export function createPilotExpressApp(
                         description: string;
                       }) => ({
                         ...mk,
+                        memberId: user.memberId,
                         memberName: user.fullName,
                         status: 'İnceleniyor' as const,
                         attendanceBoost: 0,
@@ -3134,6 +3257,38 @@ export function createPilotExpressApp(
                   ...curr.makeupSubmissions,
                 ]
             : curr.makeupSubmissions;
+
+          const sanitizedGuestMakeupCards =
+            isMakeupApprover && Array.isArray(incomingPatch.guestMakeupCards)
+              ? incomingPatch.guestMakeupCards.map(
+                  (card: {
+                    id: string;
+                    guestName: string;
+                    guestClub: string;
+                    guestDistrict?: string;
+                    guestEmail: string;
+                    meetingNo: number;
+                    meetingDate: string;
+                    sentAt: string;
+                  }) => {
+                    const existingCard = curr.guestMakeupCards.find(
+                      (ex) => ex.id === card.id
+                    );
+                    if (existingCard) {
+                      return existingCard;
+                    }
+                    return {
+                      ...card,
+                      guestDistrict: card.guestDistrict || 'UR 2420. Bölge',
+                      verificationCode:
+                        computeGuestCertificateVerificationCode(
+                          authorizedClubId,
+                          card
+                        ),
+                    };
+                  }
+                )
+              : curr.guestMakeupCards;
 
           return {
             ...curr,
@@ -3163,10 +3318,7 @@ export function createPilotExpressApp(
               isBoardAdmin && incomingPatch.ritualSteps
                 ? incomingPatch.ritualSteps
                 : curr.ritualSteps,
-            guestMakeupCards:
-              isBoardAdmin && incomingPatch.guestMakeupCards
-                ? incomingPatch.guestMakeupCards
-                : curr.guestMakeupCards,
+            guestMakeupCards: sanitizedGuestMakeupCards,
             boardResolutions:
               isBoardAdmin && incomingPatch.boardResolutions
                 ? incomingPatch.boardResolutions

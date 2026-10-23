@@ -1,5 +1,6 @@
 import {
   FinancialLineItem,
+  MakeupSubmission,
   MemberRsvp,
   MenuPreference,
   PaymentNotification,
@@ -902,5 +903,37 @@ export function calculateSpecializedModulesSummary(
   };
 }
 
+/**
+ * Calculates extra approved make-up count strictly bound to the target member (#35).
+ * Prioritizes immutable `memberId` matching so two different members with the same fullName never collide.
+ */
+export function calculateMemberExtraMakeups(
+  submissions: MakeupSubmission[],
+  initialSubmissions: MakeupSubmission[],
+  memberId: string,
+  memberFullName: string
+): number {
+  const normalizeName = (name: string) =>
+    String(name || '')
+      .toLowerCase()
+      .replace(/^rtn\.?\s*/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
 
+  const targetNameKey = normalizeName(memberFullName);
+  const belongsToMember = (m: MakeupSubmission): boolean => {
+    if (m.memberId) {
+      return m.memberId === memberId;
+    }
+    return normalizeName(m.memberName) === targetNameKey;
+  };
 
+  const currentApproved = submissions.filter(
+    (m) => m.status === 'Onaylandı' && belongsToMember(m)
+  ).length;
+  const baselineApproved = initialSubmissions.filter(
+    (m) => m.status === 'Onaylandı' && belongsToMember(m)
+  ).length;
+
+  return Math.max(0, currentApproved - baselineApproved);
+}

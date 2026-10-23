@@ -293,6 +293,7 @@ export const INITIAL_CELEBRATIONS: CelebrationItem[] = [
 export const INITIAL_MAKEUP_SUBMISSIONS: MakeupSubmission[] = [
   {
     id: 'mk-101',
+    memberId: 'm-rifat',
     memberName: 'Rifat Akın',
     targetClubOrEvent: 'Karaköy Rotary Kulübü Haftalık Toplantısı',
     activityType: 'Kulüp Toplantısı',
@@ -303,6 +304,7 @@ export const INITIAL_MAKEUP_SUBMISSIONS: MakeupSubmission[] = [
   },
   {
     id: 'mk-102',
+    memberId: 'm-rifat',
     memberName: 'Rifat Akın',
     targetClubOrEvent: 'UR 2420. Bölge Halkla İlişkiler ve Dijital İmaj Semineri',
     activityType: 'Bölge Semineri',

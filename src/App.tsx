@@ -51,6 +51,7 @@ import {
 } from './data/mockGalataData';
 import {
   calculateKuverSummary,
+  calculateMemberExtraMakeups,
   calculateMemberFinanceSummary,
   calculateUpdatedAttendance,
   createSpeakerProposal,
@@ -98,6 +99,7 @@ export default function App() {
   const sessionTokenRef = useRef<string>('');
   const roleTokensRef = useRef<Partial<Record<ClubRole, string>>>({});
   const serverRevisionRef = useRef<number | undefined>(undefined);
+  const lastSyncedStateRef = useRef<Record<string, unknown> | null>(null);
   const [activeTenantClubId, setActiveTenantClubId] = useState<string>('club-galata');
   const [activeTenantClubName, setActiveTenantClubName] = useState<string>(
     'Galata Rotary Kulübü'
@@ -392,6 +394,7 @@ export default function App() {
         serverRevisionRef.current = data.revision;
       }
       if (data?.state) {
+        lastSyncedStateRef.current = data.state as Record<string, unknown>;
         applyServerTenantState(data.state);
       } else if (data) {
         if (data.auditLogs) setAuditLogs(data.auditLogs);
@@ -553,29 +556,12 @@ export default function App() {
   const activeMemberDisplayName =
     sessionUser?.fullName || 'Rtn. Rifat Akın';
 
-  // Derived Calculations via Pure Logic (#33 & #35: Per-member, per-meeting QR attendance + per-member approved make-up boost)
-  const normalizeMemberNameKey = (name: string) =>
-    String(name || '')
-      .toLowerCase()
-      .replace(/^rtn\.?\s*/i, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-  const activeMemberNameKey = normalizeMemberNameKey(activeMemberDisplayName);
-  const memberApprovedMakeupsCount = makeupSubmissions.filter(
-    (m) =>
-      m.status === 'Onaylandı' &&
-      normalizeMemberNameKey(m.memberName) === activeMemberNameKey
-  ).length;
-  const initialMemberApprovedMakeupsCount = INITIAL_MAKEUP_SUBMISSIONS.filter(
-    (m) =>
-      m.status === 'Onaylandı' &&
-      normalizeMemberNameKey(m.memberName) === activeMemberNameKey
-  ).length;
-
-  const extraMakeupsCount = Math.max(
-    0,
-    memberApprovedMakeupsCount - initialMemberApprovedMakeupsCount
+  // Derived Calculations via Pure Logic (#33 & #35: Per-member, per-meeting QR attendance + memberId-bound approved make-up boost)
+  const extraMakeupsCount = calculateMemberExtraMakeups(
+    makeupSubmissions,
+    INITIAL_MAKEUP_SUBMISSIONS,
+    activeMemberId,
+    activeMemberDisplayName
   );
 
   const selectedMeetingAttendees =
@@ -1087,6 +1073,7 @@ export default function App() {
   ) => {
     const newEntry: MakeupSubmission = {
       id: `mk-${Date.now()}`,
+      memberId: activeMemberId,
       memberName: activeMemberDisplayName,
       ...payload,
       status: 'İnceleniyor',
@@ -1158,22 +1145,28 @@ export default function App() {
       id: `gmk-${Date.now()}`,
       ...payload,
       sentAt: '23 Ekim 2026 · Şimdi',
-      verificationCode: `GLR-2420-${Math.floor(1000 + Math.random() * 8999)}`,
+      verificationCode: `GLR-2420-${payload.meetingNo}-PENDING`,
     };
     const nextCards = [newCard, ...guestMakeupCards];
     const ok = await recordServerAudit(
       'QR Yoklama & Make-up',
       `Misafir Rotaryen Make-up Sertifikası Düzenlendi: ${payload.guestName}`,
-      `${payload.guestName} (${payload.guestClub}) için resmi katılım sertifikası (${newCard.verificationCode}) oluşturuldu.`,
+      `${payload.guestName} (${payload.guestClub}) için resmi dijital katılım belgesi oluşturuldu.`,
       ['sekreter', 'baskan'],
       { guestMakeupCards: nextCards }
     );
     if (!ok) return;
-    setGuestMakeupCards(nextCards);
-    setActiveCertificateCard(newCard);
+    const syncedCards = Array.isArray(
+      lastSyncedStateRef.current?.guestMakeupCards
+    )
+      ? (lastSyncedStateRef.current.guestMakeupCards as GuestRotaryMakeupCard[])
+      : null;
+    const serverIssuedCard =
+      syncedCards?.find((c) => c.id === newCard.id) || newCard;
+    setActiveCertificateCard(serverIssuedCard);
     showToast(
       'Resmi Dijital Make-up Sertifikası Hazır',
-      `${payload.guestName} (${payload.guestClub}) için kulüp doğrulama kodlu (${newCard.verificationCode}) dijital katılım belgesi sunucu onayıyla oluşturuldu.`
+      `${payload.guestName} (${payload.guestClub}) için sunucu doğrulama kodlu (${serverIssuedCard.verificationCode}) dijital katılım belgesi sunucu onayıyla oluşturuldu.`
     );
   };
 

@@ -5,6 +5,7 @@ import {
   calculateHotelBanquetCommitment,
   calculateKuverSummary,
   calculateMeetingCostSharingAndExemptions,
+  calculateMemberExtraMakeups,
   calculateMemberFinanceSummary,
   calculateProjectProgress,
   calculateSpecializedModulesSummary,
@@ -26,6 +27,7 @@ import {
 } from './rotaryLogic';
 import {
   FinancialLineItem,
+  MakeupSubmission,
   MemberRsvp,
   PaymentNotification,
   RotaryMember,
@@ -489,5 +491,77 @@ test('Issue #51: Kermes, GALATART, and RYLA specialized modules summary strictly
   );
 });
 
+test('Issue #35: calculateMemberExtraMakeups isolates approved make-ups per memberId even when two members share the exact same fullName', () => {
+  const initialMakeups: MakeupSubmission[] = [
+    {
+      id: 'mk-init-1',
+      memberId: 'm-ahmet-1',
+      memberName: 'Rtn. Ahmet Yılmaz',
+      targetClubOrEvent: 'Karaköy Rotary Kulübü',
+      activityType: 'Kulüp Toplantısı',
+      date: '10 Ekim 2026',
+      description: 'İlk katılım',
+      status: 'Onaylandı',
+      attendanceBoost: 3,
+    },
+  ];
 
+  const currentMakeups: MakeupSubmission[] = [
+    ...initialMakeups,
+    {
+      id: 'mk-ahmet1-approved',
+      memberId: 'm-ahmet-1',
+      memberName: 'Rtn. Ahmet Yılmaz',
+      targetClubOrEvent: 'Maçka Rotary Kulübü',
+      activityType: 'Kulüp Toplantısı',
+      date: '18 Ekim 2026',
+      description: 'Onaylı katılım',
+      status: 'Onaylandı',
+      attendanceBoost: 3,
+    },
+    {
+      id: 'mk-ahmet1-pending',
+      memberId: 'm-ahmet-1',
+      memberName: 'Rtn. Ahmet Yılmaz',
+      targetClubOrEvent: 'Beşiktaş Rotary Kulübü',
+      activityType: 'Kulüp Toplantısı',
+      date: '20 Ekim 2026',
+      description: 'Henüz inceleniyor',
+      status: 'İnceleniyor',
+      attendanceBoost: 0,
+    },
+    {
+      id: 'mk-ahmet2-approved',
+      memberId: 'm-ahmet-2',
+      memberName: 'Rtn. Ahmet Yılmaz',
+      targetClubOrEvent: 'Şişli Rotary Kulübü',
+      activityType: 'Hizmet Projesi',
+      date: '21 Ekim 2026',
+      description: 'Aynı isimli ikinci üyenin onaylı katılımı',
+      status: 'Onaylandı',
+      attendanceBoost: 3,
+    },
+  ];
 
+  // m-ahmet-1 had 1 initial approved and now has 2 approved (+1 extra), ignoring m-ahmet-2's approved make-up and pending ones
+  assert.equal(
+    calculateMemberExtraMakeups(
+      currentMakeups,
+      initialMakeups,
+      'm-ahmet-1',
+      'Rtn. Ahmet Yılmaz'
+    ),
+    1
+  );
+
+  // m-ahmet-2 had 0 initial approved and now has 1 approved (+1 extra), ignoring m-ahmet-1's make-ups
+  assert.equal(
+    calculateMemberExtraMakeups(
+      currentMakeups,
+      initialMakeups,
+      'm-ahmet-2',
+      'Rtn. Ahmet Yılmaz'
+    ),
+    1
+  );
+});
