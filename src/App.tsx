@@ -50,7 +50,6 @@ import {
   INITIAL_TREASURY_LEDGER,
 } from './data/mockGalataData';
 import {
-  applyBulkMemberAccrual,
   calculateKuverSummary,
   calculateMemberFinanceSummary,
   calculateUpdatedAttendance,
@@ -82,10 +81,20 @@ interface ToastMessage {
   detail: string;
 }
 
+interface SessionUserIdentity {
+  memberId: string;
+  rotaryId: string;
+  fullName: string;
+  email: string;
+  role: ClubRole;
+  clubId: string;
+}
+
 export default function App() {
   // Core Navigation, Multi-Tenant & Cryptographic Session State (No localStorage full-state overwrite!)
   const [activeRole, setActiveRole] = useState<ClubRole>('uye');
   const [sessionToken, setSessionToken] = useState<string>('');
+  const [sessionUser, setSessionUser] = useState<SessionUserIdentity | null>(null);
   const sessionTokenRef = useRef<string>('');
   const roleTokensRef = useRef<Partial<Record<ClubRole, string>>>({});
   const serverRevisionRef = useRef<number | undefined>(undefined);
@@ -150,10 +159,10 @@ export default function App() {
 
   // Tab 5: Classification Directory, Committees, Past Presidents & Apple Wallet Modal State
   const [members, setMembers] = useState<RotaryMember[]>(GALATA_ROTARY_MEMBERS);
-  const [committees, setCommittees] = useState<ClubCommittee[]>(
+  const [committees] = useState<ClubCommittee[]>(
     INITIAL_CLUB_COMMITTEES
   );
-  const [pastPresidents, setPastPresidents] = useState<PastPresidentRecord[]>(
+  const [pastPresidents] = useState<PastPresidentRecord[]>(
     INITIAL_PAST_PRESIDENTS
   );
   const [walletModalMember, setWalletModalMember] = useState<RotaryMember | null>(
@@ -186,6 +195,12 @@ export default function App() {
     if (typeof serverData.updatedAt === 'string') {
       setServerSyncedAt(serverData.updatedAt);
     }
+    if (
+      serverData.authenticatedUser &&
+      typeof serverData.authenticatedUser === 'object'
+    ) {
+      setSessionUser(serverData.authenticatedUser as SessionUserIdentity);
+    }
     if (Array.isArray(serverData.auditLogs)) {
       setAuditLogs(serverData.auditLogs as AuditLogEntry[]);
     }
@@ -208,6 +223,30 @@ export default function App() {
     if (serverData.rsvpStatus) setRsvpStatus(serverData.rsvpStatus as RsvpStatus);
     if (serverData.menuPreference) {
       setMenuPreference(serverData.menuPreference as MenuPreference);
+    }
+    if (typeof serverData.qrCheckedIn === 'boolean') {
+      setQrCheckedIn(serverData.qrCheckedIn);
+    }
+    if (Array.isArray(serverData.makeupSubmissions)) {
+      setMakeupSubmissions(serverData.makeupSubmissions as MakeupSubmission[]);
+    }
+    if (Array.isArray(serverData.guestMakeupCards)) {
+      setGuestMakeupCards(serverData.guestMakeupCards as GuestRotaryMakeupCard[]);
+    }
+    if (Array.isArray(serverData.firesideGroups)) {
+      setFiresideGroups(serverData.firesideGroups as FiresideGroup[]);
+    }
+    if (Array.isArray(serverData.ritualSteps)) {
+      setRitualSteps(serverData.ritualSteps as RitualStep[]);
+    }
+    if (Array.isArray(serverData.celebrations)) {
+      setCelebrations(serverData.celebrations as CelebrationItem[]);
+    }
+    if (Array.isArray(serverData.speakerProposals)) {
+      setSpeakerProposals(serverData.speakerProposals as SpeakerProposal[]);
+    }
+    if (Array.isArray(serverData.financialItems)) {
+      setFinancialItems(serverData.financialItems as FinancialLineItem[]);
     }
     if (serverData.members) setMembers(serverData.members as RotaryMember[]);
     if (serverData.paymentNotifications) {
@@ -250,6 +289,9 @@ export default function App() {
     try {
       const token = explicitToken || roleTokensRef.current[role] || '';
       if (!token) {
+        sessionTokenRef.current = '';
+        setSessionToken('');
+        setSessionUser(null);
         return false;
       }
 
@@ -265,7 +307,12 @@ export default function App() {
           },
         }
       );
-      if (!stateRes.ok) return false;
+      if (!stateRes.ok) {
+        sessionTokenRef.current = '';
+        setSessionToken('');
+        setSessionUser(null);
+        return false;
+      }
       const serverData = await stateRes.json();
       applyServerTenantState(serverData);
       return true;
@@ -275,8 +322,8 @@ export default function App() {
   };
 
   /**
-   * Sends ONLY the changed delta patch with optimistic concurrency control (expectedRevision) (#14, #18)
-   * Never dumps stale full-state arrays over concurrent edits!
+   * Sends ONLY the changed delta patch with optimistic concurrency control (expectedRevision) (#14, #18, #76)
+   * Strictly requires an active authenticated session token — never claims success without server verification!
    */
   const recordServerAudit = async (
     module: AuditLogEntry['module'],
@@ -286,7 +333,13 @@ export default function App() {
     patchOverride?: Record<string, unknown>
   ): Promise<boolean> => {
     const token = sessionTokenRef.current || sessionToken;
-    if (!token) return true;
+    if (!token) {
+      showToast(
+        'Sunucu Oturumu Gerekli (401)',
+        'Doğrulanmış sunucu oturumu (Bearer Token) olmadan işlem kaydedilemez. Lütfen Kilit Ekranından PIN veya Passkey ile giriş yapın.'
+      );
+      return false;
+    }
 
     try {
       const res = await fetch('/api/pilot/sync', {
@@ -483,6 +536,11 @@ export default function App() {
     );
   };
 
+  // Authenticated Member Identity (#46, #76) — bound to verified server session user
+  const activeMemberId = sessionUser?.memberId || 'm-rifat';
+  const activeMemberDisplayName =
+    sessionUser?.fullName || 'Rtn. Rifat Akın';
+
   // Derived Calculations via Pure Logic
   const extraMakeupsCount = Math.max(
     0,
@@ -496,7 +554,7 @@ export default function App() {
 
   const combinedRsvpList: MemberRsvp[] = [
     ...members
-      .filter((m) => m.id !== 'm-rifat')
+      .filter((m) => m.id !== activeMemberId)
       .map((m) => ({
         memberId: m.id,
         memberName: m.fullName,
@@ -517,7 +575,7 @@ export default function App() {
   const financeSummary = calculateMemberFinanceSummary(
     financialItems,
     paymentNotifications,
-    'm-rifat'
+    activeMemberId
   );
 
   const pendingPaymentsCount = paymentNotifications.filter(
@@ -585,7 +643,8 @@ export default function App() {
         );
         return;
       } catch {
-        // Offline fallback
+        showToast('Bağlantı Uyarısı', 'Kulüp değiştirme servisine ulaşılamadı.');
+        return;
       }
     }
     setActiveTenantClubId(tenant.id);
@@ -598,7 +657,7 @@ export default function App() {
 
   const handleChangeRsvpStatus = async (status: RsvpStatus) => {
     const nextMembers = members.map((m) =>
-      m.id === 'm-rifat' ? { ...m, rsvpStatus: status } : m
+      m.id === activeMemberId ? { ...m, rsvpStatus: status } : m
     );
     const statusLabels: Record<RsvpStatus, string> = {
       attending: 'Katılıyorum (1 Kuver)',
@@ -610,7 +669,7 @@ export default function App() {
     const ok = await recordServerAudit(
       'LCV & Kuver',
       `LCV Bildirimi Güncellendi (${statusLabels[status]})`,
-      `Rtn. Rifat Akın #${selectedMeetingNo} toplantı LCV durumunu "${statusLabels[status]}" olarak güncelledi.`,
+      `${activeMemberDisplayName} #${selectedMeetingNo} toplantı LCV durumunu "${statusLabels[status]}" olarak güncelledi.`,
       undefined,
       { rsvpStatus: status, members: nextMembers }
     );
@@ -625,12 +684,12 @@ export default function App() {
 
   const handleChangeMenuPreference = async (menu: MenuPreference) => {
     const nextMembers = members.map((m) =>
-      m.id === 'm-rifat' ? { ...m, mealPreference: menu } : m
+      m.id === activeMemberId ? { ...m, mealPreference: menu } : m
     );
     const ok = await recordServerAudit(
       'LCV & Kuver',
       `Menü Tercihi Güncellendi (${menu})`,
-      `Rtn. Rifat Akın akşam yemeği menü tercihini "${menu}" olarak güncelledi.`,
+      `${activeMemberDisplayName} akşam yemeği menü tercihini "${menu}" olarak güncelledi.`,
       undefined,
       { menuPreference: menu, members: nextMembers }
     );
@@ -668,7 +727,7 @@ export default function App() {
     );
     if (!ok) return;
     setMembers(nextMembers);
-    if (memberId === 'm-rifat') {
+    if (memberId === activeMemberId) {
       setRsvpStatus(status);
       if (menu) setMenuPreference(menu);
     }
@@ -713,96 +772,151 @@ export default function App() {
     );
   };
 
-  const handleToggleVoteSpeaker = (proposalId: string) => {
-    setSpeakerProposals((prev) => toggleVoteSpeakerProposal(prev, proposalId));
+  const handleToggleVoteSpeaker = async (proposalId: string) => {
+    const nextProposals = toggleVoteSpeakerProposal(speakerProposals, proposalId);
+    const ok = await recordServerAudit(
+      'LCV & Kuver',
+      `Konuk Konuşmacı Oylaması Güncellendi (${proposalId})`,
+      `${activeMemberDisplayName} konuşmacı havuzu oylamasını güncelledi.`,
+      undefined,
+      { speakerProposals: nextProposals }
+    );
+    if (!ok) return;
+    setSpeakerProposals(nextProposals);
     showToast(
       'Konuk Konuşmacı Oylaması Güncellendi',
-      'Oyunuz Program Komitesi konuşmacı havuzuna işlendi.'
+      'Oyunuz sunucu onayıyla Program Komitesi konuşmacı havuzuna işlendi.'
     );
   };
 
-  const handleAddSpeakerProposal = (input: {
+  const handleAddSpeakerProposal = async (input: {
     speakerName: string;
     speakerTitle: string;
     proposedTopic: string;
     targetMonth: string;
   }) => {
-    setSpeakerProposals((prev) =>
-      createSpeakerProposal(prev, {
-        ...input,
-        proposedBy: 'Rtn. Rifat Akın',
-      })
+    const nextProposals = createSpeakerProposal(speakerProposals, {
+      ...input,
+      proposedBy: activeMemberDisplayName,
+    });
+    const ok = await recordServerAudit(
+      'LCV & Kuver',
+      `Yeni Konuşmacı Önerisi: ${input.speakerName}`,
+      `${activeMemberDisplayName} tarafından "${input.proposedTopic}" başlığı konuşmacı havuzuna eklendi.`,
+      undefined,
+      { speakerProposals: nextProposals }
     );
+    if (!ok) return;
+    setSpeakerProposals(nextProposals);
     showToast(
       `Yeni Konuşmacı Önerisi: ${input.speakerName}`,
-      `“${input.proposedTopic}” başlığı konuşmacı havuzuna eklendi ve oylamaya açıldı.`
+      `“${input.proposedTopic}” başlığı sunucu onayıyla konuşmacı havuzuna eklendi ve oylamaya açıldı.`
     );
   };
 
-  const handleToggleRitualStep = (id: string) => {
-    setRitualSteps((prev) =>
-      prev.map((step) =>
-        step.id === id ? { ...step, completed: !step.completed } : step
-      )
+  const handleToggleRitualStep = async (id: string) => {
+    const nextSteps = ritualSteps.map((step) =>
+      step.id === id ? { ...step, completed: !step.completed } : step
     );
+    const ok = await recordServerAudit(
+      'LCV & Kuver',
+      `Toplantı Ritüel Akışı Güncellendi (${id})`,
+      `Kürsü akış maddesi durumu Başkan Kokpitinde güncellendi.`,
+      ['sekreter', 'baskan'],
+      { ritualSteps: nextSteps }
+    );
+    if (!ok) return;
+    setRitualSteps(nextSteps);
     showToast(
       'Toplantı Ritüel Akışı Güncellendi',
-      'Kürsü akış maddesi durumu Başkan Kokpitinde işaretlendi.'
+      'Kürsü akış maddesi durumu sunucu onayıyla Başkan Kokpitinde işaretlendi.'
     );
   };
 
-  const handleCongratulateMember = (id: string) => {
+  const handleCongratulateMember = async (id: string) => {
     const target = celebrations.find((c) => c.id === id);
-    setCelebrations((prev) =>
-      prev.map((c) => (c.id === id ? { ...c, congratulated: true } : c))
+    if (!target) return;
+    const nextCelebrations = celebrations.map((c) =>
+      c.id === id ? { ...c, congratulated: true } : c
     );
-    if (target) {
-      showToast(
-        `Mutlu Günler Kutlaması: ${target.memberName}`,
-        `${target.type} kürsü anonsu yapıldı ve tebrik mesajı iletildi.`
-      );
-    }
+    const ok = await recordServerAudit(
+      'LCV & Kuver',
+      `Mutlu Günler Kutlaması: ${target.memberName}`,
+      `${target.memberName} (${target.type}) kutlama durumu güncellendi.`,
+      undefined,
+      { celebrations: nextCelebrations }
+    );
+    if (!ok) return;
+    setCelebrations(nextCelebrations);
+    showToast(
+      `Mutlu Günler Kutlaması: ${target.memberName}`,
+      `${target.type} kürsü anonsu yapıldı ve tebrik mesajı sunucu onayıyla kaydedildi.`
+    );
   };
 
-  const handleAdvanceCertificateStatus = () => {
-    setMeetings((prev) =>
-      prev.map((m) =>
-        m.meetingNo === selectedMeetingNo
-          ? { ...m, certificateStatus: 'Takdim Edildi' }
-          : m
-      )
-    );
+  const handleAdvanceCertificateStatus = async () => {
     const activeMeeting =
       meetings.find((m) => m.meetingNo === selectedMeetingNo) || meetings[0];
+    const nextMeetings = meetings.map((m) =>
+      m.meetingNo === selectedMeetingNo
+        ? { ...m, certificateStatus: 'Takdim Edildi' as const }
+        : m
+    );
+    const ok = await recordServerAudit(
+      'LCV & Kuver',
+      `Konuşmacı Teşekkür Sertifikası Takdim Edildi (#${selectedMeetingNo})`,
+      `${activeMeeting.speakerName} adına düzenlenen End Polio Now bağış sertifikası takdim edildi.`,
+      ['sekreter', 'baskan'],
+      { meetings: nextMeetings }
+    );
+    if (!ok) return;
+    setMeetings(nextMeetings);
     showToast(
       'Konuşmacı Teşekkür Sertifikası Takdim Edildi',
-      `${activeMeeting.speakerName} adına düzenlenen End Polio Now bağış sertifikası takdim edildi.`
+      `${activeMeeting.speakerName} adına düzenlenen End Polio Now bağış sertifikası sunucu onayıyla kaydedildi.`
     );
   };
 
-  const handleSendHotelKuverReport = () => {
+  const handleSendHotelKuverReport = async () => {
+    const activeMeeting =
+      meetings.find((m) => m.meetingNo === selectedMeetingNo) || meetings[0];
+    if (!activeMeeting.isLcvLockedForHotel) {
+      showToast(
+        'Önce LCV Listesi Kilitlenmelidir (#29)',
+        `Toplantı #${activeMeeting.meetingNo} kuver özetini otele kaydetmeden önce lütfen kesin LCV listesini kilitleyin.`
+      );
+      return;
+    }
+    const ok = await recordServerAudit(
+      'LCV & Kuver',
+      `Pera Palace Banket Kuver Özeti Kaydedildi (#${activeMeeting.meetingNo})`,
+      `Toplantı #${activeMeeting.meetingNo} için toplam ${kuverSummary.totalKuver} Kuver (${kuverSummary.attendingMembers} Üye, ${kuverSummary.spousesCount} Eş, ${kuverSummary.guestsCount} Konuk) mutfak dağılım özeti sunucu denetim kaydına işlendi.`,
+      ['sekreter', 'baskan']
+    );
+    if (!ok) return;
     showToast(
-      'Pera Palace Banket Bildirimi Gönderildi',
-      `Toplam ${kuverSummary.totalKuver} Kuver (${kuverSummary.attendingMembers} Üye, ${kuverSummary.spousesCount} Eş, ${kuverSummary.guestsCount} Konuk) mutfak dağılımıyla otele iletildi.`
+      'Pera Palace Banket Kuver Özeti Sunucuya Kaydedildi',
+      `Toplam ${kuverSummary.totalKuver} Kuver (${kuverSummary.attendingMembers} Üye, ${kuverSummary.spousesCount} Eş, ${kuverSummary.guestsCount} Konuk) mutfak dağılım özeti sunucu onayıyla kayıt altına alındı.`
     );
   };
 
-  const handleSimulateQrCheckIn = () => {
-    setQrCheckedIn(true);
-    showToast(
-      'QR Yoklama Başarılı (+%2 Katılım)',
-      '1842. Haftalık Toplantı yoklamanız işlendi ve devam yüzdeniz güncellendi.'
-    );
-    recordServerAudit(
+  const handleSimulateQrCheckIn = async () => {
+    const ok = await recordServerAudit(
       'QR Yoklama & Make-up',
       'Pera Palace Masa QR Yoklama Okutuldu (+%2)',
-      'TR-2420-88412 (Rtn. Rifat Akın) #1842. Haftalık Toplantı salon giriş yoklaması sunucuya işlendi.',
+      `${sessionUser?.rotaryId || 'TR-2420-88412'} (${activeMemberDisplayName}) #${selectedMeetingNo}. Haftalık Toplantı salon giriş yoklaması sunucuya işlendi.`,
       undefined,
       { qrCheckedIn: true }
     );
+    if (!ok) return;
+    setQrCheckedIn(true);
+    showToast(
+      'QR Yoklama Başarılı (+%2 Katılım)',
+      '1842. Haftalık Toplantı yoklamanız sunucu onayıyla işlendi ve devam yüzdeniz güncellendi.'
+    );
   };
 
-  const handleAddMakeupSubmission = (
+  const handleAddMakeupSubmission = async (
     payload: Omit<
       MakeupSubmission,
       'id' | 'status' | 'attendanceBoost' | 'memberName'
@@ -810,27 +924,28 @@ export default function App() {
   ) => {
     const newEntry: MakeupSubmission = {
       id: `mk-${Date.now()}`,
-      memberName: 'Rifat Akın',
+      memberName: activeMemberDisplayName,
       ...payload,
       status: 'Onaylandı',
       attendanceBoost: 3,
     };
     const nextMakeups = [newEntry, ...makeupSubmissions];
-    setMakeupSubmissions(nextMakeups);
-    showToast(
-      'Make-up Bildirimi Onaylandı (+%3 Katılım)',
-      `${payload.targetClubOrEvent} katılımınız devam oranınıza eklendi.`
-    );
-    recordServerAudit(
+    const ok = await recordServerAudit(
       'QR Yoklama & Make-up',
       `Make-up Bildirimi Kaydedildi: ${payload.targetClubOrEvent}`,
-      `${payload.activityType} (${payload.date}) katılımı devam oranına +%3 olarak işlendi.`,
+      `${activeMemberDisplayName} · ${payload.activityType} (${payload.date}) katılımı devam oranına +%3 olarak işlendi.`,
       undefined,
       { makeupSubmissions: nextMakeups }
     );
+    if (!ok) return;
+    setMakeupSubmissions(nextMakeups);
+    showToast(
+      'Make-up Bildirimi Onaylandı (+%3 Katılım)',
+      `${payload.targetClubOrEvent} katılımınız sunucu onayıyla devam oranınıza eklendi.`
+    );
   };
 
-  const handleSendGuestMakeupCard = (
+  const handleSendGuestMakeupCard = async (
     payload: Omit<GuestRotaryMakeupCard, 'id' | 'sentAt' | 'verificationCode'>
   ) => {
     const newCard: GuestRotaryMakeupCard = {
@@ -839,38 +954,54 @@ export default function App() {
       sentAt: '23 Ekim 2026 · Şimdi',
       verificationCode: `GLR-2420-${Math.floor(1000 + Math.random() * 8999)}`,
     };
-    setGuestMakeupCards((prev) => [newCard, ...prev]);
+    const nextCards = [newCard, ...guestMakeupCards];
+    const ok = await recordServerAudit(
+      'QR Yoklama & Make-up',
+      `Misafir Rotaryen Make-up Sertifikası Düzenlendi: ${payload.guestName}`,
+      `${payload.guestName} (${payload.guestClub}) için resmi katılım sertifikası (${newCard.verificationCode}) oluşturuldu.`,
+      ['sekreter', 'baskan'],
+      { guestMakeupCards: nextCards }
+    );
+    if (!ok) return;
+    setGuestMakeupCards(nextCards);
     setActiveCertificateCard(newCard);
     showToast(
       'Resmi Dijital Make-up Sertifikası Hazır',
-      `${payload.guestName} (${payload.guestClub}) için ıslak imzalı ve mühürlü katılım belgesi oluşturuldu.`
+      `${payload.guestName} (${payload.guestClub}) için ıslak imzalı ve mühürlü katılım belgesi sunucu onayıyla oluşturuldu.`
     );
   };
 
-  const handleSubmitFiresideReport = (
+  const handleSubmitFiresideReport = async (
     groupId: string,
     summary: string,
     attendanceRate: string
   ) => {
-    setFiresideGroups((prev) =>
-      prev.map((group) =>
-        group.id === groupId
-          ? {
-              ...group,
-              reportSubmitted: true,
-              reportSummary: summary,
-              attendanceRate,
-            }
-          : group
-      )
+    const nextGroups = firesideGroups.map((group) =>
+      group.id === groupId
+        ? {
+            ...group,
+            reportSubmitted: true,
+            reportSummary: summary,
+            attendanceRate,
+          }
+        : group
     );
+    const ok = await recordServerAudit(
+      'QR Yoklama & Make-up',
+      `Ocakbaşı (Fireside) Raporu Yüklendi (${groupId})`,
+      `${activeMemberDisplayName} tarafından Ocakbaşı toplantı tutanağı (${attendanceRate}) kaydedildi.`,
+      undefined,
+      { firesideGroups: nextGroups }
+    );
+    if (!ok) return;
+    setFiresideGroups(nextGroups);
     showToast(
       'Ocakbaşı (Fireside) Raporu Yüklendi',
-      'Toplantı tutanağı ve katılım listesi Kulüp Genel Sekreterliğine iletildi.'
+      'Toplantı tutanağı ve katılım listesi sunucu onayıyla Kulüp Genel Sekreterliğine iletildi.'
     );
   };
 
-  const handleCreateFiresideGroup = (
+  const handleCreateFiresideGroup = async (
     newGroup: Omit<FiresideGroup, 'id' | 'reportSubmitted'>
   ) => {
     const created: FiresideGroup = {
@@ -878,10 +1009,19 @@ export default function App() {
       ...newGroup,
       reportSubmitted: false,
     };
-    setFiresideGroups((prev) => [created, ...prev]);
+    const nextGroups = [created, ...firesideGroups];
+    const ok = await recordServerAudit(
+      'QR Yoklama & Make-up',
+      `Yeni Ocakbaşı Grubu Kuruldu: ${newGroup.groupName}`,
+      `Ev sahibi ${newGroup.hostMember} ve ${newGroup.participants.length} katılımcı üye ile yeni Ocakbaşı grubu oluşturuldu.`,
+      ['sekreter', 'baskan'],
+      { firesideGroups: nextGroups }
+    );
+    if (!ok) return;
+    setFiresideGroups(nextGroups);
     showToast(
       `Yeni Ocakbaşı Grubu Kuruldu: ${newGroup.groupName}`,
-      `Ev sahibi ${newGroup.hostMember} ve ${newGroup.participants.length} katılımcı üyeye davet iletildi.`
+      `Ev sahibi ${newGroup.hostMember} ve ${newGroup.participants.length} katılımcı üyeye davet sunucu onayıyla kaydedildi.`
     );
   };
 
@@ -903,8 +1043,8 @@ export default function App() {
   }) => {
     const newPayment: PaymentNotification = {
       id: `pay-${Date.now()}`,
-      memberId: 'm-rifat',
-      memberName: 'Rtn. Rifat Akın',
+      memberId: activeMemberId,
+      memberName: activeMemberDisplayName,
       category: payload.category,
       amount: payload.amount,
       description: payload.description,
@@ -916,7 +1056,7 @@ export default function App() {
     const ok = await recordServerAudit(
       'Saymanlık & Kasa',
       `Dekont Bildirimi Alındı (${payload.receiptRef})`,
-      `Rtn. Rifat Akın ${formatTL(payload.amount)} tutarlı dekontu Sayman banka mutabakat kuyruğuna iletti.`,
+      `${activeMemberDisplayName} ${formatTL(payload.amount)} tutarlı dekontu Sayman banka mutabakat kuyruğuna iletti.`,
       undefined,
       { paymentNotifications: nextPayments }
     );
@@ -938,6 +1078,14 @@ export default function App() {
     if (!target) return;
 
     const token = sessionTokenRef.current || sessionToken;
+    if (!token) {
+      showToast(
+        'Sunucu Oturumu Gerekli (401)',
+        'Ödeme mutabakatı için doğrulanmış Sayman veya Başkan oturumu gereklidir.'
+      );
+      return;
+    }
+
     try {
       const res = await fetch('/api/pilot/reconcile-payment', {
         method: 'POST',
@@ -973,32 +1121,34 @@ export default function App() {
     }
   };
 
-  const handleRejectPayment = (paymentId: string) => {
+  const handleRejectPayment = async (paymentId: string) => {
     const target = paymentNotifications.find((p) => p.id === paymentId);
-    setPaymentNotifications((prev) =>
-      prev.map((p) => (p.id === paymentId ? { ...p, status: 'Reddedildi' } : p))
+    if (!target) return;
+    const nextPayments = paymentNotifications.map((p) =>
+      p.id === paymentId ? { ...p, status: 'Reddedildi' as const } : p
     );
-    if (target) {
-      showToast(
-        'Ödeme Bildirimi Reddedildi',
-        `${target.memberName} (${target.receiptRef}) dekont kaydı banka ekstresiyle uyuşmadığı için reddedildi.`
-      );
-    }
+    const ok = await recordServerAudit(
+      'Saymanlık & Kasa',
+      `Ödeme Bildirimi Reddedildi (${target.receiptRef})`,
+      `${target.memberName} (${target.receiptRef}) dekont kaydı banka ekstresiyle uyuşmadığı için reddedildi.`,
+      ['sayman', 'baskan'],
+      { paymentNotifications: nextPayments }
+    );
+    if (!ok) return;
+    setPaymentNotifications(nextPayments);
+    showToast(
+      'Ödeme Bildirimi Reddedildi',
+      `${target.memberName} (${target.receiptRef}) dekont kaydı sunucu onayıyla reddedildi.`
+    );
   };
 
   const handleSendGentleReminder = (overdueId: string) => {
     const target = overdueMembers.find((o) => o.id === overdueId);
-    setOverdueMembers((prev) =>
-      prev.map((o) =>
-        o.id === overdueId ? { ...o, lastRemindedAt: 'Az Önce İletildi' } : o
-      )
+    if (!target) return;
+    showToast(
+      'Nazik Hatırlatma Bildirimi Gönderildi',
+      `${target.memberName} için Rotary dostluk dilinde hazırlanan bakiye hatırlatması iletildi.`
     );
-    if (target) {
-      showToast(
-        'Nazik Hatırlatma Bildirimi Gönderildi',
-        `${target.memberName} için Rotary dostluk dilinde hazırlanan bakiye hatırlatması iletildi.`
-      );
-    }
   };
 
   const handleRemindMemberBalance = (memberName: string, totalDebt: number) => {
@@ -1014,106 +1164,85 @@ export default function App() {
     description: string
   ) => {
     const token = sessionTokenRef.current || sessionToken;
-    if (token) {
-      try {
-        const res = await fetch('/api/pilot/accrue-dues', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify({
-            clubId: activeTenantClubId,
-            category,
-            amount,
-            description,
-            dueDate: '15 Kasım 2026',
-          }),
-        });
-        const data = await res.json();
-        if (res.ok && data?.state) {
-          applyServerTenantState(data.state);
-          showToast(
-            `Sunucu Yönetimli Toplu Tahakkuk Uygulandı (${formatTL(amount)})`,
-            `Tüm kulüp üyelerinin "${category}" cari bakiyesine "${description}" kalemi sunucu tarafından işlendi.`
-          );
-          return;
-        }
-        showToast(
-          'Tahakkuk Yetki / Doğrulama Uyarısı',
-          data?.message || 'Toplu tahakkuk yalnızca Sayman veya Başkan oturumuyla yapılabilir.'
-        );
-        return;
-      } catch {
-        // Fallback to local state when offline
-      }
+    if (!token) {
+      showToast(
+        'Sunucu Oturumu Gerekli (401)',
+        'Toplu tahakkuk işlemi için doğrulanmış Sayman veya Başkan oturumu gereklidir.'
+      );
+      return;
     }
 
-    const nextMembers = applyBulkMemberAccrual(members, category, amount);
-    setMembers(nextMembers);
-    const nextFinItems = [
-      ...financialItems,
-      {
-        id: `fin-${Date.now()}`,
-        category,
-        title: description,
-        period: 'Ekim 2026 Tahakkuku',
-        totalAmount: amount,
-        paidAmount: 0,
-        dueDate: '15 Kasım 2026',
-      },
-    ];
-    setFinancialItems(nextFinItems);
-    showToast(
-      `Toplu Tahakkuk Uygulandı (${formatTL(amount)})`,
-      `Tüm kulüp üyelerinin "${category}" cari bakiyesine "${description}" kalemi eklendi.`
-    );
+    try {
+      const res = await fetch('/api/pilot/accrue-dues', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          clubId: activeTenantClubId,
+          category,
+          amount,
+          description,
+          dueDate: '15 Kasım 2026',
+        }),
+      });
+      const data = await res.json();
+      if (res.ok && data?.state) {
+        applyServerTenantState(data.state);
+        showToast(
+          `Sunucu Yönetimli Toplu Tahakkuk Uygulandı (${formatTL(amount)})`,
+          `Tüm kulüp üyelerinin "${category}" cari bakiyesine "${description}" kalemi sunucu tarafından işlendi.`
+        );
+        return;
+      }
+      showToast(
+        'Tahakkuk Yetki / Doğrulama Uyarısı',
+        data?.message || 'Toplu tahakkuk yalnızca Sayman veya Başkan oturumuyla yapılabilir.'
+      );
+    } catch {
+      showToast('Bağlantı Uyarısı', 'Sunucu tahakkuk servisine ulaşılamadı.');
+    }
   };
 
   const handleAddTreasuryEntry = async (entry: Omit<TreasuryLedgerEntry, 'id'>) => {
     const token = sessionTokenRef.current || sessionToken;
-    if (token) {
-      try {
-        const res = await fetch('/api/pilot/reconcile-expense', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify({
-            clubId: activeTenantClubId,
-            ...entry,
-          }),
-        });
-        const data = await res.json();
-        if (res.ok && data?.state) {
-          applyServerTenantState(data.state);
-          showToast(
-            `Sunucu Doğrulamalı Kasa Kaydı Eklendi (${entry.type})`,
-            `${entry.title} (${formatTL(entry.amount)}) mükerrer belge kontrolüyle Kulüp Kasa Defterine işlendi.`
-          );
-          return;
-        }
-        showToast(
-          'Kasa Defteri Mutabakat Kuralı (#39)',
-          data?.message || 'Kasa defteri kaydı doğrulanamadı.'
-        );
-        return;
-      } catch {
-        // Fallback to local state when offline
-      }
+    if (!token) {
+      showToast(
+        'Sunucu Oturumu Gerekli (401)',
+        'Kasa defteri kaydı eklemek için doğrulanmış Sayman veya Başkan oturumu gereklidir.'
+      );
+      return;
     }
 
-    const created: TreasuryLedgerEntry = {
-      id: `tr-${Date.now()}`,
-      ...entry,
-    };
-    const nextLedger = [created, ...treasuryLedger];
-    setTreasuryLedger(nextLedger);
-    showToast(
-      `Kasa Defteri Kaydı Eklendi (${entry.type})`,
-      `${entry.title} (${formatTL(entry.amount)}) Kulüp Kasa & Gelir-Gider Defterine işlendi.`
-    );
+    try {
+      const res = await fetch('/api/pilot/reconcile-expense', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          clubId: activeTenantClubId,
+          ...entry,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok && data?.state) {
+        applyServerTenantState(data.state);
+        showToast(
+          `Sunucu Doğrulamalı Kasa Kaydı Eklendi (${entry.type})`,
+          `${entry.title} (${formatTL(entry.amount)}) mükerrer belge kontrolüyle Kulüp Kasa Defterine işlendi.`
+        );
+        return;
+      }
+      showToast(
+        'Kasa Defteri Mutabakat Kuralı (#39)',
+        data?.message || 'Kasa defteri kaydı doğrulanamadı.'
+      );
+    } catch {
+      showToast('Bağlantı Uyarısı', 'Sunucu kasa defteri servisine ulaşılamadı.');
+    }
   };
 
   const handleDownloadFinanceCsvNotify = () => {
@@ -1125,10 +1254,11 @@ export default function App() {
 
   /**
    * Hardened Financial Integrity (#6, #39, #76):
-   * Member project support creates a pending payment notification with a unique bank reference.
+   * Member project support creates a pending payment notification with a unique bank reference
+   * and waits for server confirmation before updating state or displaying a toast.
    * Project collectedAmount is ONLY incremented when the Treasurer reconciles the bank statement via /api/pilot/reconcile-payment.
    */
-  const handleSupportProject = (
+  const handleSupportProject = async (
     projectId: string,
     amount: number,
     supportType: string
@@ -1148,8 +1278,8 @@ export default function App() {
 
     const newPayment: PaymentNotification = {
       id: `pay-prj-${Date.now()}`,
-      memberId: 'm-rifat',
-      memberName: 'Rtn. Rifat Akın',
+      memberId: activeMemberId,
+      memberName: activeMemberDisplayName,
       category: 'Vakıf / Proje Katkı Payı',
       amount,
       description: `${target.title} — ${supportType}`,
@@ -1159,18 +1289,19 @@ export default function App() {
       targetProjectId: projectId,
     };
     const nextPayments = [newPayment, ...paymentNotifications];
-    setPaymentNotifications(nextPayments);
 
-    recordServerAudit(
+    const ok = await recordServerAudit(
       'Projeler & Burslar',
       `Proje Katkı Bildirimi (Mutabakat Bekliyor): ${target.title}`,
-      `Rtn. Rifat Akın tarafından ${formatTL(amount)} (${supportType}) proje katkısı bildirildi; banka mutabakatı (${candidateRef}) sonrası proje fonuna işlenecek.`,
+      `${activeMemberDisplayName} tarafından ${formatTL(amount)} (${supportType}) proje katkısı bildirildi; banka mutabakatı (${candidateRef}) sonrası proje fonuna işlenecek.`,
       undefined,
       { paymentNotifications: nextPayments }
     );
+    if (!ok) return;
+    setPaymentNotifications(nextPayments);
     showToast(
       `${target.title} Katkı Bildiriminiz Alındı (${candidateRef})`,
-      `${formatTL(amount)} (${supportType}) katkınız Sayman banka mutabakat kuyruğuna eklendi; banka ekstresi eşleştiğinde proje bütçesine eklenecektir.`
+      `${formatTL(amount)} (${supportType}) katkınız sunucu onayıyla Sayman banka mutabakat kuyruğuna eklendi; banka ekstresi eşleştiğinde proje bütçesine eklenecektir.`
     );
   };
 
@@ -1181,10 +1312,10 @@ export default function App() {
       'Rtn. Deniz Arslan',
       'Rtn. Zeynep Yıldırım',
     ];
-    const isAlreadyVolunteer = currentList.includes('Rtn. Rifat Akın');
+    const isAlreadyVolunteer = currentList.includes(activeMemberDisplayName);
     const nextList = isAlreadyVolunteer
-      ? currentList.filter((v) => v !== 'Rtn. Rifat Akın')
-      : [...currentList, 'Rtn. Rifat Akın'];
+      ? currentList.filter((v) => v !== activeMemberDisplayName)
+      : [...currentList, activeMemberDisplayName];
 
     const nextProjects = projects.map((p) =>
       p.id === projectId ? { ...p, volunteers: nextList } : p
@@ -1192,7 +1323,7 @@ export default function App() {
     const ok = await recordServerAudit(
       'Projeler & Burslar',
       `Proje Saha Gönüllüsü Kaydı: ${target.title}`,
-      `Rtn. Rifat Akın "${target.title}" saha gönüllüsü listesine ${isAlreadyVolunteer ? 'çıkarıldı' : 'eklendi'}.`,
+      `${activeMemberDisplayName} "${target.title}" saha gönüllüsü listesine ${isAlreadyVolunteer ? 'çıkarıldı' : 'eklendi'}.`,
       undefined,
       { projects: nextProjects }
     );
@@ -1203,8 +1334,8 @@ export default function App() {
         ? `Gönüllü Kaydı Güncellendi: ${target.title}`
         : `Saha Gönüllüsü Oldunuz: ${target.title}`,
       isAlreadyVolunteer
-        ? 'Proje saha gönüllüsü kaydınız kaldırıldı.'
-        : 'Rtn. Rifat Akın saha gönüllüsü listesine eklendi ve katılımınız Make-up olarak kaydedildi.'
+        ? 'Proje saha gönüllüsü kaydınız sunucu onayıyla kaldırıldı.'
+        : `${activeMemberDisplayName} saha gönüllüsü listesine sunucu onayıyla eklendi.`
     );
   };
 
@@ -1216,7 +1347,7 @@ export default function App() {
       ...newProject,
       collectedAmount: newProject.ticketPrice * 2,
       supportersCount: 2,
-      volunteers: [newProject.committeeChair, 'Rtn. Rifat Akın'],
+      volunteers: [newProject.committeeChair, activeMemberDisplayName],
     };
     const nextProjects = [created, ...projects];
     const ok = await recordServerAudit(
@@ -1250,8 +1381,8 @@ export default function App() {
 
     const newPayment: PaymentNotification = {
       id: `pay-burs-${Date.now()}`,
-      memberId: 'm-rifat',
-      memberName: 'Rtn. Rifat Akın',
+      memberId: activeMemberId,
+      memberName: activeMemberDisplayName,
       category: 'Vakıf / Proje Katkı Payı',
       amount: target.monthlyStipend,
       description: `${target.fullName} (${target.university}) 1 Aylık Burs Taahhüdü`,
@@ -1318,15 +1449,6 @@ export default function App() {
     );
   };
 
-  const activeMemberDisplayName =
-    activeRole === 'sekreter'
-      ? 'Rtn. Av. Nazlı Denizmen'
-      : activeRole === 'sayman'
-      ? 'Rtn. YMM Levent Soydan'
-      : activeRole === 'baskan'
-      ? 'Rtn. Mimar Emre Karaca'
-      : 'Rtn. Rifat Akın';
-
   const handleUpdateMeetingHotelCommitment = async (
     meetingNo: number,
     patch: Partial<WeeklyMeeting>
@@ -1366,9 +1488,10 @@ export default function App() {
     shiftId: string,
     volunteerName: string
   ) => {
+    const effectiveName = sessionUser?.fullName || volunteerName;
     const targetSlot = volunteerShifts.find((s) => s.id === shiftId);
     if (!targetSlot) return;
-    const isAlreadyIn = targetSlot.assignedVolunteers.includes(volunteerName);
+    const isAlreadyIn = targetSlot.assignedVolunteers.includes(effectiveName);
     if (
       !isAlreadyIn &&
       targetSlot.assignedVolunteers.length >= targetSlot.requiredCount
@@ -1383,12 +1506,12 @@ export default function App() {
     const nextShifts = toggleVolunteerShiftAssignment(
       volunteerShifts,
       shiftId,
-      volunteerName
+      effectiveName
     );
     const ok = await recordServerAudit(
       'QR Yoklama & Make-up',
       `Vardiya Gönüllü Ataması: ${targetSlot.taskTitle}`,
-      `${volunteerName} "${targetSlot.taskTitle}" vardiyasına ${isAlreadyIn ? 'ayrıldı' : 'katıldı'}.`,
+      `${effectiveName} "${targetSlot.taskTitle}" vardiyasına ${isAlreadyIn ? 'ayrıldı' : 'katıldı'}.`,
       undefined,
       { volunteerShifts: nextShifts }
     );
@@ -1399,8 +1522,8 @@ export default function App() {
         ? `Vardiya Görevinden Ayrıldınız: ${targetSlot.taskTitle}`
         : `Vardiya Görevi Atandı: ${targetSlot.taskTitle}`,
       isAlreadyIn
-        ? `${volunteerName} sunucu onayıyla vardiya listesinden çıkarıldı.`
-        : `${volunteerName} (${targetSlot.shiftWindow}) sunucu onayıyla vardiya çizelgesine kaydedildi.`
+        ? `${effectiveName} sunucu onayıyla vardiya listesinden çıkarıldı.`
+        : `${effectiveName} (${targetSlot.shiftWindow}) sunucu onayıyla vardiya çizelgesine kaydedildi.`
     );
   };
 
@@ -1418,7 +1541,7 @@ export default function App() {
         termInfo={termInfo}
         onOpenWalletModal={() =>
           setWalletModalMember(
-            members.find((m) => m.id === 'm-rifat') || members[0]
+            members.find((m) => m.id === activeMemberId) || members[0]
           )
         }
         onOpenSplashModal={() => setIsSplashModalOpen(true)}

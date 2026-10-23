@@ -111,16 +111,8 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
 
   const isBoardLeader = activeRole === 'sekreter' || activeRole === 'baskan';
 
-  // Issue #46 Live Volunteer, Task & Shift Management bound to active session/role member
-  const effectiveVolunteerName =
-    activeMemberName ||
-    (activeRole === 'sekreter'
-      ? 'Rtn. Dr. Kerem Aydın'
-      : activeRole === 'sayman'
-      ? 'Rtn. YMM Levent Soydan'
-      : activeRole === 'baskan'
-      ? 'Rtn. Av. Nazlı Denizmen'
-      : 'Rtn. Rifat Akın');
+  // Issue #46 Live Volunteer, Task & Shift Management bound to authenticated session member
+  const effectiveVolunteerName = activeMemberName || 'Rtn. Rifat Akın';
 
   const [localVolunteerShifts, setLocalVolunteerShifts] = useState<
     VolunteerShiftSlot[]

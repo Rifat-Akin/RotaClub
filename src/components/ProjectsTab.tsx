@@ -281,7 +281,7 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({
                       type="button"
                       onClick={() => onToggleProjectVolunteer(project.id)}
                       className={`w-full min-h-[44px] py-2.5 px-3 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 border transition-colors cursor-pointer ${
-                        (project.volunteers || []).includes('Rtn. Rifat Akın')
+                        (project.volunteers || []).includes(activeMemberName)
                           ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
                           : 'bg-slate-100 hover:bg-slate-200 text-slate-800 border-slate-200'
                       }`}

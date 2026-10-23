@@ -2456,5 +2456,111 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
     assert.equal(unauthorizedSpecRes.status, 403);
     const unauthorizedSpecBody = await unauthorizedSpecRes.json();
     assert.equal(unauthorizedSpecBody.error, 'RBAC_FORBIDDEN');
+
+    // 7. Issue #17 & #76 Unauthenticated Sync Rejection Test: Missing Bearer token on QR check-in, make-up, or volunteer shift sync MUST fail with 401 AUTH_REQUIRED
+    const unauthSyncRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: selfLeaveBody.revision,
+        state: { qrCheckedIn: true },
+      }),
+    });
+    assert.equal(unauthSyncRes.status, 401);
+    const unauthSyncBody = await unauthSyncRes.json();
+    assert.equal(unauthSyncBody.error, 'AUTH_REQUIRED');
+
+    // 8. Issue #46 & #76 Real Member Identity Test: Newly provisioned member account receives exact authenticatedUser.fullName and can only register their own real name in volunteerShifts
+    const registerNewMemberRes = await fetch(
+      `${baseUrl}/api/auth/register-member-account`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sekreterSession.token}`,
+        },
+        body: JSON.stringify({
+          memberId: 'm-selim-yalcin',
+          rotaryId: 'TR-2420-99104',
+          fullName: 'Rtn. Dr. Selim Yalçın',
+          email: 'selim.yalcin@galatarotary.org',
+          role: 'uye',
+          clubId: 'club-galata',
+          initialPinOrPassword: 'SelimGlt!2026#',
+        }),
+      }
+    );
+    assert.equal(registerNewMemberRes.status, 201);
+
+    const selimSession = await loginRole(
+      baseUrl,
+      'TR-2420-99104',
+      'SelimGlt!2026#'
+    );
+    const selimStateRes = await fetch(
+      `${baseUrl}/api/pilot/state?clubId=club-galata`,
+      {
+        headers: { Authorization: `Bearer ${selimSession.token}` },
+      }
+    );
+    assert.equal(selimStateRes.status, 200);
+    const selimState = await selimStateRes.json();
+    assert.equal(selimState.authenticatedUser.memberId, 'm-selim-yalcin');
+    assert.equal(
+      selimState.authenticatedUser.fullName,
+      'Rtn. Dr. Selim Yalçın'
+    );
+
+    // Selim attempting to add a role-based sample name ('Rtn. Rifat Akın') instead of his own real name is rejected with 403
+    const spoofedSampleNameShifts = selimState.volunteerShifts.map(
+      (s: { id: string; assignedVolunteers: string[] }) =>
+        s.id === 'shift-ryla-1'
+          ? {
+              ...s,
+              assignedVolunteers: [...s.assignedVolunteers, 'Rtn. Rifat Akın'],
+            }
+          : s
+    );
+    const spoofedSampleRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${selimSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: selimState.revision,
+        state: { volunteerShifts: spoofedSampleNameShifts },
+      }),
+    });
+    assert.equal(spoofedSampleRes.status, 403);
+
+    // Selim adding his own real authenticated name ('Rtn. Dr. Selim Yalçın') to an open shift succeeds with 200 OK
+    const selimRealNameShifts = selimState.volunteerShifts.map(
+      (s: { id: string; assignedVolunteers: string[] }) =>
+        s.id === 'shift-ryla-1'
+          ? {
+              ...s,
+              assignedVolunteers: [
+                ...s.assignedVolunteers,
+                selimState.authenticatedUser.fullName,
+              ],
+            }
+          : s
+    );
+    const selimRealJoinRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${selimSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: selimState.revision,
+        state: { volunteerShifts: selimRealNameShifts },
+      }),
+    });
+    assert.equal(selimRealJoinRes.status, 200);
   });
 });
