@@ -2358,7 +2358,7 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
               ...s,
               assignedVolunteers: [
                 ...s.assignedVolunteers,
-                'Rtn. Fazla Gönüllü',
+                'Rtn. Rifat Akın',
               ],
             }
           : s
@@ -2378,7 +2378,83 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
     assert.equal(overCapRes.status, 422);
     const overCapBody = await overCapRes.json();
     assert.equal(overCapBody.error, 'SHIFT_CAPACITY_EXCEEDED');
+
+    // 4. Issue #46 Negative Test: Regular member ('uye') attempting to remove or add ANOTHER member's volunteer shift record MUST fail with 403 VOLUNTEER_SHIFT_FORBIDDEN_MUTATION
+    const tamperOtherMemberShift = initialState.volunteerShifts.map(
+      (s: { id: string; assignedVolunteers: string[] }) =>
+        s.id === 'shift-galatart-1'
+          ? {
+              ...s,
+              assignedVolunteers: ['Rtn. Rifat Akın'], // Attempted to remove 'Rtn. Av. Nazlı Denizmen'
+            }
+          : s
+    );
+    const tamperOtherRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${uyeSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: lockHotelBody.revision,
+        state: { volunteerShifts: tamperOtherMemberShift },
+      }),
+    });
+    assert.equal(tamperOtherRes.status, 403);
+    const tamperOtherBody = await tamperOtherRes.json();
+    assert.equal(tamperOtherBody.error, 'VOLUNTEER_SHIFT_FORBIDDEN_MUTATION');
+
+    // 5. Issue #46 Positive Test: Regular member ('uye') leaving and re-joining THEIR OWN shift ('Rtn. Rifat Akın') succeeds with 200 OK
+    const selfLeaveShifts = initialState.volunteerShifts.map(
+      (s: { id: string; assignedVolunteers: string[] }) =>
+        s.id === 'shift-galatart-1'
+          ? {
+              ...s,
+              assignedVolunteers: s.assignedVolunteers.filter(
+                (v) => v !== 'Rtn. Rifat Akın'
+              ),
+            }
+          : s
+    );
+    const selfLeaveRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${uyeSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: lockHotelBody.revision,
+        state: { volunteerShifts: selfLeaveShifts },
+      }),
+    });
+    assert.equal(selfLeaveRes.status, 200);
+    const selfLeaveBody = await selfLeaveRes.json();
+
+    // 6. Issue #51 Negative Test: Regular member ('uye') attempting to mutate specializedModules MUST fail with 403 RBAC_FORBIDDEN
+    const unauthorizedSpecRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${uyeSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: selfLeaveBody.revision,
+        state: {
+          specializedModules: {
+            ...initialState.specializedModules,
+            kermes: {
+              ...initialState.specializedModules.kermes,
+              allocatedStalls: 1,
+            },
+          },
+        },
+      }),
+    });
+    assert.equal(unauthorizedSpecRes.status, 403);
+    const unauthorizedSpecBody = await unauthorizedSpecRes.json();
+    assert.equal(unauthorizedSpecBody.error, 'RBAC_FORBIDDEN');
   });
 });
-
-

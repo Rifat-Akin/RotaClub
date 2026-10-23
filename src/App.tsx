@@ -278,65 +278,71 @@ export default function App() {
    * Sends ONLY the changed delta patch with optimistic concurrency control (expectedRevision) (#14, #18)
    * Never dumps stale full-state arrays over concurrent edits!
    */
-  const recordServerAudit = (
+  const recordServerAudit = async (
     module: AuditLogEntry['module'],
     action: string,
     detail: string,
     requiredRoles?: ClubRole[],
     patchOverride?: Record<string, unknown>
-  ) => {
+  ): Promise<boolean> => {
     const token = sessionTokenRef.current || sessionToken;
-    if (!token) return;
+    if (!token) return true;
 
-    fetch('/api/pilot/sync', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        clubId: activeTenantClubId,
-        expectedRevision: serverRevisionRef.current,
-        auditEvent: {
-          module,
-          action,
-          detail,
-          requiredRoles,
+    try {
+      const res = await fetch('/api/pilot/sync', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
         },
-        state: patchOverride || {},
-      }),
-    })
-      .then(async (res) => {
-        if (res.status === 409) {
-          // Revision conflict or duplicate reference: reload authoritative server state
-          await authenticateAndFetchClubState(
-            activeRole,
-            activeTenantClubId,
-            token
-          );
-          return null;
-        }
-        return res.ok ? res.json() : null;
-      })
-      .then((data) => {
-        if (!data) return;
-        if (typeof data.revision === 'number') {
-          serverRevisionRef.current = data.revision;
-        }
-        if (data.state) {
-          applyServerTenantState(data.state);
-        } else {
-          if (data.auditLogs) setAuditLogs(data.auditLogs);
-          if (data.updatedAt) setServerSyncedAt(data.updatedAt);
-          if (data.auditVerification) {
-            setAuditChainValid(Boolean(data.auditVerification.valid));
-            if (data.auditVerification.headHash) {
-              setAuditHeadHash(data.auditVerification.headHash);
-            }
+        body: JSON.stringify({
+          clubId: activeTenantClubId,
+          expectedRevision: serverRevisionRef.current,
+          auditEvent: {
+            module,
+            action,
+            detail,
+            requiredRoles,
+          },
+          state: patchOverride || {},
+        }),
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        await authenticateAndFetchClubState(
+          activeRole,
+          activeTenantClubId,
+          token
+        );
+        showToast(
+          'Sunucu Doğrulama Uyarısı',
+          errData?.message || 'İşlem sunucu tarafından onaylanmadı.'
+        );
+        return false;
+      }
+
+      const data = await res.json();
+      if (typeof data?.revision === 'number') {
+        serverRevisionRef.current = data.revision;
+      }
+      if (data?.state) {
+        applyServerTenantState(data.state);
+      } else if (data) {
+        if (data.auditLogs) setAuditLogs(data.auditLogs);
+        if (data.updatedAt) setServerSyncedAt(data.updatedAt);
+        if (data.auditVerification) {
+          setAuditChainValid(Boolean(data.auditVerification.valid));
+          if (data.auditVerification.headHash) {
+            setAuditHeadHash(data.auditVerification.headHash);
           }
         }
-      })
-      .catch(() => {});
+      }
+      return true;
+    } catch {
+      showToast('Bağlantı Uyarısı', 'Sunucu senkronizasyon servisine ulaşılamadı.');
+      return false;
+    }
   };
 
   const showToast = (title: string, detail: string) => {
@@ -433,7 +439,7 @@ export default function App() {
     }
   };
 
-  const handleAddBoardResolution = (
+  const handleAddBoardResolution = async (
     payload: Omit<BoardResolutionItem, 'id' | 'signedBy'>
   ) => {
     const created: BoardResolutionItem = {
@@ -443,30 +449,32 @@ export default function App() {
         'Rtn. Mimar Emre Karaca (Başkan) · Rtn. Av. Nazlı Denizmen (Sekreter)',
     };
     const nextList = [created, ...boardResolutions];
-    setBoardResolutions(nextList);
-    recordServerAudit(
+    const ok = await recordServerAudit(
       'Yönetim & Güvenlik',
       `YK Karar Defterine Kayıt: ${payload.resolutionNo}`,
       `${payload.title} (${payload.voteStatus}) Yönetim Kurulu Karar Defterine işlendi.`,
       ['sekreter', 'baskan'],
       { boardResolutions: nextList }
     );
+    if (!ok) return;
+    setBoardResolutions(nextList);
     showToast(
       `YK Kararı Kaydedildi (${payload.resolutionNo})`,
       `"${payload.title}" Yönetim Kurulu Karar Defterine eklendi.`
     );
   };
 
-  const handleToggleKvkkMaskPhone = () => {
+  const handleToggleKvkkMaskPhone = async () => {
     const nextState = !kvkkMaskPhone;
-    setKvkkMaskPhone(nextState);
-    recordServerAudit(
+    const ok = await recordServerAudit(
       'Yönetim & Güvenlik',
       `KVKK Telefon Maskeleme ${nextState ? 'Aktif Edildi' : 'Kapatıldı'}`,
       `Üye rehberi telefon numaraları KVKK gizlilik modu kapsamında ${nextState ? 'maskelendi' : 'tam görünüme açıldı'}.`,
       ['sekreter', 'sayman', 'baskan'],
       { kvkkMaskPhone: nextState }
     );
+    if (!ok) return;
+    setKvkkMaskPhone(nextState);
     showToast(
       nextState ? 'KVKK Telefon Maskeleme Aktif' : 'KVKK Telefon Maskeleme Kapatıldı',
       nextState
@@ -588,12 +596,10 @@ export default function App() {
     );
   };
 
-  const handleChangeRsvpStatus = (status: RsvpStatus) => {
-    setRsvpStatus(status);
+  const handleChangeRsvpStatus = async (status: RsvpStatus) => {
     const nextMembers = members.map((m) =>
       m.id === 'm-rifat' ? { ...m, rsvpStatus: status } : m
     );
-    setMembers(nextMembers);
     const statusLabels: Record<RsvpStatus, string> = {
       attending: 'Katılıyorum (1 Kuver)',
       with_spouse: 'Eşli Katılıyorum (+1 · 2 Kuver)',
@@ -601,44 +607,49 @@ export default function App() {
       excused: 'Mazeretliyim (Kuver Düşüldü)',
       pending: 'Yanıt Bekleniyor',
     };
-    showToast(
-      `LCV Güncellendi: ${statusLabels[status]}`,
-      'Pera Palace Hotel canlı kuver listesi ve İsim İsim LCV Matrisi anında güncellendi.'
-    );
-    recordServerAudit(
+    const ok = await recordServerAudit(
       'LCV & Kuver',
       `LCV Bildirimi Güncellendi (${statusLabels[status]})`,
       `Rtn. Rifat Akın #${selectedMeetingNo} toplantı LCV durumunu "${statusLabels[status]}" olarak güncelledi.`,
       undefined,
       { rsvpStatus: status, members: nextMembers }
     );
+    if (!ok) return;
+    setRsvpStatus(status);
+    setMembers(nextMembers);
+    showToast(
+      `LCV Güncellendi: ${statusLabels[status]}`,
+      'Pera Palace Hotel canlı kuver listesi ve İsim İsim LCV Matrisi sunucu onayıyla güncellendi.'
+    );
   };
 
-  const handleChangeMenuPreference = (menu: MenuPreference) => {
-    setMenuPreference(menu);
+  const handleChangeMenuPreference = async (menu: MenuPreference) => {
     const nextMembers = members.map((m) =>
       m.id === 'm-rifat' ? { ...m, mealPreference: menu } : m
     );
-    setMembers(nextMembers);
-    showToast(
-      `Menü Tercihi: ${menu}`,
-      `Toplantı akşam yemeği tercihiniz "${menu} Menü" olarak kaydedildi.`
-    );
-    recordServerAudit(
+    const ok = await recordServerAudit(
       'LCV & Kuver',
       `Menü Tercihi Güncellendi (${menu})`,
       `Rtn. Rifat Akın akşam yemeği menü tercihini "${menu}" olarak güncelledi.`,
       undefined,
       { menuPreference: menu, members: nextMembers }
     );
+    if (!ok) return;
+    setMenuPreference(menu);
+    setMembers(nextMembers);
+    showToast(
+      `Menü Tercihi: ${menu}`,
+      `Toplantı akşam yemeği tercihiniz "${menu} Menü" olarak kaydedildi.`
+    );
   };
 
-  const handleUpdateMemberRsvp = (
+  const handleUpdateMemberRsvp = async (
     memberId: string,
     status: RsvpStatus,
     menu?: MenuPreference
   ) => {
     const target = members.find((m) => m.id === memberId);
+    if (!target) return;
     const nextMembers = members.map((m) =>
       m.id === memberId
         ? {
@@ -648,24 +659,23 @@ export default function App() {
           }
         : m
     );
+    const ok = await recordServerAudit(
+      'LCV & Kuver',
+      `Sekreterlik Kuver Matrisi Güncellemesi: ${target.fullName}`,
+      `${target.fullName} üyesinin LCV durumu "${status}" olarak Sekreterlik/Başkanlık tarafından güncellendi.`,
+      ['sekreter', 'baskan'],
+      { members: nextMembers }
+    );
+    if (!ok) return;
     setMembers(nextMembers);
     if (memberId === 'm-rifat') {
       setRsvpStatus(status);
       if (menu) setMenuPreference(menu);
     }
-    if (target) {
-      showToast(
-        `Üye LCV Durumu Güncellendi: ${target.fullName}`,
-        'Pera Palace Hotel canlı kuver toplamı yeni LCV durumuna göre yeniden hesaplandı.'
-      );
-      recordServerAudit(
-        'LCV & Kuver',
-        `Sekreterlik Kuver Matrisi Güncellemesi: ${target.fullName}`,
-        `${target.fullName} üyesinin LCV durumu "${status}" olarak Sekreterlik/Başkanlık tarafından güncellendi.`,
-        ['sekreter', 'baskan'],
-        { members: nextMembers }
-      );
-    }
+    showToast(
+      `Üye LCV Durumu Güncellendi: ${target.fullName}`,
+      'Pera Palace Hotel canlı kuver toplamı yeni LCV durumuna göre yeniden hesaplandı.'
+    );
   };
 
   const handleRemindUnrespondedMembers = () => {
@@ -685,20 +695,21 @@ export default function App() {
     );
   };
 
-  const handleCreateNewMeeting = (newMeeting: WeeklyMeeting) => {
+  const handleCreateNewMeeting = async (newMeeting: WeeklyMeeting) => {
     const nextMeetings = [...meetings, newMeeting];
-    setMeetings(nextMeetings);
-    setSelectedMeetingNo(newMeeting.meetingNo);
-    showToast(
-      `Yeni Toplantı Planlandı (#${newMeeting.meetingNo})`,
-      `${newMeeting.date} tarihli "${newMeeting.topic}" toplantısı bülten takvimine eklendi.`
-    );
-    recordServerAudit(
+    const ok = await recordServerAudit(
       'LCV & Kuver',
       `Yeni Haftalık Toplantı Planlandı (#${newMeeting.meetingNo})`,
       `${newMeeting.date} · ${newMeeting.speakerName} (${newMeeting.topic}) bülten takvimine eklendi.`,
       ['sekreter', 'baskan'],
       { meetings: nextMeetings, selectedMeetingNo: newMeeting.meetingNo }
+    );
+    if (!ok) return;
+    setMeetings(nextMeetings);
+    setSelectedMeetingNo(newMeeting.meetingNo);
+    showToast(
+      `Yeni Toplantı Planlandı (#${newMeeting.meetingNo})`,
+      `${newMeeting.date} tarihli "${newMeeting.topic}" toplantısı bülten takvimine eklendi.`
     );
   };
 
@@ -884,7 +895,7 @@ export default function App() {
     );
   };
 
-  const handleSubmitPaymentNotification = (payload: {
+  const handleSubmitPaymentNotification = async (payload: {
     category: FinancialLineItem['category'];
     amount: number;
     description: string;
@@ -902,14 +913,15 @@ export default function App() {
       status: 'Bekliyor',
     };
     const nextPayments = [newPayment, ...paymentNotifications];
-    setPaymentNotifications(nextPayments);
-    recordServerAudit(
+    const ok = await recordServerAudit(
       'Saymanlık & Kasa',
       `Dekont Bildirimi Alındı (${payload.receiptRef})`,
       `Rtn. Rifat Akın ${formatTL(payload.amount)} tutarlı dekontu Sayman banka mutabakat kuyruğuna iletti.`,
       undefined,
       { paymentNotifications: nextPayments }
     );
+    if (!ok) return;
+    setPaymentNotifications(nextPayments);
     showToast(
       'Dekont Bildirimi Banka Mutabakat Kuyruğuna Eklendi',
       `${formatTL(payload.amount)} tutarındaki bildiriminiz Sayman banka ekstresi eşleştirmesi sonrasında cari bakiyenizden düşülecektir.`
@@ -1162,7 +1174,7 @@ export default function App() {
     );
   };
 
-  const handleToggleProjectVolunteer = (projectId: string) => {
+  const handleToggleProjectVolunteer = async (projectId: string) => {
     const target = projects.find((p) => p.id === projectId);
     if (!target) return;
     const currentList = target.volunteers || [
@@ -1177,6 +1189,14 @@ export default function App() {
     const nextProjects = projects.map((p) =>
       p.id === projectId ? { ...p, volunteers: nextList } : p
     );
+    const ok = await recordServerAudit(
+      'Projeler & Burslar',
+      `Proje Saha Gönüllüsü Kaydı: ${target.title}`,
+      `Rtn. Rifat Akın "${target.title}" saha gönüllüsü listesine ${isAlreadyVolunteer ? 'çıkarıldı' : 'eklendi'}.`,
+      undefined,
+      { projects: nextProjects }
+    );
+    if (!ok) return;
     setProjects(nextProjects);
     showToast(
       isAlreadyVolunteer
@@ -1186,16 +1206,9 @@ export default function App() {
         ? 'Proje saha gönüllüsü kaydınız kaldırıldı.'
         : 'Rtn. Rifat Akın saha gönüllüsü listesine eklendi ve katılımınız Make-up olarak kaydedildi.'
     );
-    recordServerAudit(
-      'Projeler & Burslar',
-      `Proje Saha Gönüllüsü Kaydı: ${target.title}`,
-      `Rtn. Rifat Akın "${target.title}" saha gönüllüsü listesine ${isAlreadyVolunteer ? 'çıkarıldı' : 'eklendi'}.`,
-      undefined,
-      { projects: nextProjects }
-    );
   };
 
-  const handleCreateProject = (
+  const handleCreateProject = async (
     newProject: Omit<GalataProject, 'id' | 'collectedAmount' | 'supportersCount'>
   ) => {
     const created: GalataProject = {
@@ -1206,21 +1219,22 @@ export default function App() {
       volunteers: [newProject.committeeChair, 'Rtn. Rifat Akın'],
     };
     const nextProjects = [created, ...projects];
-    setProjects(nextProjects);
-    recordServerAudit(
+    const ok = await recordServerAudit(
       'Projeler & Burslar',
       `Yeni Hizmet Projesi Başlatıldı: ${newProject.title}`,
       `Hedef bütçesi ${formatTL(newProject.targetBudget)} olan proje yayına alındı.`,
       ['sekreter', 'baskan'],
       { projects: nextProjects }
     );
+    if (!ok) return;
+    setProjects(nextProjects);
     showToast(
       `Yeni Hizmet Projesi Başlatıldı: ${newProject.title}`,
       `Hedef bütçesi ${formatTL(newProject.targetBudget)} olan proje bağış termometresiyle yayına alındı.`
     );
   };
 
-  const handleSponsorScholarMonth = (scholarId: string) => {
+  const handleSponsorScholarMonth = async (scholarId: string) => {
     const target = scholars.find((s) => s.id === scholarId);
     if (!target) return;
 
@@ -1247,50 +1261,53 @@ export default function App() {
       targetScholarId: scholarId,
     };
     const nextPayments = [newPayment, ...paymentNotifications];
-    setPaymentNotifications(nextPayments);
 
-    recordServerAudit(
+    const ok = await recordServerAudit(
       'Projeler & Burslar',
       `1 Aylık Eğitim Bursu Bildirimi (Mutabakat Bekliyor): ${target.fullName}`,
       `${target.university} öğrencisi için ${formatTL(target.monthlyStipend)} burs katkısı Sayman banka mutabakat kuyruğuna (${candidateRef}) eklendi.`,
       undefined,
       { paymentNotifications: nextPayments }
     );
+    if (!ok) return;
+    setPaymentNotifications(nextPayments);
     showToast(
       `1 Aylık Eğitim Bursu Bildirimi Kaydedildi (${candidateRef})`,
       `${target.university} öğrencimiz için ${formatTL(target.monthlyStipend)} burs katkınız Sayman banka mutabakat kuyruğuna eklendi; mutabakat onayıyla burs ay sayısına eklenecektir.`
     );
   };
 
-  const handleAddNewMember = (newMember: RotaryMember) => {
+  const handleAddNewMember = async (newMember: RotaryMember) => {
     const nextMembers = [newMember, ...members];
-    setMembers(nextMembers);
-    recordServerAudit(
+    const ok = await recordServerAudit(
       'Yönetim & Güvenlik',
       `Yeni Kulüp Üyesi Kabulü: Rtn. ${newMember.fullName}`,
       `${newMember.classification} (${newMember.rotaryId}) Galata Rotary Üye Rehberine eklendi.`,
       ['sekreter', 'baskan'],
       { members: nextMembers }
     );
+    if (!ok) return;
+    setMembers(nextMembers);
     showToast(
       `Yeni Kulüp Üyesi Eklendi: Rtn. ${newMember.fullName}`,
       `${newMember.classification} sınıflandırmasıyla Galata Rotary Üye Rehberine ve LCV/Cari matrislere kaydedildi.`
     );
   };
 
-  const handleTriggerRollover = () => {
+  const handleTriggerRollover = async () => {
     const nextTerm = executeJulyFirstRollover(termInfo);
-    setTermInfo(nextTerm);
-    showToast(
-      '1 Temmuz Dönem Devir-Teslimi Tamamlandı',
-      '2026-2027 Dönemi "Galata Dijital Yıllığı" olarak arşivlendi ve 2027-2028 Yönetim Kurulu aktif edildi.'
-    );
-    recordServerAudit(
+    const ok = await recordServerAudit(
       'Yönetim & Güvenlik',
       '1 Temmuz Dönem Devir-Teslim (Rollover) Tamamlandı',
       '2026-2027 Dönemi Galata Dijital Yıllığı olarak arşivlendi ve 2027-2028 Yönetim Kurulu aktif edildi.',
       ['sekreter', 'baskan'],
       { termInfo: nextTerm }
+    );
+    if (!ok) return;
+    setTermInfo(nextTerm);
+    showToast(
+      '1 Temmuz Dönem Devir-Teslimi Tamamlandı',
+      '2026-2027 Dönemi "Galata Dijital Yıllığı" olarak arşivlendi ve 2027-2028 Yönetim Kurulu aktif edildi.'
     );
   };
 
@@ -1303,22 +1320,21 @@ export default function App() {
 
   const activeMemberDisplayName =
     activeRole === 'sekreter'
-      ? 'Rtn. Dr. Kerem Aydın'
+      ? 'Rtn. Av. Nazlı Denizmen'
       : activeRole === 'sayman'
       ? 'Rtn. YMM Levent Soydan'
       : activeRole === 'baskan'
-      ? 'Rtn. Av. Nazlı Denizmen'
+      ? 'Rtn. Mimar Emre Karaca'
       : 'Rtn. Rifat Akın';
 
-  const handleUpdateMeetingHotelCommitment = (
+  const handleUpdateMeetingHotelCommitment = async (
     meetingNo: number,
     patch: Partial<WeeklyMeeting>
   ) => {
     const nextMeetings = meetings.map((m) =>
       m.meetingNo === meetingNo ? { ...m, ...patch } : m
     );
-    setMeetings(nextMeetings);
-    recordServerAudit(
+    const ok = await recordServerAudit(
       'LCV & Kuver',
       `Otel Banket & LCV Mutabakatı Güncellendi (#${meetingNo})`,
       patch.hotelConfirmationRef
@@ -1327,15 +1343,26 @@ export default function App() {
       ['sekreter', 'baskan'],
       { meetings: nextMeetings }
     );
+    if (!ok) return;
+    setMeetings(nextMeetings);
     if (patch.hotelConfirmationRef) {
       showToast(
         `Otel Banket Teyidi Kaydedildi (${patch.hotelConfirmationRef})`,
-        `Toplantı #${meetingNo} kesin kuver listesi otele onaylandı ve kilitlendi (#29).`
+        `Toplantı #${meetingNo} kesin kuver listesi sunucu onayıyla otele onaylandı ve kilitlendi (#29).`
+      );
+    } else if (typeof patch.isLcvLockedForHotel === 'boolean') {
+      showToast(
+        patch.isLcvLockedForHotel
+          ? `Toplantı #${meetingNo} Kesin LCV Listesi Kilitlendi (#29)`
+          : `Toplantı #${meetingNo} LCV Kilidi Açıldı (#29)`,
+        patch.isLcvLockedForHotel
+          ? 'Üye LCV/menü değişiklikleri kilitlendi; otel banket teyit referansı kaydedilebilir.'
+          : 'Toplantı LCV bildirimleri yeniden üye güncellemesine açıldı.'
       );
     }
   };
 
-  const handleToggleVolunteerShift = (
+  const handleToggleVolunteerShift = async (
     shiftId: string,
     volunteerName: string
   ) => {
@@ -1358,21 +1385,22 @@ export default function App() {
       shiftId,
       volunteerName
     );
-    setVolunteerShifts(nextShifts);
-    recordServerAudit(
+    const ok = await recordServerAudit(
       'QR Yoklama & Make-up',
       `Vardiya Gönüllü Ataması: ${targetSlot.taskTitle}`,
       `${volunteerName} "${targetSlot.taskTitle}" vardiyasına ${isAlreadyIn ? 'ayrıldı' : 'katıldı'}.`,
       undefined,
       { volunteerShifts: nextShifts }
     );
+    if (!ok) return;
+    setVolunteerShifts(nextShifts);
     showToast(
       isAlreadyIn
         ? `Vardiya Görevinden Ayrıldınız: ${targetSlot.taskTitle}`
         : `Vardiya Görevi Atandı: ${targetSlot.taskTitle}`,
       isAlreadyIn
-        ? `${volunteerName} vardiya listesinden çıkarıldı.`
-        : `${volunteerName} (${targetSlot.shiftWindow}) vardiya çizelgesine kaydedildi.`
+        ? `${volunteerName} sunucu onayıyla vardiya listesinden çıkarıldı.`
+        : `${volunteerName} (${targetSlot.shiftWindow}) sunucu onayıyla vardiya çizelgesine kaydedildi.`
     );
   };
 

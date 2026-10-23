@@ -2497,21 +2497,133 @@ export function createPilotExpressApp(
         }
       }
 
-      // Issue #46 Fix: Enforce strict volunteer shift capacity on the server
+      // Issue #46 Fix: Enforce strict volunteer shift capacity AND per-member identity authorization on the server
       if (Array.isArray(incomingPatch.volunteerShifts)) {
+        const currentVolunteerShifts = currentTenant.volunteerShifts || [];
+        const existingShiftsById = new Map(
+          currentVolunteerShifts.map((s) => [s.id, s])
+        );
+        const selfNormalized = normalizePersonName(user.fullName);
+
         for (const slot of incomingPatch.volunteerShifts) {
+          const existingSlot = existingShiftsById.get(slot?.id);
+          const effectiveRequiredCount =
+            !isBoardAdmin && existingSlot
+              ? existingSlot.requiredCount
+              : Number(slot?.requiredCount);
+
           if (
-            typeof slot.requiredCount === 'number' &&
-            Array.isArray(slot.assignedVolunteers) &&
-            slot.assignedVolunteers.length > slot.requiredCount
+            Number.isFinite(effectiveRequiredCount) &&
+            Array.isArray(slot?.assignedVolunteers) &&
+            slot.assignedVolunteers.length > effectiveRequiredCount
           ) {
             res.status(422).json({
               error: 'SHIFT_CAPACITY_EXCEEDED',
-              message: `Vardiya kontenjanı aşıldı (#46): "${slot.roleTitle}" vardiyası en fazla ${slot.requiredCount} gönüllü kabul edebilir.`,
+              message: `Vardiya kontenjanı aşıldı (#46): "${slot.taskTitle || slot.roleTitle || slot.id}" vardiyası en fazla ${effectiveRequiredCount} gönüllü kabul edebilir.`,
             });
             return;
           }
         }
+
+        if (!isBoardAdmin) {
+          if (
+            incomingPatch.volunteerShifts.length !==
+            currentVolunteerShifts.length
+          ) {
+            res.status(403).json({
+              error: 'VOLUNTEER_SHIFT_FORBIDDEN_MUTATION',
+              message:
+                'Gönüllü vardiya yetki sınırı (#46): Standart üye oturumu vardiya tanımlarını ekleyemez veya silemez.',
+            });
+            return;
+          }
+
+          for (const slot of incomingPatch.volunteerShifts) {
+            const existingSlot = existingShiftsById.get(slot?.id);
+            if (
+              !existingSlot ||
+              slot.eventTitle !== existingSlot.eventTitle ||
+              slot.taskTitle !== existingSlot.taskTitle ||
+              slot.shiftWindow !== existingSlot.shiftWindow ||
+              slot.location !== existingSlot.location ||
+              slot.requiredCount !== existingSlot.requiredCount ||
+              !Array.isArray(slot.assignedVolunteers)
+            ) {
+              res.status(403).json({
+                error: 'VOLUNTEER_SHIFT_FORBIDDEN_MUTATION',
+                message:
+                  'Gönüllü vardiya yetki sınırı (#46): Standart üye oturumu vardiya başlığı, saati, lokasyonu veya kontenjanını değiştiremez.',
+              });
+              return;
+            }
+
+            const existingNormList: string[] =
+              existingSlot.assignedVolunteers.map(normalizePersonName);
+            const incomingNormList: string[] = (
+              slot.assignedVolunteers as string[]
+            ).map(normalizePersonName);
+
+            const existingOthers = existingNormList.filter(
+              (n: string) => n !== selfNormalized
+            );
+            const incomingOthers = incomingNormList.filter(
+              (n: string) => n !== selfNormalized
+            );
+
+            const othersUnchanged =
+              existingOthers.length === incomingOthers.length &&
+              existingOthers.every((val, idx) => val === incomingOthers[idx]);
+
+            const selfCountInIncoming = incomingNormList.filter(
+              (n: string) => n === selfNormalized
+            ).length;
+
+            if (!othersUnchanged || selfCountInIncoming > 1) {
+              res.status(403).json({
+                error: 'VOLUNTEER_SHIFT_FORBIDDEN_MUTATION',
+                message: `Gönüllü vardiya yetki sınırı (#46): Standart üye oturumu (${user.fullName}) yalnızca kendi vardiya kaydını ekleyebilir veya çıkarabilir; başka üyelerin vardiya atamalarını değiştiremez.`,
+              });
+              return;
+            }
+          }
+        }
+      }
+
+      // Issue #46 Fix: Also prevent regular members from altering other members' names in project volunteer lists
+      if (Array.isArray(incomingPatch.projects) && !isBoardAdmin) {
+        const selfNormalized = normalizePersonName(user.fullName);
+        for (const incProj of incomingPatch.projects) {
+          const existingProj = currentTenant.projects.find(
+            (p) => p.id === incProj?.id
+          );
+          if (!existingProj || !Array.isArray(incProj?.volunteers)) continue;
+          const existingOthers = (existingProj.volunteers || [])
+            .map(normalizePersonName)
+            .filter((n) => n !== selfNormalized);
+          const incomingOthers = incProj.volunteers
+            .map(normalizePersonName)
+            .filter((n: string) => n !== selfNormalized);
+          const othersUnchanged =
+            existingOthers.length === incomingOthers.length &&
+            existingOthers.every((val, idx) => val === incomingOthers[idx]);
+          if (!othersUnchanged) {
+            res.status(403).json({
+              error: 'VOLUNTEER_SHIFT_FORBIDDEN_MUTATION',
+              message: `Proje gönüllü yetki sınırı (#46): Standart üye oturumu (${user.fullName}) yalnızca kendi gönüllü kaydını güncelleyebilir.`,
+            });
+            return;
+          }
+        }
+      }
+
+      // Issue #51 Fix: Block regular members from mutating specialized project financial/quota modules
+      if (incomingPatch.specializedModules !== undefined && !isBoardAdmin) {
+        res.status(403).json({
+          error: 'RBAC_FORBIDDEN',
+          message:
+            'Özel proje modülleri (Kermes, GALATART, RYLA) bütçe ve kontenjan parametreleri yalnızca Yönetim Kurulu yetkilileri tarafından güncellenebilir (#51).',
+        });
+        return;
       }
 
       const casResult = store.updateTenant(
@@ -2721,26 +2833,41 @@ export function createPilotExpressApp(
                   ]
               : curr.paymentNotifications,
             volunteerShifts: Array.isArray(incomingPatch.volunteerShifts)
-              ? incomingPatch.volunteerShifts.map(
-                  (slot: {
-                    id: string;
-                    projectId: string;
-                    projectTitle: string;
-                    shiftTimeLabel: string;
-                    roleTitle: string;
-                    requiredCount: number;
-                    assignedVolunteers: string[];
-                  }) => ({
-                    ...slot,
-                    assignedVolunteers: Array.from(
-                      new Set(
-                        Array.isArray(slot.assignedVolunteers)
-                          ? slot.assignedVolunteers
-                          : []
-                      )
-                    ).slice(0, Math.max(0, Number(slot.requiredCount) || 0)),
+              ? isBoardAdmin
+                ? incomingPatch.volunteerShifts.map(
+                    (slot: {
+                      id: string;
+                      eventTitle: string;
+                      taskTitle: string;
+                      shiftWindow: string;
+                      location: string;
+                      requiredCount: number;
+                      assignedVolunteers: string[];
+                    }) => ({
+                      ...slot,
+                      assignedVolunteers: Array.from(
+                        new Set(
+                          Array.isArray(slot.assignedVolunteers)
+                            ? slot.assignedVolunteers
+                            : []
+                        )
+                      ).slice(0, Math.max(0, Number(slot.requiredCount) || 0)),
+                    })
+                  )
+                : (curr.volunteerShifts || []).map((existingSlot) => {
+                    const match = incomingPatch.volunteerShifts.find(
+                      (s: { id: string }) => s.id === existingSlot.id
+                    );
+                    if (!match || !Array.isArray(match.assignedVolunteers)) {
+                      return existingSlot;
+                    }
+                    return {
+                      ...existingSlot,
+                      assignedVolunteers: Array.from(
+                        new Set(match.assignedVolunteers as string[])
+                      ).slice(0, Math.max(0, existingSlot.requiredCount)),
+                    };
                   })
-                )
               : curr.volunteerShifts,
             specializedModules:
               (isBoardAdmin || isFinanceAdmin) &&
