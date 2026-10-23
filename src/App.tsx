@@ -975,11 +975,47 @@ export default function App() {
     );
   };
 
-  const handleBulkAccrual = (
+  const handleBulkAccrual = async (
     category: FinancialLineItem['category'],
     amount: number,
     description: string
   ) => {
+    const token = sessionTokenRef.current || sessionToken;
+    if (token) {
+      try {
+        const res = await fetch('/api/pilot/accrue-dues', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            clubId: activeTenantClubId,
+            category,
+            amount,
+            description,
+            dueDate: '15 Kasım 2026',
+          }),
+        });
+        const data = await res.json();
+        if (res.ok && data?.state) {
+          applyServerTenantState(data.state);
+          showToast(
+            `Sunucu Yönetimli Toplu Tahakkuk Uygulandı (${formatTL(amount)})`,
+            `Tüm kulüp üyelerinin "${category}" cari bakiyesine "${description}" kalemi sunucu tarafından işlendi.`
+          );
+          return;
+        }
+        showToast(
+          'Tahakkuk Yetki / Doğrulama Uyarısı',
+          data?.message || 'Toplu tahakkuk yalnızca Sayman veya Başkan oturumuyla yapılabilir.'
+        );
+        return;
+      } catch {
+        // Fallback to local state when offline
+      }
+    }
+
     const nextMembers = applyBulkMemberAccrual(members, category, amount);
     setMembers(nextMembers);
     const nextFinItems = [
@@ -995,33 +1031,52 @@ export default function App() {
       },
     ];
     setFinancialItems(nextFinItems);
-    recordServerAudit(
-      'Saymanlık & Kasa',
-      `Toplu Aidat/Kuver Tahakkuku (${formatTL(amount)})`,
-      `Tüm kulüp üyelerinin "${category}" cari bakiyesine "${description}" kalemi eklendi.`,
-      ['sayman', 'baskan'],
-      { members: nextMembers, financialItems: nextFinItems }
-    );
     showToast(
       `Toplu Tahakkuk Uygulandı (${formatTL(amount)})`,
       `Tüm kulüp üyelerinin "${category}" cari bakiyesine "${description}" kalemi eklendi.`
     );
   };
 
-  const handleAddTreasuryEntry = (entry: Omit<TreasuryLedgerEntry, 'id'>) => {
+  const handleAddTreasuryEntry = async (entry: Omit<TreasuryLedgerEntry, 'id'>) => {
+    const token = sessionTokenRef.current || sessionToken;
+    if (token) {
+      try {
+        const res = await fetch('/api/pilot/reconcile-expense', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            clubId: activeTenantClubId,
+            ...entry,
+          }),
+        });
+        const data = await res.json();
+        if (res.ok && data?.state) {
+          applyServerTenantState(data.state);
+          showToast(
+            `Sunucu Doğrulamalı Kasa Kaydı Eklendi (${entry.type})`,
+            `${entry.title} (${formatTL(entry.amount)}) mükerrer belge kontrolüyle Kulüp Kasa Defterine işlendi.`
+          );
+          return;
+        }
+        showToast(
+          'Kasa Defteri Mutabakat Kuralı (#39)',
+          data?.message || 'Kasa defteri kaydı doğrulanamadı.'
+        );
+        return;
+      } catch {
+        // Fallback to local state when offline
+      }
+    }
+
     const created: TreasuryLedgerEntry = {
       id: `tr-${Date.now()}`,
       ...entry,
     };
     const nextLedger = [created, ...treasuryLedger];
     setTreasuryLedger(nextLedger);
-    recordServerAudit(
-      'Saymanlık & Kasa',
-      `Kasa Defteri Kaydı (${entry.type}: ${formatTL(entry.amount)})`,
-      `${entry.title} (${entry.referenceNo}) kasa defterine işlendi.`,
-      ['sayman', 'baskan'],
-      { treasuryLedger: nextLedger }
-    );
     showToast(
       `Kasa Defteri Kaydı Eklendi (${entry.type})`,
       `${entry.title} (${formatTL(entry.amount)}) Kulüp Kasa & Gelir-Gider Defterine işlendi.`

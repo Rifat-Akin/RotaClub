@@ -56,7 +56,9 @@ export const ALLOWED_TENANT_CLUB_IDS = [
 
 export type AllowedTenantClubId = (typeof ALLOWED_TENANT_CLUB_IDS)[number];
 
-export function isAllowedTenantClubId(clubId: string): clubId is AllowedTenantClubId {
+export function isAllowedTenantClubId(
+  clubId: string
+): clubId is AllowedTenantClubId {
   return (ALLOWED_TENANT_CLUB_IDS as readonly string[]).includes(clubId);
 }
 
@@ -141,6 +143,7 @@ export interface PilotUserAccount {
 
 export interface BankStatementEntry {
   bankRef: string;
+  type?: 'Gelir' | 'Gider';
   amount: number;
   senderName: string;
   date: string;
@@ -193,7 +196,7 @@ export interface TenantClubDatabaseState {
 }
 
 export interface MultiTenantDatabaseFile {
-  schemaVersion: '5.2.0-hardened';
+  schemaVersion: '5.3.0-hardened';
   updatedAt: string;
   tenants: Record<string, TenantClubDatabaseState>;
   accounts: PilotUserAccount[];
@@ -227,6 +230,45 @@ export function hashPinWithSalt(pin: string, salt: string): string {
 }
 
 /**
+ * Validates credential complexity for new account provisioning and PIN rotation (#22).
+ * Rejects short (<6), repeated-character ('111111'), or sequential ('123456', '654321') PINs.
+ */
+export function validateStrongCredential(pinOrPassword: string): {
+  valid: boolean;
+  reason?: string;
+} {
+  const clean = String(pinOrPassword || '').trim();
+  if (clean.length < 6) {
+    return {
+      valid: false,
+      reason: 'Kimlik doğrulama parolası / PIN en az 6 karakter olmalıdır.',
+    };
+  }
+  if (/^(\w)\1+$/.test(clean)) {
+    return {
+      valid: false,
+      reason: 'Tekrarlayan karakterlerden oluşan zayıf PIN kodları (örn. 111111) kullanılamaz.',
+    };
+  }
+  const weakList = new Set([
+    '123456',
+    '654321',
+    '12345678',
+    '000000',
+    'password',
+    'rotary',
+    'galata',
+  ]);
+  if (weakList.has(clean.toLowerCase())) {
+    return {
+      valid: false,
+      reason: 'Ardışık veya yaygın tahmin edilebilir PIN/parola dizileri kullanılamaz.',
+    };
+  }
+  return { valid: true };
+}
+
+/**
  * Converts a 64-byte IEEE P1363 ECDSA signature (r || s, produced by WebCrypto subtle.sign)
  * into ASN.1 DER format expected by Node's crypto.verify('sha256', ...).
  * If already in ASN.1 DER format (starts with 0x30), returns as-is.
@@ -240,7 +282,10 @@ export function ensureDerEcdsaSignature(sigBuf: Buffer): Buffer {
       }
       const sliced = buf.subarray(i);
       if (sliced[0] & 0x80) {
-        return Buffer.concat([Buffer.from([0x02, sliced.length + 1, 0x00]), sliced]);
+        return Buffer.concat([
+          Buffer.from([0x02, sliced.length + 1, 0x00]),
+          sliced,
+        ]);
       }
       return Buffer.concat([Buffer.from([0x02, sliced.length]), sliced]);
     };
@@ -252,25 +297,33 @@ export function ensureDerEcdsaSignature(sigBuf: Buffer): Buffer {
   return sigBuf;
 }
 
-function buildInitialAccount(params: {
-  memberId: string;
-  rotaryId: string;
-  fullName: string;
-  email: string;
-  role: ClubRole;
-  clubId: AllowedTenantClubId;
-  clubMemberships: ClubMembershipBinding[];
-  envPinVar: string;
-  precomputedSalt: string;
-  precomputedHash: string;
-}): PilotUserAccount {
-  const customEnvPin = process.env[params.envPinVar]?.trim();
-  const salt = customEnvPin
-    ? crypto.randomBytes(16).toString('hex')
-    : params.precomputedSalt;
-  const hash = customEnvPin
-    ? hashPinWithSalt(customEnvPin, salt)
-    : params.precomputedHash;
+/**
+ * Secure Account Provisioning (#22, #70):
+ * Zero hardcoded salts or precomputed hashes in source code.
+ * Uses fresh CSPRNG 16-byte salt per account and either environment-injected secret
+ * or CSPRNG random 16-byte initial bootstrap secret written to a local 0o600 file.
+ */
+function buildProvisionedAccount(
+  params: {
+    memberId: string;
+    rotaryId: string;
+    fullName: string;
+    email: string;
+    role: ClubRole;
+    clubId: AllowedTenantClubId;
+    clubMemberships: ClubMembershipBinding[];
+    envPinVar: string;
+  },
+  bootstrapCollector: Record<string, string>
+): PilotUserAccount {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const envSecret = process.env[params.envPinVar]?.trim();
+  const initialSecret =
+    envSecret && envSecret.length >= 6
+      ? envSecret
+      : crypto.randomBytes(12).toString('base64url');
+
+  bootstrapCollector[params.rotaryId] = initialSecret;
 
   return {
     memberId: params.memberId,
@@ -281,79 +334,145 @@ function buildInitialAccount(params: {
     clubId: params.clubId,
     clubMemberships: params.clubMemberships,
     passwordSalt: salt,
-    passwordHash: hash,
-    // Credentials must be registered with a real ECDSA P-256 SPKI public key via /api/auth/webauthn-register-verify
+    passwordHash: hashPinWithSalt(initialSecret, salt),
     webauthnCredentials: [],
   };
 }
 
-export function createInitialPilotAccounts(): PilotUserAccount[] {
-  return [
-    buildInitialAccount({
-      memberId: 'm-rifat',
-      rotaryId: 'TR-2420-88412',
-      fullName: 'Rtn. Rifat Akın',
-      email: 'rifat.akin@galatarotary.org',
-      role: 'uye',
-      clubId: 'club-galata',
-      // Regular member belongs ONLY to club-galata (#70)
-      clubMemberships: [{ clubId: 'club-galata', role: 'uye' }],
-      envPinVar: 'ROTACLUB_PIN_UYE',
-      precomputedSalt: '9f8e7d6c5b4a39281726354453627180',
-      precomputedHash:
-        '1d5ab304ffd47117df5743c7320bea0197a5fcd9d4a1a9ca313294cab41d44f9',
-    }),
-    buildInitialAccount({
-      memberId: 'm-nazli',
-      rotaryId: 'TR-2420-81024',
-      fullName: 'Rtn. Av. Nazlı Denizmen',
-      email: 'sekreter@galatarotary.org',
-      role: 'sekreter',
-      clubId: 'club-galata',
-      // Club secretary belongs ONLY to club-galata (#70)
-      clubMemberships: [{ clubId: 'club-galata', role: 'sekreter' }],
-      envPinVar: 'ROTACLUB_PIN_SEKRETER',
-      precomputedSalt: '1a2b3c4d5e6f708192a3b4c5d6e7f809',
-      precomputedHash:
-        'b034352ba57a189a42fd1b0cf190efae4843cbc4ab5ae90af697f98daf11a418',
-    }),
-    buildInitialAccount({
-      memberId: 'm-levent',
-      rotaryId: 'TR-2420-79310',
-      fullName: 'Rtn. YMM Levent Soydan',
-      email: 'sayman@galatarotary.org',
-      role: 'sayman',
-      clubId: 'club-galata',
-      // Club treasurer belongs ONLY to club-galata (#70)
-      clubMemberships: [{ clubId: 'club-galata', role: 'sayman' }],
-      envPinVar: 'ROTACLUB_PIN_SAYMAN',
-      precomputedSalt: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
-      precomputedHash:
-        'ccc5a073f09744e1bc2545d64b75dcf67dc05a738bfc0541e3d7187210c97901',
-    }),
-    buildInitialAccount({
-      memberId: 'm-emre',
-      rotaryId: 'TR-2420-74105',
-      fullName: 'Rtn. Mimar Emre Karaca',
-      email: 'baskan@galatarotary.org',
-      role: 'baskan',
-      clubId: 'club-galata',
-      // District 2420 Multi-Club Governance Officer & Galata President (#70)
-      clubMemberships: [
-        { clubId: 'club-galata', role: 'baskan' },
-        { clubId: 'club-karakoy', role: 'baskan' },
-        { clubId: 'club-macka', role: 'baskan' },
-        { clubId: 'club-district2420', role: 'baskan' },
-      ],
-      envPinVar: 'ROTACLUB_PIN_BASKAN',
-      precomputedSalt: 'f0e1d2c3b4a5968778695a4b3c2d1e0f',
-      precomputedHash:
-        'c042c479a593355ef36883d44f896c4d713052cf9b8b514493859134ed7101f6',
-    }),
-  ];
-}
+export function createInitialPilotAccounts(
+  bootstrapFileDir?: string
+): PilotUserAccount[] {
+  const bootstrapSecrets: Record<string, string> = {};
 
-export const PILOT_ACCOUNTS: PilotUserAccount[] = createInitialPilotAccounts();
+  const accounts: PilotUserAccount[] = [
+    buildProvisionedAccount(
+      {
+        memberId: 'm-rifat',
+        rotaryId: 'TR-2420-88412',
+        fullName: 'Rtn. Rifat Akın',
+        email: 'rifat.akin@galatarotary.org',
+        role: 'uye',
+        clubId: 'club-galata',
+        // Strictly Galata member ONLY (#70)
+        clubMemberships: [{ clubId: 'club-galata', role: 'uye' }],
+        envPinVar: 'ROTACLUB_PIN_UYE',
+      },
+      bootstrapSecrets
+    ),
+    buildProvisionedAccount(
+      {
+        memberId: 'm-nazli',
+        rotaryId: 'TR-2420-81024',
+        fullName: 'Rtn. Av. Nazlı Denizmen',
+        email: 'sekreter@galatarotary.org',
+        role: 'sekreter',
+        clubId: 'club-galata',
+        // Strictly Galata secretary ONLY (#70)
+        clubMemberships: [{ clubId: 'club-galata', role: 'sekreter' }],
+        envPinVar: 'ROTACLUB_PIN_SEKRETER',
+      },
+      bootstrapSecrets
+    ),
+    buildProvisionedAccount(
+      {
+        memberId: 'm-levent',
+        rotaryId: 'TR-2420-79310',
+        fullName: 'Rtn. YMM Levent Soydan',
+        email: 'sayman@galatarotary.org',
+        role: 'sayman',
+        clubId: 'club-galata',
+        // Strictly Galata treasurer ONLY (#70)
+        clubMemberships: [{ clubId: 'club-galata', role: 'sayman' }],
+        envPinVar: 'ROTACLUB_PIN_SAYMAN',
+      },
+      bootstrapSecrets
+    ),
+    buildProvisionedAccount(
+      {
+        memberId: 'm-emre',
+        rotaryId: 'TR-2420-74105',
+        fullName: 'Rtn. Mimar Emre Karaca',
+        email: 'baskan@galatarotary.org',
+        role: 'baskan',
+        clubId: 'club-galata',
+        // Issue #70 Fix: Galata President is 'baskan' ONLY in club-galata!
+        // Does NOT hold 'baskan' over Karaköy or Maçka!
+        clubMemberships: [{ clubId: 'club-galata', role: 'baskan' }],
+        envPinVar: 'ROTACLUB_PIN_BASKAN',
+      },
+      bootstrapSecrets
+    ),
+    buildProvisionedAccount(
+      {
+        memberId: 'm-club-karakoy-baskan',
+        rotaryId: 'TR-2420-KRK-01',
+        fullName: 'Rtn. Karaköy Rotary Kulübü Başkanı',
+        email: 'baskan@karakoyrotary.org',
+        role: 'baskan',
+        clubId: 'club-karakoy',
+        // Strictly Karaköy President ONLY (#70)
+        clubMemberships: [{ clubId: 'club-karakoy', role: 'baskan' }],
+        envPinVar: 'ROTACLUB_PIN_KARAKOY_BASKAN',
+      },
+      bootstrapSecrets
+    ),
+    buildProvisionedAccount(
+      {
+        memberId: 'm-club-macka-baskan',
+        rotaryId: 'TR-2420-MCK-01',
+        fullName: 'Rtn. Maçka Rotary Kulübü Başkanı',
+        email: 'baskan@mackarotary.org',
+        role: 'baskan',
+        clubId: 'club-macka',
+        // Strictly Maçka President ONLY (#70)
+        clubMemberships: [{ clubId: 'club-macka', role: 'baskan' }],
+        envPinVar: 'ROTACLUB_PIN_MACKA_BASKAN',
+      },
+      bootstrapSecrets
+    ),
+    buildProvisionedAccount(
+      {
+        memberId: 'm-district-gov',
+        rotaryId: 'TR-2420-GOV-01',
+        fullName: 'Rtn. GDB Bölge Guvernörü',
+        email: 'guvernor@rotary2420.org',
+        role: 'baskan',
+        clubId: 'club-district2420',
+        // Issue #70 Fix: District Governor is 'baskan' in club-district2420,
+        // and only visiting 'uye' (observer) when switching into individual clubs!
+        clubMemberships: [
+          { clubId: 'club-district2420', role: 'baskan' },
+          { clubId: 'club-galata', role: 'uye' },
+          { clubId: 'club-karakoy', role: 'uye' },
+          { clubId: 'club-macka', role: 'uye' },
+        ],
+        envPinVar: 'ROTACLUB_PIN_DISTRICT_GOV',
+      },
+      bootstrapSecrets
+    ),
+  ];
+
+  const targetDir =
+    bootstrapFileDir || path.resolve(process.cwd(), '.aistudio');
+  try {
+    if (!fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true });
+    }
+    const bootstrapPath = path.join(
+      targetDir,
+      '.bootstrap_credentials.json'
+    );
+    fs.writeFileSync(
+      bootstrapPath,
+      JSON.stringify(bootstrapSecrets, null, 2),
+      { encoding: 'utf8', mode: 0o600 }
+    );
+  } catch {
+    // Ignore if filesystem is read-only
+  }
+
+  return accounts;
+}
 
 const runtimeRevokedJtis = new Set<string>();
 
@@ -517,15 +636,15 @@ export function verifySignedToken(
 
 export function findPilotAccount(
   identifier: string,
-  accounts: PilotUserAccount[] = PILOT_ACCOUNTS
+  accounts: PilotUserAccount[]
 ): PilotUserAccount | undefined {
   const normalized = String(identifier || '').trim().toLowerCase();
   return accounts.find(
     (acc) =>
-      acc.role === normalized ||
       acc.rotaryId.toLowerCase() === normalized ||
       acc.email.toLowerCase() === normalized ||
-      acc.memberId.toLowerCase() === normalized
+      acc.memberId.toLowerCase() === normalized ||
+      (acc.clubId === 'club-galata' && acc.role === normalized)
   );
 }
 
@@ -544,12 +663,15 @@ export function authenticatePilotCredentials(
   identifier: string,
   pinOrPassword: string,
   clubId = 'club-galata',
-  accounts: PilotUserAccount[] = PILOT_ACCOUNTS
+  accounts: PilotUserAccount[]
 ):
   | { ok: true; user: AuthenticatedUser; token: string }
   | {
       ok: false;
-      reason: 'INVALID_CREDENTIALS' | 'UNKNOWN_CLUB_TENANT' | 'CLUB_MEMBERSHIP_FORBIDDEN';
+      reason:
+        | 'INVALID_CREDENTIALS'
+        | 'UNKNOWN_CLUB_TENANT'
+        | 'CLUB_MEMBERSHIP_FORBIDDEN';
     } {
   if (!isAllowedTenantClubId(clubId)) {
     return { ok: false, reason: 'UNKNOWN_CLUB_TENANT' };
@@ -560,7 +682,10 @@ export function authenticatePilotCredentials(
     return { ok: false, reason: 'INVALID_CREDENTIALS' };
   }
 
-  const computedHash = hashPinWithSalt(pinOrPassword.trim(), account.passwordSalt);
+  const computedHash = hashPinWithSalt(
+    pinOrPassword.trim(),
+    account.passwordSalt
+  );
   const hashA = Buffer.from(computedHash, 'hex');
   const hashB = Buffer.from(account.passwordHash, 'hex');
   if (hashA.length !== hashB.length || !crypto.timingSafeEqual(hashA, hashB)) {
@@ -610,8 +735,10 @@ function createInitialAuditChainForClub(
           actorName: 'Rtn. Mimar Emre Karaca (Dönem Başkanı)',
           actorRole: 'baskan',
           module: 'Yönetim & Güvenlik',
-          action: 'Galata Rotary Pilot Veritabanı & Kriptografik Denetim Zinciri Başlatıldı',
-          detail: 'SHA-256 hash zincirli denetim defteri, HMAC-SHA256 oturum doğrulaması ve çoklu kulüp izolasyonu başlatıldı.',
+          action:
+            'Galata Rotary Pilot Veritabanı & Kriptografik Denetim Zinciri Başlatıldı',
+          detail:
+            'SHA-256 hash zincirli denetim defteri, HMAC-SHA256 oturum doğrulaması ve çoklu kulüp izolasyonu başlatıldı.',
         },
         {
           id: 'aud-1002',
@@ -620,7 +747,8 @@ function createInitialAuditChainForClub(
           actorRole: 'sayman',
           module: 'Saymanlık & Kasa',
           action: 'Banka Mutabakatlı Kasa Tahsilat Kaydı (GAR-2026-99120)',
-          detail: '14 üyenin Ekim ayı aidat ve kuver tahsilatı (168.000 TL) banka ekstresiyle eşleştirilerek kasa defterine işlendi.',
+          detail:
+            '14 üyenin Ekim ayı aidat ve kuver tahsilatı (168.000 TL) banka ekstresiyle eşleştirilerek kasa defterine işlendi.',
         },
         {
           id: 'aud-1003',
@@ -629,7 +757,8 @@ function createInitialAuditChainForClub(
           actorRole: 'uye',
           module: 'Saymanlık & Kasa',
           action: 'FAST Dekont Bildirimi (GAR-2026-88341)',
-          detail: '9.000 TL 1. Yarıyıl Aidat 2. Taksit ödemesi banka mutabakatı ve Sayman onayı kuyruğuna eklendi.',
+          detail:
+            '9.000 TL 1. Yarıyıl Aidat 2. Taksit ödemesi banka mutabakatı ve Sayman onayı kuyruğuna eklendi.',
         },
         {
           id: 'aud-1004',
@@ -638,7 +767,8 @@ function createInitialAuditChainForClub(
           actorRole: 'sekreter',
           module: 'LCV & Kuver',
           action: '1842. Toplantı Kuver Matrisi Senkronizasyonu',
-          detail: 'Pera Palace Hotel mutfak kuver listesi (35 Kuver) sunucu veritabanında doğrulandı.',
+          detail:
+            'Pera Palace Hotel mutfak kuver listesi (35 Kuver) sunucu veritabanında doğrulandı.',
         },
       ]
     : [
@@ -671,12 +801,15 @@ function createInitialAuditChainForClub(
   return chain.reverse();
 }
 
-function createInitialBankStatementsForClub(clubId: string): BankStatementEntry[] {
+function createInitialBankStatementsForClub(
+  clubId: string
+): BankStatementEntry[] {
   if (clubId !== 'club-galata') {
     const prefix = clubId.replace('club-', '').toUpperCase();
     return [
       {
         bankRef: `${prefix}-2026-1001`,
+        type: 'Gelir',
         amount: 9000,
         senderName: `Rtn. ${prefix} Rotary Başkanı`,
         date: '23 Ekim 2026 · 10:00',
@@ -689,6 +822,7 @@ function createInitialBankStatementsForClub(clubId: string): BankStatementEntry[
   return [
     {
       bankRef: 'GAR-2026-88341',
+      type: 'Gelir',
       amount: 9000,
       senderName: 'Rtn. Kerem Soylu',
       date: '22 Ekim 2026 · 10:42',
@@ -697,34 +831,52 @@ function createInitialBankStatementsForClub(clubId: string): BankStatementEntry[
     },
     {
       bankRef: 'ISBK-2026-44120',
+      type: 'Gelir',
       amount: 12000,
       senderName: 'Rtn. Defne Serezli',
       date: '21 Ekim 2026 · 16:40',
-      description: 'İş Bankası FAST — GALATART Sergi Fonu ve PolioPlus Katkı Payı',
+      description:
+        'İş Bankası FAST — GALATART Sergi Fonu ve PolioPlus Katkı Payı',
       reconciled: false,
     },
     {
       bankRef: 'GAR-2026-99501',
+      type: 'Gelir',
       amount: 5000,
       senderName: 'Rtn. Rifat Akın',
       date: '23 Ekim 2026 · 15:00',
-      description: 'Garanti BBVA FAST — Galata Rotary Proje / Burs / Aidat Ödemesi #1',
+      description:
+        'Garanti BBVA FAST — Galata Rotary Proje / Burs / Aidat Ödemesi #1',
       reconciled: false,
     },
     {
       bankRef: 'GAR-2026-99502',
+      type: 'Gelir',
       amount: 4500,
       senderName: 'Rtn. Rifat Akın',
       date: '23 Ekim 2026 · 15:10',
-      description: 'Garanti BBVA FAST — Galata Rotary Eğitim Bursu Katkı Ödemesi #2',
+      description:
+        'Garanti BBVA FAST — Galata Rotary Eğitim Bursu Katkı Ödemesi #2',
       reconciled: false,
     },
     {
       bankRef: 'GAR-2026-99503',
+      type: 'Gelir',
       amount: 7500,
       senderName: 'Rtn. Rifat Akın',
       date: '23 Ekim 2026 · 15:20',
-      description: 'Garanti BBVA FAST — Galata Rotary Hizmet Projesi Bağışı #3',
+      description:
+        'Garanti BBVA FAST — Galata Rotary Hizmet Projesi Bağışı #3',
+      reconciled: false,
+    },
+    {
+      bankRef: 'PERA-2026-77101',
+      type: 'Gider',
+      amount: 52500,
+      senderName: 'Pera Palace Hotel Banket Müdürlüğü',
+      date: '23 Ekim 2026 · 16:00',
+      description:
+        '1842. Toplantı Otel & Kuver Faturası (35 Kuver Banka EFT Çıkışı)',
       reconciled: false,
     },
   ];
@@ -910,21 +1062,217 @@ export function createTenantClubState(
   };
 }
 
-export function createDefaultMultiTenantDb(): MultiTenantDatabaseFile {
+export function createDefaultMultiTenantDb(
+  bootstrapFileDir?: string
+): MultiTenantDatabaseFile {
   return {
-    schemaVersion: '5.2.0-hardened',
+    schemaVersion: '5.3.0-hardened',
     updatedAt: new Date().toISOString(),
     tenants: {
       'club-galata': createTenantClubState('club-galata', 'Galata Rotary Kulübü'),
-      'club-karakoy': createTenantClubState('club-karakoy', 'Karaköy Rotary Kulübü'),
+      'club-karakoy': createTenantClubState(
+        'club-karakoy',
+        'Karaköy Rotary Kulübü'
+      ),
       'club-macka': createTenantClubState('club-macka', 'Maçka Rotary Kulübü'),
       'club-district2420': createTenantClubState(
         'club-district2420',
         'UR 2420. Bölge Guvernörlüğü'
       ),
     },
-    accounts: createInitialPilotAccounts(),
+    accounts: createInitialPilotAccounts(bootstrapFileDir),
     revokedTokenJtis: [],
+  };
+}
+
+/**
+ * Lossless Database Migration Engine (#14, #19):
+ * Upgrades any legacy v4 / v5.0 / v5.1 / v5.2 database object to '5.3.0-hardened'
+ * while preserving 100% of existing tenant records, payments, treasury ledgers,
+ * audit hash chains, rotated PINs, and registered WebAuthn credentials.
+ */
+export function migrateDatabaseLossless(
+  rawParsed: Record<string, unknown>,
+  bootstrapFileDir?: string
+): MultiTenantDatabaseFile {
+  const defaults = createDefaultMultiTenantDb(bootstrapFileDir);
+  const rawTenants =
+    rawParsed.tenants && typeof rawParsed.tenants === 'object'
+      ? (rawParsed.tenants as Record<string, Partial<TenantClubDatabaseState>>)
+      : {};
+
+  // Legacy v5.0 top-level auditLedger support
+  const legacyTopLevelAudit = Array.isArray(rawParsed.auditLedger)
+    ? (rawParsed.auditLedger as ChainedAuditLogEntry[])
+    : [];
+
+  const migratedTenants: Record<string, TenantClubDatabaseState> = {};
+
+  for (const clubId of ALLOWED_TENANT_CLUB_IDS) {
+    const defaultTenant = defaults.tenants[clubId];
+    const existingTenant = rawTenants[clubId];
+    if (!existingTenant) {
+      migratedTenants[clubId] = defaultTenant;
+      continue;
+    }
+
+    const existingAudit =
+      Array.isArray(existingTenant.auditLedger) &&
+      existingTenant.auditLedger.length > 0
+        ? existingTenant.auditLedger
+        : legacyTopLevelAudit.filter((a) => !a.clubId || a.clubId === clubId);
+
+    migratedTenants[clubId] = {
+      ...defaultTenant,
+      ...existingTenant,
+      clubId,
+      revision:
+        typeof existingTenant.revision === 'number' &&
+        existingTenant.revision >= 1
+          ? existingTenant.revision
+          : 1,
+      updatedAt: existingTenant.updatedAt || new Date().toISOString(),
+      termInfo: existingTenant.termInfo || defaultTenant.termInfo,
+      meetings: Array.isArray(existingTenant.meetings)
+        ? existingTenant.meetings
+        : defaultTenant.meetings,
+      ritualSteps: Array.isArray(existingTenant.ritualSteps)
+        ? existingTenant.ritualSteps
+        : defaultTenant.ritualSteps,
+      celebrations: Array.isArray(existingTenant.celebrations)
+        ? existingTenant.celebrations
+        : defaultTenant.celebrations,
+      speakerProposals: Array.isArray(existingTenant.speakerProposals)
+        ? existingTenant.speakerProposals
+        : defaultTenant.speakerProposals,
+      makeupSubmissions: Array.isArray(existingTenant.makeupSubmissions)
+        ? existingTenant.makeupSubmissions
+        : defaultTenant.makeupSubmissions,
+      guestMakeupCards: Array.isArray(existingTenant.guestMakeupCards)
+        ? existingTenant.guestMakeupCards
+        : defaultTenant.guestMakeupCards,
+      firesideGroups: Array.isArray(existingTenant.firesideGroups)
+        ? existingTenant.firesideGroups
+        : defaultTenant.firesideGroups,
+      financialItems: Array.isArray(existingTenant.financialItems)
+        ? existingTenant.financialItems
+        : defaultTenant.financialItems,
+      paymentNotifications: Array.isArray(existingTenant.paymentNotifications)
+        ? existingTenant.paymentNotifications.map((p) => ({
+            ...p,
+            receiptRef: normalizeBankRef(p.receiptRef),
+          }))
+        : defaultTenant.paymentNotifications,
+      overdueMembers: Array.isArray(existingTenant.overdueMembers)
+        ? existingTenant.overdueMembers
+        : defaultTenant.overdueMembers,
+      treasuryLedger: Array.isArray(existingTenant.treasuryLedger)
+        ? existingTenant.treasuryLedger
+        : defaultTenant.treasuryLedger,
+      projects: Array.isArray(existingTenant.projects)
+        ? existingTenant.projects
+        : defaultTenant.projects,
+      scholars: Array.isArray(existingTenant.scholars)
+        ? existingTenant.scholars
+        : defaultTenant.scholars,
+      members: Array.isArray(existingTenant.members)
+        ? existingTenant.members
+        : defaultTenant.members,
+      committees: Array.isArray(existingTenant.committees)
+        ? existingTenant.committees
+        : defaultTenant.committees,
+      pastPresidents: Array.isArray(existingTenant.pastPresidents)
+        ? existingTenant.pastPresidents
+        : defaultTenant.pastPresidents,
+      boardResolutions: Array.isArray(existingTenant.boardResolutions)
+        ? existingTenant.boardResolutions
+        : defaultTenant.boardResolutions,
+      bankStatements: Array.isArray(existingTenant.bankStatements)
+        ? existingTenant.bankStatements
+        : defaultTenant.bankStatements,
+      auditLedger:
+        existingAudit.length > 0 ? existingAudit : defaultTenant.auditLedger,
+    };
+  }
+
+  // Preserve any custom accounts & existing password hashes / WebAuthn passkeys
+  const rawAccounts = Array.isArray(rawParsed.accounts)
+    ? (rawParsed.accounts as Partial<PilotUserAccount>[])
+    : [];
+  const migratedAccounts: PilotUserAccount[] = [...defaults.accounts];
+
+  for (const rawAcc of rawAccounts) {
+    if (!rawAcc || !rawAcc.memberId) continue;
+    const idx = migratedAccounts.findIndex(
+      (a) => a.memberId === rawAcc.memberId
+    );
+    if (idx >= 0) {
+      const defAcc = migratedAccounts[idx];
+      migratedAccounts[idx] = {
+        ...defAcc,
+        ...rawAcc,
+        memberId: defAcc.memberId,
+        rotaryId: rawAcc.rotaryId || defAcc.rotaryId,
+        fullName: rawAcc.fullName || defAcc.fullName,
+        email: rawAcc.email || defAcc.email,
+        role: (rawAcc.role as ClubRole) || defAcc.role,
+        clubId: isAllowedTenantClubId(String(rawAcc.clubId || ''))
+          ? (rawAcc.clubId as AllowedTenantClubId)
+          : defAcc.clubId,
+        // Enforce strict club memberships for default accounts (#70)
+        clubMemberships: defAcc.clubMemberships,
+        passwordSalt: rawAcc.passwordSalt || defAcc.passwordSalt,
+        passwordHash: rawAcc.passwordHash || defAcc.passwordHash,
+        webauthnCredentials: Array.isArray(rawAcc.webauthnCredentials)
+          ? rawAcc.webauthnCredentials.filter(
+              (c): c is WebAuthnCredentialRecord =>
+                Boolean(c && c.credentialId && c.publicKeySpkiB64)
+            )
+          : defAcc.webauthnCredentials,
+      };
+    } else if (
+      rawAcc.rotaryId &&
+      rawAcc.fullName &&
+      rawAcc.email &&
+      rawAcc.role &&
+      rawAcc.passwordSalt &&
+      rawAcc.passwordHash
+    ) {
+      const safeClubId: AllowedTenantClubId = isAllowedTenantClubId(
+        String(rawAcc.clubId || '')
+      )
+        ? (rawAcc.clubId as AllowedTenantClubId)
+        : 'club-galata';
+      migratedAccounts.push({
+        memberId: rawAcc.memberId,
+        rotaryId: rawAcc.rotaryId,
+        fullName: rawAcc.fullName,
+        email: rawAcc.email,
+        role: rawAcc.role as ClubRole,
+        clubId: safeClubId,
+        clubMemberships: Array.isArray(rawAcc.clubMemberships)
+          ? rawAcc.clubMemberships
+          : [{ clubId: safeClubId, role: rawAcc.role as ClubRole }],
+        passwordSalt: rawAcc.passwordSalt,
+        passwordHash: rawAcc.passwordHash,
+        webauthnCredentials: Array.isArray(rawAcc.webauthnCredentials)
+          ? rawAcc.webauthnCredentials.filter(
+              (c): c is WebAuthnCredentialRecord =>
+                Boolean(c && c.credentialId && c.publicKeySpkiB64)
+            )
+          : [],
+      });
+    }
+  }
+
+  return {
+    schemaVersion: '5.3.0-hardened',
+    updatedAt: new Date().toISOString(),
+    tenants: migratedTenants,
+    accounts: migratedAccounts,
+    revokedTokenJtis: Array.isArray(rawParsed.revokedTokenJtis)
+      ? (rawParsed.revokedTokenJtis as string[])
+      : [],
   };
 }
 
@@ -951,22 +1299,29 @@ export function redactStateForRole(
     return {
       ...m,
       phone: isSelf ? m.phone : maskPhoneForKvkk(m.phone, shouldMaskPhones),
-      email: isSelf ? m.email : maskEmailForKvkk(m.email, shouldMaskSensitivePii),
+      email: isSelf
+        ? m.email
+        : maskEmailForKvkk(m.email, shouldMaskSensitivePii),
       bloodGroup: isSelf || isPrivilegedBoard ? m.bloodGroup : 'KVKK Gizli',
       spouseName: isSelf || isPrivilegedBoard ? m.spouseName : undefined,
       weddingAnniversary:
         isSelf || isPrivilegedBoard ? m.weddingAnniversary : undefined,
       duesBalance: isPrivilegedFinance || isSelf ? m.duesBalance : 0,
       mealBalance: isPrivilegedFinance || isSelf ? m.mealBalance : 0,
-      foundationBalance: isPrivilegedFinance || isSelf ? m.foundationBalance : 0,
+      foundationBalance:
+        isPrivilegedFinance || isSelf ? m.foundationBalance : 0,
     };
   });
 
   const sanitizedPayments = isPrivilegedFinance
     ? tenantState.paymentNotifications
-    : tenantState.paymentNotifications.filter((p) => p.memberId === user.memberId);
+    : tenantState.paymentNotifications.filter(
+        (p) => p.memberId === user.memberId
+      );
 
-  const sanitizedOverdue = isPrivilegedFinance ? tenantState.overdueMembers : [];
+  const sanitizedOverdue = isPrivilegedFinance
+    ? tenantState.overdueMembers
+    : [];
 
   const sanitizedTreasuryLedger = isPrivilegedFinance
     ? tenantState.treasuryLedger
@@ -998,7 +1353,7 @@ export function redactStateForRole(
 
 /**
  * Atomic File Persistence with Write-Ahead Temp File + fsync + rename
- * Enforces Compare-And-Swap (CAS) revision locking (#14, #18, #70).
+ * Enforces mandatory Compare-And-Swap (CAS) revision locking and lossless schema migration (#14, #18, #19, #70).
  */
 export class AtomicMultiTenantStore {
   private dbDir: string;
@@ -1010,7 +1365,7 @@ export class AtomicMultiTenantStore {
       ? path.dirname(customDbFile)
       : path.resolve(process.cwd(), '.aistudio');
     this.dbFile =
-      customDbFile || path.join(this.dbDir, 'rotaclub_pilot_v5_2_db.json');
+      customDbFile || path.join(this.dbDir, 'rotaclub_pilot_v5_3_db.json');
     this.state = this.loadFromDisk();
     if (Array.isArray(this.state.revokedTokenJtis)) {
       for (const jti of this.state.revokedTokenJtis) {
@@ -1024,23 +1379,45 @@ export class AtomicMultiTenantStore {
       fs.mkdirSync(this.dbDir, { recursive: true });
     }
     if (!fs.existsSync(this.dbFile)) {
-      const initial = createDefaultMultiTenantDb();
+      const initial = createDefaultMultiTenantDb(this.dbDir);
       this.atomicWriteToDisk(initial);
       return initial;
     }
+
     const raw = fs.readFileSync(this.dbFile, 'utf-8');
-    const parsed = JSON.parse(raw) as Partial<MultiTenantDatabaseFile>;
-    if (
-      !parsed ||
-      parsed.schemaVersion !== '5.2.0-hardened' ||
-      !parsed.tenants ||
-      !parsed.accounts
-    ) {
-      const upgraded = createDefaultMultiTenantDb();
-      this.atomicWriteToDisk(upgraded);
-      return upgraded;
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(raw) as Record<string, unknown>;
+    } catch (err) {
+      // Never silently wipe a corrupt database file (#14, #19): quarantine to .corrupt.bak and throw
+      const corruptBak = `${this.dbFile}.corrupt.${Date.now()}.bak`;
+      fs.copyFileSync(this.dbFile, corruptBak);
+      throw new Error(
+        `CORRUPT_DATABASE_FILE: Veritabanı dosyası bozulmuş, veri kaybını önlemek için yedeklendi (${corruptBak}): ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
     }
-    return parsed as MultiTenantDatabaseFile;
+
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error('CORRUPT_DATABASE_FILE: Geçersiz veritabanı kök nesnesi.');
+    }
+
+    if (parsed.schemaVersion !== '5.3.0-hardened') {
+      // Create a lossless pre-migration backup snapshot before upgrading (#19)
+      const oldVer = String(parsed.schemaVersion || 'legacy').replace(
+        /[^a-zA-Z0-9._-]/g,
+        '_'
+      );
+      const bakFile = `${this.dbFile}.pre-migration-${oldVer}.bak`;
+      fs.copyFileSync(this.dbFile, bakFile);
+
+      const migrated = migrateDatabaseLossless(parsed, this.dbDir);
+      this.atomicWriteToDisk(migrated);
+      return migrated;
+    }
+
+    return parsed as unknown as MultiTenantDatabaseFile;
   }
 
   private atomicWriteToDisk(nextState: MultiTenantDatabaseFile): void {
@@ -1065,25 +1442,100 @@ export class AtomicMultiTenantStore {
     return this.state.accounts;
   }
 
+  public provisionNewMemberAccount(params: {
+    memberId: string;
+    rotaryId: string;
+    fullName: string;
+    email: string;
+    role: ClubRole;
+    clubId: AllowedTenantClubId;
+    initialPinOrPassword: string;
+  }):
+    | { ok: true; account: PilotUserAccount }
+    | { ok: false; error: string; message: string } {
+    const strength = validateStrongCredential(params.initialPinOrPassword);
+    if (!strength.valid) {
+      return {
+        ok: false,
+        error: 'WEAK_PIN_REJECTED',
+        message: strength.reason!,
+      };
+    }
+
+    const duplicate = this.state.accounts.some(
+      (a) =>
+        a.memberId.toLowerCase() === params.memberId.toLowerCase() ||
+        a.rotaryId.toLowerCase() === params.rotaryId.toLowerCase() ||
+        a.email.toLowerCase() === params.email.toLowerCase()
+    );
+    if (duplicate) {
+      return {
+        ok: false,
+        error: 'ACCOUNT_ALREADY_EXISTS',
+        message: 'Bu Rotary ID, üye kimliği veya e-posta adresiyle kayıtlı bir hesap zaten mevcut.',
+      };
+    }
+
+    const salt = crypto.randomBytes(16).toString('hex');
+    const newAccount: PilotUserAccount = {
+      memberId: params.memberId,
+      rotaryId: params.rotaryId,
+      fullName: params.fullName,
+      email: params.email,
+      role: params.role,
+      clubId: params.clubId,
+      clubMemberships: [{ clubId: params.clubId, role: params.role }],
+      passwordSalt: salt,
+      passwordHash: hashPinWithSalt(params.initialPinOrPassword.trim(), salt),
+      webauthnCredentials: [],
+    };
+
+    this.state.accounts.push(newAccount);
+    this.state.updatedAt = new Date().toISOString();
+    this.atomicWriteToDisk(this.state);
+    return { ok: true, account: newAccount };
+  }
+
   public changeAccountPin(
     memberId: string,
     currentPin: string,
     newPin: string
-  ): boolean {
+  ):
+    | { ok: true }
+    | { ok: false; reason: 'INVALID_CURRENT_PIN' | 'WEAK_PIN_REJECTED'; message: string } {
+    const strength = validateStrongCredential(newPin);
+    if (!strength.valid) {
+      return {
+        ok: false,
+        reason: 'WEAK_PIN_REJECTED',
+        message: strength.reason!,
+      };
+    }
+
     const account = this.state.accounts.find((a) => a.memberId === memberId);
-    if (!account) return false;
+    if (!account) {
+      return {
+        ok: false,
+        reason: 'INVALID_CURRENT_PIN',
+        message: 'Hesap bulunamadı.',
+      };
+    }
     const currentHash = hashPinWithSalt(currentPin.trim(), account.passwordSalt);
     const bufA = Buffer.from(currentHash, 'hex');
     const bufB = Buffer.from(account.passwordHash, 'hex');
     if (bufA.length !== bufB.length || !crypto.timingSafeEqual(bufA, bufB)) {
-      return false;
+      return {
+        ok: false,
+        reason: 'INVALID_CURRENT_PIN',
+        message: 'Mevcut PIN kodu doğrulanamadı.',
+      };
     }
     const newSalt = crypto.randomBytes(16).toString('hex');
     account.passwordSalt = newSalt;
     account.passwordHash = hashPinWithSalt(newPin.trim(), newSalt);
     this.state.updatedAt = new Date().toISOString();
     this.atomicWriteToDisk(this.state);
-    return true;
+    return { ok: true };
   }
 
   public registerWebAuthnCredential(
@@ -1170,6 +1622,86 @@ export class AtomicMultiTenantStore {
     };
   }
 
+  public restoreTenantFromVerifiedBackup(params: {
+    clubId: string;
+    backupPayload: {
+      clubId?: string;
+      tenantState?: TenantClubDatabaseState;
+      auditLedger?: ChainedAuditLogEntry[];
+      backupChecksum?: string;
+    };
+    actor: AuthenticatedUser;
+    timestamp: string;
+  }):
+    | { ok: true; state: TenantClubDatabaseState }
+    | { ok: false; error: string; message: string } {
+    const { clubId, backupPayload, actor, timestamp } = params;
+    if (
+      !backupPayload ||
+      backupPayload.clubId !== clubId ||
+      !backupPayload.tenantState ||
+      !backupPayload.backupChecksum
+    ) {
+      return {
+        ok: false,
+        error: 'INVALID_BACKUP_PAYLOAD',
+        message: 'Yedek dosyası kulüp kimliği veya veri yapısı geçersiz.',
+      };
+    }
+
+    const computedChecksum = crypto
+      .createHash('sha256')
+      .update(JSON.stringify(backupPayload.tenantState), 'utf8')
+      .digest('hex');
+    if (computedChecksum !== backupPayload.backupChecksum) {
+      return {
+        ok: false,
+        error: 'BACKUP_CHECKSUM_MISMATCH',
+        message: 'Yedek dosyasının SHA-256 bütünlük özeti (backupChecksum) doğrulanamadı.',
+      };
+    }
+
+    const incomingAudit =
+      backupPayload.auditLedger || backupPayload.tenantState.auditLedger || [];
+    const chainCheck = verifyAuditChain(incomingAudit, clubId);
+    if (!chainCheck.valid) {
+      return {
+        ok: false,
+        error: 'CORRUPT_BACKUP_AUDIT_CHAIN',
+        message: 'Yedek dosyasındaki SHA-256 denetim zinciri bozulmuş; geri yükleme reddedildi.',
+      };
+    }
+
+    const current = this.getTenantState(clubId);
+    // Preserve whichever audit chain is longer/current so audit history can never be truncated
+    const preservedAudit =
+      current.auditLedger.length >= incomingAudit.length
+        ? current.auditLedger
+        : incomingAudit;
+
+    const restored: TenantClubDatabaseState = {
+      ...backupPayload.tenantState,
+      clubId,
+      revision: current.revision + 1,
+      updatedAt: new Date().toISOString(),
+      auditLedger: preservedAudit,
+    };
+    this.state.tenants[clubId] = restored;
+    this.appendAuditEntry({
+      clubId,
+      actorName: `${actor.fullName} (${actor.rotaryId})`,
+      actorRole: actor.role,
+      module: 'Yönetim & Güvenlik',
+      action: `Kulüp Yedeğinden Veri Geri Yükleme Tamamlandı (Rev #${restored.revision})`,
+      detail: `SHA-256 checksum (${computedChecksum.slice(
+        0,
+        12
+      )}...) doğrulanarak operasyonel durum geri yüklendi.`,
+      timestamp,
+    });
+    return { ok: true, state: this.state.tenants[clubId] };
+  }
+
   public appendAuditEntry(params: {
     clubId: string;
     actorName: string;
@@ -1214,22 +1746,37 @@ export class AtomicMultiTenantStore {
   }
 
   /**
-   * Atomic Compare-And-Swap (CAS) Tenant Update (#14)
-   * Validates expectedRevision inside the critical section before applying updater and fsyncing to disk.
+   * Mandatory Compare-And-Swap (CAS) Tenant Update (#14)
+   * Requires an explicit integer expectedRevision matching current.revision before mutating state.
    */
   public updateTenant(
     clubId: string,
     updater: (current: TenantClubDatabaseState) => TenantClubDatabaseState,
-    expectedRevision?: number
+    expectedRevision: number
   ):
     | { ok: true; state: TenantClubDatabaseState }
-    | { ok: false; currentRevision: number } {
+    | {
+        ok: false;
+        reason: 'REVISION_REQUIRED' | 'REVISION_CONFLICT';
+        currentRevision: number;
+      } {
     const current = this.getTenantState(clubId);
     if (
-      typeof expectedRevision === 'number' &&
-      expectedRevision !== current.revision
+      typeof expectedRevision !== 'number' ||
+      !Number.isInteger(expectedRevision)
     ) {
-      return { ok: false, currentRevision: current.revision };
+      return {
+        ok: false,
+        reason: 'REVISION_REQUIRED',
+        currentRevision: current.revision,
+      };
+    }
+    if (expectedRevision !== current.revision) {
+      return {
+        ok: false,
+        reason: 'REVISION_CONFLICT',
+        currentRevision: current.revision,
+      };
     }
     const preservedAuditLedger = current.auditLedger;
     const updated = updater(current);

@@ -4,6 +4,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import {
+  AllowedTenantClubId,
   AtomicMultiTenantStore,
   AuthenticatedUser,
   authenticatePilotCredentials,
@@ -19,7 +20,13 @@ import {
   verifyAuditChain,
   verifySignedToken,
 } from './src/server/pilotEngine';
-import { AuditLogEntry, ClubRole, RotaryMember } from './src/types/rotary';
+import {
+  AuditLogEntry,
+  ClubRole,
+  FinancialLineItem,
+  RotaryMember,
+  TreasuryLedgerEntry,
+} from './src/types/rotary';
 
 const PORT = 3000;
 
@@ -126,7 +133,7 @@ function verifyTenantBoundary(
   requestedClubId: string | undefined,
   store: AtomicMultiTenantStore,
   res: Response
-): string | null {
+): AllowedTenantClubId | null {
   const effectiveClubId = (requestedClubId && requestedClubId.trim()) || user.clubId;
   if (!isAllowedTenantClubId(effectiveClubId)) {
     res.status(404).json({
@@ -156,6 +163,23 @@ function verifyTenantBoundary(
   return effectiveClubId;
 }
 
+function buildExpectedOriginsForHost(
+  req: Request,
+  rpId: string,
+  storedOrigin: string
+): Set<string> {
+  const hostHeader = req.get('host') || rpId || 'localhost';
+  return new Set([
+    storedOrigin,
+    `http://${hostHeader}`,
+    `https://${hostHeader}`,
+    `http://${rpId}`,
+    `https://${rpId}`,
+    `http://${rpId}:3000`,
+    `https://${rpId}:3000`,
+  ]);
+}
+
 export function createPilotExpressApp(customDbFile?: string) {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
@@ -181,6 +205,7 @@ export function createPilotExpressApp(customDbFile?: string) {
       clubId: string;
       ceremony: 'webauthn.get' | 'webauthn.create';
       rpId: string;
+      expectedOrigin: string;
       expiresAt: number;
     }
   >();
@@ -197,15 +222,16 @@ export function createPilotExpressApp(customDbFile?: string) {
     const chainStatus = verifyAuditChain(ledger, 'club-galata');
     res.json({
       status: 'ok',
-      engine: 'RotaClub Hardened Pilot Server v5.2',
+      engine: 'RotaClub Hardened Pilot Server v5.3',
       authMode:
-        'HMAC-SHA256 Signed Bearer Token + Pre-Salted Scrypt PIN + ECDSA P-256 WebAuthn Verification',
+        'HMAC-SHA256 Signed Bearer Token + CSPRNG Scrypt Credential + W3C WebAuthn P-256 Origin & Signature Verification',
       rbacEnforced: true,
       headerSpoofingBlocked: true,
       queryTokenBlocked: true,
       multiTenantIsolation: true,
       clubMembershipEnforced: true,
-      atomicCasRevisionEnforced: true,
+      atomicCasRevisionMandatory: true,
+      serverManagedAccountingLedger: true,
       auditChainValid: chainStatus.valid,
       auditHeadHash: chainStatus.headHash,
       auditTotalEntries: chainStatus.totalEntries,
@@ -298,6 +324,102 @@ export function createPilotExpressApp(customDbFile?: string) {
     });
   });
 
+  // 2b. Secure Server-Side Member Account Registration Endpoint (#22, #70)
+  // Strictly requires 'baskan' or 'sekreter' role and enforces strong PIN/password rules and CSPRNG salt.
+  app.post(
+    '/api/auth/register-member-account',
+    requireServerRole(['baskan', 'sekreter']),
+    (req: AuthenticatedRequest, res) => {
+      const user = req.authUser!;
+      const {
+        memberId,
+        rotaryId,
+        fullName,
+        email,
+        role,
+        clubId,
+        initialPinOrPassword,
+      } = req.body || {};
+
+      const authorizedClubId = verifyTenantBoundary(
+        user,
+        typeof clubId === 'string' ? clubId : undefined,
+        store,
+        res
+      );
+      if (!authorizedClubId) return;
+
+      if (
+        !memberId ||
+        !rotaryId ||
+        !fullName ||
+        !email ||
+        !initialPinOrPassword
+      ) {
+        res.status(400).json({
+          error: 'MISSING_ACCOUNT_FIELDS',
+          message:
+            'Yeni üye hesabı oluşturmak için memberId, rotaryId, fullName, email ve initialPinOrPassword zorunludur.',
+        });
+        return;
+      }
+
+      const assignedRole: ClubRole =
+        role === 'sekreter' || role === 'sayman' || role === 'baskan'
+          ? role
+          : 'uye';
+      if (assignedRole !== 'uye' && user.role !== 'baskan') {
+        res.status(403).json({
+          error: 'RBAC_FORBIDDEN',
+          message:
+            'Yönetim Kurulu rolüne sahip hesaplar yalnızca Dönem Başkanı tarafından tanımlanabilir.',
+        });
+        return;
+      }
+
+      const created = store.provisionNewMemberAccount({
+        memberId: String(memberId).trim(),
+        rotaryId: String(rotaryId).trim(),
+        fullName: String(fullName).trim(),
+        email: String(email).trim(),
+        role: assignedRole,
+        clubId: authorizedClubId,
+        initialPinOrPassword: String(initialPinOrPassword),
+      });
+
+      if (!created.ok) {
+        const status = created.error === 'ACCOUNT_ALREADY_EXISTS' ? 409 : 400;
+        res.status(status).json({
+          error: created.error,
+          message: created.message,
+        });
+        return;
+      }
+
+      store.appendAuditEntry({
+        clubId: authorizedClubId,
+        actorName: `${user.fullName} (${user.rotaryId})`,
+        actorRole: user.role,
+        module: 'Yönetim & Güvenlik',
+        action: `Yeni Üye Hesabı Oluşturuldu: ${created.account.fullName} (${created.account.rotaryId})`,
+        detail: `${created.account.fullName} için CSPRNG salt ve Scrypt özetli güvenli sunucu hesabı (${assignedRole}) tanımlandı.`,
+        timestamp: formatNowTR(),
+      });
+
+      res.status(201).json({
+        ok: true,
+        account: {
+          memberId: created.account.memberId,
+          rotaryId: created.account.rotaryId,
+          fullName: created.account.fullName,
+          email: created.account.email,
+          role: created.account.role,
+          clubId: created.account.clubId,
+        },
+      });
+    }
+  );
+
   // 3a. Authenticated WebAuthn Passkey Registration Options (#12, #22)
   // Requires an authenticated session so an unauthenticated caller can NEVER register a passkey on someone else's account!
   app.post(
@@ -317,6 +439,9 @@ export function createPilotExpressApp(customDbFile?: string) {
       const challenge = crypto.randomBytes(32).toString('base64url');
       const challengeId = crypto.randomUUID();
       const rpId = req.hostname || 'localhost';
+      const expectedOrigin = `${req.protocol || 'http'}://${
+        req.get('host') || rpId
+      }`;
 
       activeChallenges.set(challengeId, {
         challenge,
@@ -325,6 +450,7 @@ export function createPilotExpressApp(customDbFile?: string) {
         clubId: user.clubId,
         ceremony: 'webauthn.create',
         rpId,
+        expectedOrigin,
         expiresAt: Date.now() + 5 * 60 * 1000,
       });
 
@@ -348,7 +474,7 @@ export function createPilotExpressApp(customDbFile?: string) {
   );
 
   // 3b. Authenticated WebAuthn Passkey Registration Verification (#12, #22)
-  // Requires an authenticated session matching the challenge's memberId and a valid SPKI public key!
+  // Requires an authenticated session matching the challenge's memberId, strict origin check, and a valid SPKI public key!
   app.post(
     '/api/auth/webauthn-register-verify',
     requireAuth,
@@ -399,13 +525,28 @@ export function createPilotExpressApp(customDbFile?: string) {
 
       if (
         parsedClientData.type !== 'webauthn.create' ||
-        parsedClientData.challenge !== stored.challenge ||
-        !parsedClientData.origin
+        parsedClientData.challenge !== stored.challenge
       ) {
         res.status(401).json({
           error: 'WEBAUTHN_CHALLENGE_MISMATCH',
           message:
-            'WebAuthn clientDataJSON challenge, origin veya ceremony tipi sunucu kaydıyla eşleşmiyor.',
+            'WebAuthn clientDataJSON challenge veya ceremony tipi sunucu kaydıyla eşleşmiyor.',
+        });
+        return;
+      }
+
+      const allowedOrigins = buildExpectedOriginsForHost(
+        req,
+        stored.rpId,
+        stored.expectedOrigin
+      );
+      if (
+        !parsedClientData.origin ||
+        !allowedOrigins.has(parsedClientData.origin)
+      ) {
+        res.status(401).json({
+          error: 'WEBAUTHN_ORIGIN_MISMATCH',
+          message: `WebAuthn origin doğrulaması reddedildi (#22): "${parsedClientData.origin}" beklenen sunucu origin değeri (${stored.expectedOrigin}) ile eşleşmiyor.`,
         });
         return;
       }
@@ -502,6 +643,9 @@ export function createPilotExpressApp(customDbFile?: string) {
     const challenge = crypto.randomBytes(32).toString('base64url');
     const challengeId = crypto.randomUUID();
     const rpId = req.hostname || 'localhost';
+    const expectedOrigin = `${req.protocol || 'http'}://${
+      req.get('host') || rpId
+    }`;
 
     activeChallenges.set(challengeId, {
       challenge,
@@ -510,6 +654,7 @@ export function createPilotExpressApp(customDbFile?: string) {
       clubId: targetClubId,
       ceremony: 'webauthn.get',
       rpId,
+      expectedOrigin,
       expiresAt: Date.now() + 5 * 60 * 1000,
     });
 
@@ -581,13 +726,28 @@ export function createPilotExpressApp(customDbFile?: string) {
 
     if (
       parsedClientData.type !== 'webauthn.get' ||
-      parsedClientData.challenge !== stored.challenge ||
-      !parsedClientData.origin
+      parsedClientData.challenge !== stored.challenge
     ) {
       res.status(401).json({
         error: 'WEBAUTHN_ASSERTION_MISMATCH',
         message:
-          'WebAuthn clientDataJSON challenge, origin veya ceremony tipi doğrulanamadı.',
+          'WebAuthn clientDataJSON challenge veya ceremony tipi doğrulanamadı.',
+      });
+      return;
+    }
+
+    const allowedOrigins = buildExpectedOriginsForHost(
+      req,
+      stored.rpId,
+      stored.expectedOrigin
+    );
+    if (
+      !parsedClientData.origin ||
+      !allowedOrigins.has(parsedClientData.origin)
+    ) {
+      res.status(401).json({
+        error: 'WEBAUTHN_ORIGIN_MISMATCH',
+        message: `WebAuthn origin doğrulaması reddedildi (#22): "${parsedClientData.origin}" sunucu origin değeri (${stored.expectedOrigin}) ile eşleşmiyor.`,
       });
       return;
     }
@@ -761,29 +921,30 @@ export function createPilotExpressApp(customDbFile?: string) {
     res.json({ ok: true, revokedJti: user.jti });
   });
 
-  // 4c. Change Account PIN (#22)
+  // 4c. Change Account PIN with Complexity Validation (#22)
   app.post(
     '/api/auth/change-pin',
     requireAuth,
     (req: AuthenticatedRequest, res) => {
       const user = req.authUser!;
       const { currentPin, newPin } = req.body || {};
-      if (!currentPin || !newPin || String(newPin).trim().length < 6) {
+      if (!currentPin || !newPin) {
         res.status(400).json({
           error: 'INVALID_PIN_FORMAT',
-          message: 'Mevcut PIN ve en az 6 haneli yeni PIN kodu zorunludur.',
+          message: 'Mevcut PIN ve yeni PIN kodu zorunludur.',
         });
         return;
       }
-      const updated = store.changeAccountPin(
+      const result = store.changeAccountPin(
         user.memberId,
         String(currentPin),
         String(newPin)
       );
-      if (!updated) {
-        res.status(401).json({
-          error: 'INVALID_CURRENT_PIN',
-          message: 'Mevcut PIN kodu doğrulanamadı.',
+      if (!result.ok) {
+        const status = result.reason === 'WEAK_PIN_REJECTED' ? 400 : 401;
+        res.status(status).json({
+          error: result.reason,
+          message: result.message,
         });
         return;
       }
@@ -854,8 +1015,8 @@ export function createPilotExpressApp(customDbFile?: string) {
         actorName: `${user.fullName} (${user.rotaryId})`,
         actorRole: membership.role,
         module: 'Yönetim & Güvenlik',
-        action: `Kulüp Oturumu Değiştirildi (${membership.clubId})`,
-        detail: `${user.fullName} doğrulanmış kulüp üyeliği ile oturum kapsamını "${user.clubId}" kulübünden "${membership.clubId}" kulübüne taşıdı.`,
+        action: `Kulüp Oturumu Değiştirildi (${membership.clubId} · Rol: ${membership.role.toUpperCase()})`,
+        detail: `${user.fullName} doğrulanmış kulüp üyeliği ile oturum kapsamını "${user.clubId}" kulübünden "${membership.clubId}" kulübüne (${membership.role}) taşıdı.`,
         timestamp: formatNowTR(),
       });
 
@@ -916,7 +1077,7 @@ export function createPilotExpressApp(customDbFile?: string) {
     }
   );
 
-  // 7. Bank Statement Reconciliation Endpoint for Sayman / Başkan (#6, #39, #70, #76)
+  // 7a. Bank Statement Reconciliation Endpoint for Sayman / Başkan (#6, #39, #70, #76)
   app.post(
     '/api/pilot/reconcile-payment',
     requireServerRole(['sayman', 'baskan']),
@@ -1047,150 +1208,154 @@ export function createPilotExpressApp(customDbFile?: string) {
           return;
         }
 
-        const casResult = store.updateTenant(authorizedClubId, (curr) => {
-          const nextPayments = curr.paymentNotifications.map((p) =>
-            p.id === paymentId
-              ? { ...p, status: 'Onaylandı' as const, receiptRef: canonicalRef }
-              : p
-          );
+        const casResult = store.updateTenant(
+          authorizedClubId,
+          (curr) => {
+            const nextPayments = curr.paymentNotifications.map((p) =>
+              p.id === paymentId
+                ? { ...p, status: 'Onaylandı' as const, receiptRef: canonicalRef }
+                : p
+            );
 
-          const nextStatements = curr.bankStatements.map((b) =>
-            normalizeBankRef(b.bankRef) === canonicalRef
-              ? {
-                  ...b,
-                  reconciled: true,
-                  reconciledPaymentId: payment.id,
-                  reconciledAt: formatNowTR(),
-                  reconciledBy: user.fullName,
-                }
-              : b
-          );
-
-          const nextProjects = payment.targetProjectId
-            ? curr.projects.map((proj) =>
-                proj.id === payment.targetProjectId
-                  ? {
-                      ...proj,
-                      collectedAmount: proj.collectedAmount + payment.amount,
-                      supportersCount: proj.supportersCount + 1,
-                    }
-                  : proj
-              )
-            : curr.projects;
-
-          const nextScholars = payment.targetScholarId
-            ? curr.scholars.map((sch) => {
-                if (sch.id !== payment.targetScholarId) return sch;
-                const nextFunded = Math.min(
-                  sch.totalMonths,
-                  sch.fundedMonths + 1
-                );
-                return {
-                  ...sch,
-                  fundedMonths: nextFunded,
-                  statusNote:
-                    nextFunded >= sch.totalMonths
-                      ? 'Dönem Bursu Tamamlandı'
-                      : sch.statusNote,
-                };
-              })
-            : curr.scholars;
-
-          const isDirectContribution = Boolean(
-            payment.targetProjectId || payment.targetScholarId
-          );
-
-          const nextMembers = isDirectContribution
-            ? curr.members
-            : curr.members.map((m) => {
-                if (
-                  m.id !== payment.memberId &&
-                  normalizePersonName(m.fullName) !==
-                    normalizePersonName(payment.memberName)
-                ) {
-                  return m;
-                }
-                if (payment.category === 'Dönem Aidatı') {
-                  return {
-                    ...m,
-                    duesBalance: Math.max(0, m.duesBalance - payment.amount),
-                  };
-                }
-                if (payment.category === 'Toplantı Kuver Bakiyesi') {
-                  return {
-                    ...m,
-                    mealBalance: Math.max(0, m.mealBalance - payment.amount),
-                  };
-                }
-                return {
-                  ...m,
-                  foundationBalance: Math.max(
-                    0,
-                    m.foundationBalance - payment.amount
-                  ),
-                };
-              });
-
-          const nextOverdue = isDirectContribution
-            ? curr.overdueMembers
-            : curr.overdueMembers
-                .map((o) => {
-                  if (
-                    normalizePersonName(o.memberName) !==
-                    normalizePersonName(payment.memberName)
-                  ) {
-                    return o;
+            const nextStatements = curr.bankStatements.map((b) =>
+              normalizeBankRef(b.bankRef) === canonicalRef
+                ? {
+                    ...b,
+                    reconciled: true,
+                    reconciledPaymentId: payment.id,
+                    reconciledAt: formatNowTR(),
+                    reconciledBy: user.fullName,
                   }
-                  const remaining = Math.max(
-                    0,
-                    o.overdueAmount - payment.amount
+                : b
+            );
+
+            const nextProjects = payment.targetProjectId
+              ? curr.projects.map((proj) =>
+                  proj.id === payment.targetProjectId
+                    ? {
+                        ...proj,
+                        collectedAmount: proj.collectedAmount + payment.amount,
+                        supportersCount: proj.supportersCount + 1,
+                      }
+                    : proj
+                )
+              : curr.projects;
+
+            const nextScholars = payment.targetScholarId
+              ? curr.scholars.map((sch) => {
+                  if (sch.id !== payment.targetScholarId) return sch;
+                  const nextFunded = Math.min(
+                    sch.totalMonths,
+                    sch.fundedMonths + 1
                   );
-                  return { ...o, overdueAmount: remaining };
+                  return {
+                    ...sch,
+                    fundedMonths: nextFunded,
+                    statusNote:
+                      nextFunded >= sch.totalMonths
+                        ? 'Dönem Bursu Tamamlandı'
+                        : sch.statusNote,
+                  };
                 })
-                .filter((o) => o.overdueAmount > 0);
+              : curr.scholars;
 
-          const nextFinancialItems = !isDirectContribution
-            ? curr.financialItems.map((item) =>
-                item.category === payment.category
-                  ? {
-                      ...item,
-                      paidAmount: Math.min(
-                        item.totalAmount,
-                        item.paidAmount + payment.amount
-                      ),
-                    }
-                  : item
-              )
-            : curr.financialItems;
-
-          const newLedgerEntry = {
-            id: `tr-${Date.now()}`,
-            date: '23 Ekim 2026',
-            type: 'Gelir' as const,
-            category:
+            const isDirectContribution = Boolean(
               payment.targetProjectId || payment.targetScholarId
-                ? ('Burs & Proje Fonu' as const)
-                : payment.category === 'Vakıf / Proje Katkı Payı'
-                ? ('UR Bölge & Vakıf' as const)
-                : ('Aidat & Kuver Tahsilatı' as const),
-            title: `${payment.memberName} — ${payment.description} (Banka Mutabakatlı)`,
-            counterparty: payment.memberName,
-            amount: payment.amount,
-            referenceNo: canonicalRef,
-          };
+            );
 
-          return {
-            ...curr,
-            paymentNotifications: nextPayments,
-            bankStatements: nextStatements,
-            projects: nextProjects,
-            scholars: nextScholars,
-            members: nextMembers,
-            overdueMembers: nextOverdue,
-            financialItems: nextFinancialItems,
-            treasuryLedger: [newLedgerEntry, ...curr.treasuryLedger],
-          };
-        });
+            const nextMembers = isDirectContribution
+              ? curr.members
+              : curr.members.map((m) => {
+                  if (
+                    m.id !== payment.memberId &&
+                    normalizePersonName(m.fullName) !==
+                      normalizePersonName(payment.memberName)
+                  ) {
+                    return m;
+                  }
+                  if (payment.category === 'Dönem Aidatı') {
+                    return {
+                      ...m,
+                      duesBalance: Math.max(0, m.duesBalance - payment.amount),
+                    };
+                  }
+                  if (payment.category === 'Toplantı Kuver Bakiyesi') {
+                    return {
+                      ...m,
+                      mealBalance: Math.max(0, m.mealBalance - payment.amount),
+                    };
+                  }
+                  return {
+                    ...m,
+                    foundationBalance: Math.max(
+                      0,
+                      m.foundationBalance - payment.amount
+                    ),
+                  };
+                });
+
+            const nextOverdue = isDirectContribution
+              ? curr.overdueMembers
+              : curr.overdueMembers
+                  .map((o) => {
+                    if (
+                      normalizePersonName(o.memberName) !==
+                      normalizePersonName(payment.memberName)
+                    ) {
+                      return o;
+                    }
+                    const remaining = Math.max(
+                      0,
+                      o.overdueAmount - payment.amount
+                    );
+                    return { ...o, overdueAmount: remaining };
+                  })
+                  .filter((o) => o.overdueAmount > 0);
+
+            const nextFinancialItems = !isDirectContribution
+              ? curr.financialItems.map((item) =>
+                  item.category === payment.category
+                    ? {
+                        ...item,
+                        paidAmount: Math.min(
+                          item.totalAmount,
+                          item.paidAmount + payment.amount
+                        ),
+                      }
+                    : item
+                )
+              : curr.financialItems;
+
+            const newLedgerEntry: TreasuryLedgerEntry = {
+              id: `tr-${Date.now()}`,
+              date: '23 Ekim 2026',
+              type: 'Gelir',
+              category:
+                payment.targetProjectId || payment.targetScholarId
+                  ? 'Burs & Proje Fonu'
+                  : payment.category === 'Vakıf / Proje Katkı Payı'
+                  ? 'UR Bölge & Vakıf'
+                  : 'Aidat & Kuver Tahsilatı',
+              title: `${payment.memberName} — ${payment.description} (Banka Mutabakatlı)`,
+              counterparty: payment.memberName,
+              amount: payment.amount,
+              referenceNo: canonicalRef,
+            };
+
+            return {
+              ...curr,
+              paymentNotifications: nextPayments,
+              bankStatements: nextStatements,
+              projects: nextProjects,
+              scholars: nextScholars,
+              members: nextMembers,
+              overdueMembers: nextOverdue,
+              financialItems: nextFinancialItems,
+              treasuryLedger: [newLedgerEntry, ...curr.treasuryLedger],
+            };
+          },
+          tenant.revision
+        );
 
         if (!casResult.ok) {
           res.status(409).json({
@@ -1228,7 +1393,271 @@ export function createPilotExpressApp(customDbFile?: string) {
     }
   );
 
-  // 8. Authenticated State Synchronization, Atomic CAS Revision Check & Granular Accounting Protection (#14, #16, #18, #20, #39, #70)
+  // 7b. Server-Managed Club Expense & Voucher Recording Endpoint (#39, #70)
+  // Replaces direct client treasuryLedger array syncs; strictly validates unique referenceNo and positive amount.
+  app.post(
+    '/api/pilot/reconcile-expense',
+    requireServerRole(['sayman', 'baskan']),
+    (req: AuthenticatedRequest, res) => {
+      try {
+        const user = req.authUser!;
+        const {
+          clubId,
+          type,
+          category,
+          title,
+          counterparty,
+          amount,
+          referenceNo,
+          date,
+        } = req.body || {};
+
+        const authorizedClubId = verifyTenantBoundary(
+          user,
+          typeof clubId === 'string' ? clubId : undefined,
+          store,
+          res
+        );
+        if (!authorizedClubId) return;
+
+        // Income entries for member dues/projects MUST use /api/pilot/reconcile-payment against bank statements!
+        if (type === 'Gelir') {
+          res.status(422).json({
+            error: 'INCOME_REQUIRES_BANK_RECONCILIATION',
+            message:
+              'Gelir kayıtları kasa defterine doğrudan eklenemez; /api/pilot/reconcile-payment üzerinden banka ekstresi eşleştirmesi zorunludur (#39).',
+          });
+          return;
+        }
+
+        const numAmount = Number(amount);
+        if (!Number.isFinite(numAmount) || numAmount <= 0) {
+          res.status(422).json({
+            error: 'INVALID_LEDGER_AMOUNT',
+            message: 'Gider tutarı 0’dan büyük geçerli bir sayı olmalıdır.',
+          });
+          return;
+        }
+
+        const canonicalRef = normalizeBankRef(String(referenceNo || ''));
+        if (!canonicalRef || canonicalRef.length < 4) {
+          res.status(400).json({
+            error: 'MISSING_VOUCHER_REFERENCE',
+            message: 'Geçerli bir fatura veya banka dekont referans kodu (referenceNo) zorunludur.',
+          });
+          return;
+        }
+
+        if (!title || !counterparty) {
+          res.status(400).json({
+            error: 'MISSING_EXPENSE_FIELDS',
+            message: 'Gider açıklaması (title) ve karşı taraf (counterparty) zorunludur.',
+          });
+          return;
+        }
+
+        const tenant = store.getTenantState(authorizedClubId);
+        const duplicateInLedger = tenant.treasuryLedger.some(
+          (t) => normalizeBankRef(t.referenceNo) === canonicalRef
+        );
+        if (duplicateInLedger) {
+          res.status(409).json({
+            error: 'DUPLICATE_LEDGER_REFERENCE',
+            message: `Mükerrer muhasebe kaydı engellendi (#39): "${canonicalRef}" referans numaralı belge kasa defterinde zaten mevcut.`,
+          });
+          return;
+        }
+
+        const allowedCategories: TreasuryLedgerEntry['category'][] = [
+          'Otel & Banket Gideri',
+          'Burs & Proje Fonu',
+          'UR Bölge & Vakıf',
+          'Aidat & Kuver Tahsilatı',
+        ];
+        const safeCategory: TreasuryLedgerEntry['category'] =
+          allowedCategories.includes(category)
+            ? category
+            : 'Otel & Banket Gideri';
+
+        const newEntry: TreasuryLedgerEntry = {
+          id: `tr-exp-${Date.now()}`,
+          date: typeof date === 'string' && date.trim() ? date.trim() : '23 Ekim 2026',
+          type: 'Gider',
+          category: safeCategory,
+          title: String(title).trim(),
+          counterparty: String(counterparty).trim(),
+          amount: numAmount,
+          referenceNo: canonicalRef,
+        };
+
+        const casResult = store.updateTenant(
+          authorizedClubId,
+          (curr) => ({
+            ...curr,
+            treasuryLedger: [newEntry, ...curr.treasuryLedger],
+          }),
+          tenant.revision
+        );
+
+        if (!casResult.ok) {
+          res.status(409).json({
+            error: 'REVISION_CONFLICT',
+            currentRevision: casResult.currentRevision,
+          });
+          return;
+        }
+
+        store.appendAuditEntry({
+          clubId: authorizedClubId,
+          actorName: `${user.fullName} (${user.rotaryId})`,
+          actorRole: user.role,
+          module: 'Saymanlık & Kasa',
+          action: `Sunucu Doğrulamalı Gider Kaydı (${canonicalRef})`,
+          detail: `${newEntry.title} (${newEntry.counterparty} · ${newEntry.amount} TL) mükerrer belge kontrolüyle kasa defterine işlendi.`,
+          timestamp: formatNowTR(),
+        });
+
+        res.json({
+          ok: true,
+          revision: casResult.state.revision,
+          state: redactStateForRole(
+            casResult.state,
+            store.getAuditLedger(authorizedClubId),
+            user
+          ),
+        });
+      } catch (err) {
+        res.status(500).json({
+          error: 'EXPENSE_WRITE_ERROR',
+          message: err instanceof Error ? err.message : 'Gider kayıt hatası',
+        });
+      }
+    }
+  );
+
+  // 7c. Server-Managed Bulk Member Dues/Kuver Accrual Endpoint (#39, #70)
+  app.post(
+    '/api/pilot/accrue-dues',
+    requireServerRole(['sayman', 'baskan']),
+    (req: AuthenticatedRequest, res) => {
+      try {
+        const user = req.authUser!;
+        const { clubId, category, amount, description, dueDate } = req.body || {};
+
+        const authorizedClubId = verifyTenantBoundary(
+          user,
+          typeof clubId === 'string' ? clubId : undefined,
+          store,
+          res
+        );
+        if (!authorizedClubId) return;
+
+        const numAmount = Number(amount);
+        if (!Number.isFinite(numAmount) || numAmount <= 0) {
+          res.status(422).json({
+            error: 'INVALID_ACCRUAL_AMOUNT',
+            message: 'Tahakkuk tutarı 0’dan büyük geçerli bir sayı olmalıdır.',
+          });
+          return;
+        }
+
+        if (!description || !String(description).trim()) {
+          res.status(400).json({
+            error: 'MISSING_ACCRUAL_DESCRIPTION',
+            message: 'Tahakkuk açıklaması (description) zorunludur.',
+          });
+          return;
+        }
+
+        const validCategories: FinancialLineItem['category'][] = [
+          'Dönem Aidatı',
+          'Toplantı Kuver Bakiyesi',
+          'Vakıf / Proje Katkı Payı',
+        ];
+        const safeCategory: FinancialLineItem['category'] =
+          validCategories.includes(category) ? category : 'Dönem Aidatı';
+
+        const tenant = store.getTenantState(authorizedClubId);
+        const casResult = store.updateTenant(
+          authorizedClubId,
+          (curr) => {
+            const nextMembers = curr.members.map((m) => {
+              if (safeCategory === 'Dönem Aidatı') {
+                return { ...m, duesBalance: m.duesBalance + numAmount };
+              }
+              if (safeCategory === 'Toplantı Kuver Bakiyesi') {
+                return { ...m, mealBalance: m.mealBalance + numAmount };
+              }
+              return {
+                ...m,
+                foundationBalance: m.foundationBalance + numAmount,
+              };
+            });
+
+            const nextFinancialItems: FinancialLineItem[] = [
+              ...curr.financialItems,
+              {
+                id: `fin-${Date.now()}`,
+                category: safeCategory,
+                title: String(description).trim(),
+                period: 'Ekim 2026 Tahakkuku',
+                totalAmount: numAmount,
+                paidAmount: 0,
+                dueDate:
+                  typeof dueDate === 'string' && dueDate.trim()
+                    ? dueDate.trim()
+                    : '15 Kasım 2026',
+              },
+            ];
+
+            return {
+              ...curr,
+              members: nextMembers,
+              financialItems: nextFinancialItems,
+            };
+          },
+          tenant.revision
+        );
+
+        if (!casResult.ok) {
+          res.status(409).json({
+            error: 'REVISION_CONFLICT',
+            currentRevision: casResult.currentRevision,
+          });
+          return;
+        }
+
+        store.appendAuditEntry({
+          clubId: authorizedClubId,
+          actorName: `${user.fullName} (${user.rotaryId})`,
+          actorRole: user.role,
+          module: 'Saymanlık & Kasa',
+          action: `Sunucu Yönetimli Toplu Tahakkuk (${safeCategory}: ${numAmount} TL)`,
+          detail: `Tüm kulüp üyelerinin "${safeCategory}" cari bakiyesine "${String(
+            description
+          ).trim()}" kalemi sunucu tarafından tahakkuk ettirildi.`,
+          timestamp: formatNowTR(),
+        });
+
+        res.json({
+          ok: true,
+          revision: casResult.state.revision,
+          state: redactStateForRole(
+            casResult.state,
+            store.getAuditLedger(authorizedClubId),
+            user
+          ),
+        });
+      } catch (err) {
+        res.status(500).json({
+          error: 'ACCRUAL_WRITE_ERROR',
+          message: err instanceof Error ? err.message : 'Tahakkuk kayıt hatası',
+        });
+      }
+    }
+  );
+
+  // 8. Authenticated State Synchronization, Mandatory CAS Revision Check & Closed Accounting Ledger Bypass (#14, #16, #18, #20, #39, #70)
   app.post('/api/pilot/sync', requireAuth, (req: AuthenticatedRequest, res) => {
     try {
       const user = req.authUser!;
@@ -1243,6 +1672,30 @@ export function createPilotExpressApp(customDbFile?: string) {
       if (!authorizedClubId) return;
 
       const currentTenant = store.getTenantState(authorizedClubId);
+
+      // Issue #14 Fix: expectedRevision is strictly MANDATORY on /api/pilot/sync
+      const expectedRevision = req.body?.expectedRevision;
+      if (
+        typeof expectedRevision !== 'number' ||
+        !Number.isInteger(expectedRevision)
+      ) {
+        res.status(428).json({
+          error: 'REVISION_REQUIRED',
+          message:
+            'Eşzamanlı veri bütünlüğü (#14): /api/pilot/sync isteklerinde tam sayı expectedRevision alanı zorunludur.',
+          currentRevision: currentTenant.revision,
+        });
+        return;
+      }
+
+      if (expectedRevision !== currentTenant.revision) {
+        res.status(409).json({
+          error: 'REVISION_CONFLICT',
+          message: `Veri sürümü çakışması (#14): İstemci revizyonu (${expectedRevision}) sunucu revizyonu (${currentTenant.revision}) ile eşleşmiyor.`,
+          currentRevision: currentTenant.revision,
+        });
+        return;
+      }
 
       const auditEvent = req.body?.auditEvent as
         | {
@@ -1272,6 +1725,50 @@ export function createPilotExpressApp(customDbFile?: string) {
         user.role === 'sekreter' ||
         user.role === 'sayman' ||
         user.role === 'baskan';
+
+      // Issue #39 Fix: Close ALL direct client write paths to treasuryLedger, bankStatements, financialItems, and overdueMembers!
+      if (
+        'treasuryLedger' in incomingPatch ||
+        'bankStatements' in incomingPatch ||
+        'financialItems' in incomingPatch ||
+        'overdueMembers' in incomingPatch
+      ) {
+        res.status(422).json({
+          error: 'DIRECT_LEDGER_MUTATION_FORBIDDEN',
+          message:
+            'Muhasebe bütünlüğü koruması (#39): Kasa defteri (treasuryLedger), banka ekstreleri ve finansal tahakkuk tabloları /api/pilot/sync üzerinden doğrudan değiştirilemez. Lütfen /api/pilot/reconcile-payment, /api/pilot/reconcile-expense veya /api/pilot/accrue-dues uç noktalarını kullanın.',
+        });
+        return;
+      }
+
+      // Issue #39 Fix: Block direct client mutation of member debt balances via /api/pilot/sync
+      if (Array.isArray(incomingPatch.members) && isFinanceAdmin) {
+        for (const incMember of incomingPatch.members) {
+          if (!incMember || typeof incMember.id !== 'string') continue;
+          const existing = currentTenant.members.find(
+            (m) => m.id === incMember.id
+          );
+          if (existing) {
+            const duesChanged =
+              typeof incMember.duesBalance === 'number' &&
+              incMember.duesBalance !== existing.duesBalance;
+            const mealChanged =
+              typeof incMember.mealBalance === 'number' &&
+              incMember.mealBalance !== existing.mealBalance;
+            const foundChanged =
+              typeof incMember.foundationBalance === 'number' &&
+              incMember.foundationBalance !== existing.foundationBalance;
+            if (duesChanged || mealChanged || foundChanged) {
+              res.status(422).json({
+                error: 'DIRECT_LEDGER_MUTATION_FORBIDDEN',
+                message:
+                  'Muhasebe bütünlüğü koruması (#39): Üye cari borç bakiyeleri /api/pilot/sync üzerinden doğrudan değiştirilemez; yalnızca banka mutabakatı (/api/pilot/reconcile-payment) veya toplu tahakkuk (/api/pilot/accrue-dues) ile güncellenebilir.',
+              });
+              return;
+            }
+          }
+        }
+      }
 
       // Block regular 'uye' from toggling club-wide KVKK phone masking (#16)
       if (
@@ -1311,17 +1808,26 @@ export function createPilotExpressApp(customDbFile?: string) {
 
         const seenInPatchRefs = new Set<string>();
         for (const p of incomingPatch.paymentNotifications) {
-          if (!p || typeof p.amount !== 'number' || !Number.isFinite(p.amount) || p.amount <= 0) {
+          if (
+            !p ||
+            typeof p.amount !== 'number' ||
+            !Number.isFinite(p.amount) ||
+            p.amount <= 0
+          ) {
             res.status(422).json({
               error: 'INVALID_PAYMENT_AMOUNT',
-              message: 'Ödeme bildirimi tutarı 0’dan büyük geçerli bir sayı olmalıdır.',
+              message:
+                'Ödeme bildirimi tutarı 0’dan büyük geçerli bir sayı olmalıdır.',
             });
             return;
           }
 
           const existing = existingById.get(p.id);
           // Nobody can mark a payment 'Onaylandı' via /api/pilot/sync — must use /api/pilot/reconcile-payment!
-          if (p.status === 'Onaylandı' && (!existing || existing.status !== 'Onaylandı')) {
+          if (
+            p.status === 'Onaylandı' &&
+            (!existing || existing.status !== 'Onaylandı')
+          ) {
             res.status(422).json({
               error: 'UNRECONCILED_PAYMENT_APPROVAL_FORBIDDEN',
               message:
@@ -1349,13 +1855,15 @@ export function createPilotExpressApp(customDbFile?: string) {
             }
             seenInPatchRefs.add(normRef);
 
-            // If this is a new or still-pending notification, ensure normRef is not already used by another member or already reconciled in ledger/bankStatements
             const isAlreadyApprovedSameRecord =
               existing &&
               existing.status === 'Onaylandı' &&
               normalizeBankRef(existing.receiptRef) === normRef;
 
-            if (!isAlreadyApprovedSameRecord && reservedServerRefs.has(normRef)) {
+            if (
+              !isAlreadyApprovedSameRecord &&
+              reservedServerRefs.has(normRef)
+            ) {
               res.status(409).json({
                 error: 'DUPLICATE_RECEIPT_REF',
                 message: `Mükerrer dekont referansı engellendi (#39): "${normRef}" referans kodu başka bir ödeme veya mutabakat kaydında zaten kullanılmış.`,
@@ -1366,60 +1874,32 @@ export function createPilotExpressApp(customDbFile?: string) {
         }
       }
 
-      // Issue #39 Fix: Validate manual treasuryLedger additions by Sayman/Başkan
-      if (isFinanceAdmin && Array.isArray(incomingPatch.treasuryLedger)) {
-        const seenLedgerRefs = new Set<string>();
-        for (const item of incomingPatch.treasuryLedger) {
-          if (!item || typeof item.amount !== 'number' || !Number.isFinite(item.amount) || item.amount <= 0) {
-            res.status(422).json({
-              error: 'INVALID_LEDGER_AMOUNT',
-              message: 'Kasa defteri tutarı 0’dan büyük olmalıdır.',
-            });
-            return;
-          }
-          const ref = normalizeBankRef(item.referenceNo || '');
-          if (ref) {
-            if (seenLedgerRefs.has(ref)) {
-              res.status(409).json({
-                error: 'DUPLICATE_LEDGER_REFERENCE',
-                message: `Kasa defterinde mükerrer referans numarası (${ref}) kullanılamaz.`,
-              });
-              return;
-            }
-            seenLedgerRefs.add(ref);
-          }
-        }
-      }
-
-      const expectedRevision =
-        typeof req.body?.expectedRevision === 'number'
-          ? req.body.expectedRevision
-          : undefined;
-
       const casResult = store.updateTenant(
         authorizedClubId,
         (curr) => {
           // Issue #39 Fix: Existing projects' collectedAmount & supportersCount can ONLY increase via /api/pilot/reconcile-payment
           const sanitizedProjects = Array.isArray(incomingPatch.projects)
             ? isBoardAdmin
-              ? incomingPatch.projects.map((incProj: { id: string; volunteers?: string[] }) => {
-                  const existingProj = curr.projects.find((p) => p.id === incProj.id);
-                  if (!existingProj) {
-                    // Newly created project by board officer
+              ? incomingPatch.projects.map(
+                  (incProj: { id: string; volunteers?: string[] }) => {
+                    const existingProj = curr.projects.find(
+                      (p) => p.id === incProj.id
+                    );
+                    if (!existingProj) {
+                      return {
+                        ...incProj,
+                        collectedAmount: 0,
+                        supportersCount: 0,
+                      };
+                    }
                     return {
+                      ...existingProj,
                       ...incProj,
-                      collectedAmount: 0,
-                      supportersCount: 0,
+                      collectedAmount: existingProj.collectedAmount,
+                      supportersCount: existingProj.supportersCount,
                     };
                   }
-                  return {
-                    ...existingProj,
-                    ...incProj,
-                    // Preserve server-reconciled financial totals
-                    collectedAmount: existingProj.collectedAmount,
-                    supportersCount: existingProj.supportersCount,
-                  };
-                })
+                )
               : curr.projects.map((existingProj) => {
                   const match = incomingPatch.projects.find(
                     (p: { id: string }) => p.id === existingProj.id
@@ -1449,7 +1929,7 @@ export function createPilotExpressApp(customDbFile?: string) {
               })
             : curr.scholars;
 
-          // Issue #14 & #16 Fix: Safe member merge that NEVER overwrites server state with KVKK-redacted fields or zeroed balances!
+          // Issue #14, #16 & #39 Fix: Safe member merge that NEVER overwrites server state with KVKK-redacted fields or altered debt balances!
           const sanitizedMembers: RotaryMember[] = Array.isArray(
             incomingPatch.members
           )
@@ -1459,7 +1939,12 @@ export function createPilotExpressApp(customDbFile?: string) {
                     (m) => m.id === incMember.id
                   );
                   if (!existing) {
-                    return incMember;
+                    return {
+                      ...incMember,
+                      duesBalance: 0,
+                      mealBalance: 0,
+                      foundationBalance: 0,
+                    };
                   }
                   return {
                     ...existing,
@@ -1482,16 +1967,10 @@ export function createPilotExpressApp(customDbFile?: string) {
                     weddingAnniversary:
                       incMember.weddingAnniversary ??
                       existing.weddingAnniversary,
-                    // Only Sayman or Başkan can mutate member debt balances
-                    duesBalance: isFinanceAdmin
-                      ? incMember.duesBalance
-                      : existing.duesBalance,
-                    mealBalance: isFinanceAdmin
-                      ? incMember.mealBalance
-                      : existing.mealBalance,
-                    foundationBalance: isFinanceAdmin
-                      ? incMember.foundationBalance
-                      : existing.foundationBalance,
+                    // Member debt balances are strictly server-managed (#39)
+                    duesBalance: existing.duesBalance,
+                    mealBalance: existing.mealBalance,
+                    foundationBalance: existing.foundationBalance,
                   };
                 })
               : curr.members.map((existingMember) => {
@@ -1511,18 +1990,6 @@ export function createPilotExpressApp(customDbFile?: string) {
                     : existingMember;
                 })
             : curr.members;
-
-          // Preserve existing treasuryLedger entries and only allow finance admins to prepend new entries
-          const sanitizedTreasuryLedger =
-            isFinanceAdmin && Array.isArray(incomingPatch.treasuryLedger)
-              ? [
-                  ...incomingPatch.treasuryLedger.filter(
-                    (inc: { id: string }) =>
-                      !curr.treasuryLedger.some((ex) => ex.id === inc.id)
-                  ),
-                  ...curr.treasuryLedger,
-                ]
-              : curr.treasuryLedger;
 
           return {
             ...curr,
@@ -1564,15 +2031,6 @@ export function createPilotExpressApp(customDbFile?: string) {
               isBoardAdmin && typeof incomingPatch.kvkkMaskPhone === 'boolean'
                 ? incomingPatch.kvkkMaskPhone
                 : curr.kvkkMaskPhone,
-            treasuryLedger: sanitizedTreasuryLedger,
-            financialItems:
-              isFinanceAdmin && incomingPatch.financialItems
-                ? incomingPatch.financialItems
-                : curr.financialItems,
-            overdueMembers:
-              isFinanceAdmin && incomingPatch.overdueMembers
-                ? incomingPatch.overdueMembers
-                : curr.overdueMembers,
             paymentNotifications: Array.isArray(
               incomingPatch.paymentNotifications
             )
@@ -1608,8 +2066,9 @@ export function createPilotExpressApp(customDbFile?: string) {
       );
 
       if (!casResult.ok) {
-        res.status(409).json({
-          error: 'REVISION_CONFLICT',
+        const status = casResult.reason === 'REVISION_REQUIRED' ? 428 : 409;
+        res.status(status).json({
+          error: casResult.reason,
           message: `Veri sürümü çakışması (#14): İstemci revizyonu (${expectedRevision}) sunucu revizyonu (${casResult.currentRevision}) ile eşleşmiyor.`,
           currentRevision: casResult.currentRevision,
         });
@@ -1691,7 +2150,7 @@ export function createPilotExpressApp(customDbFile?: string) {
     }
   );
 
-  // 10. Protected Tenant-Scoped Database & Hash-Chained Audit Backup — Strictly Board Officers Only (#19, #20, #70)
+  // 10a. Protected Tenant-Scoped Database & Hash-Chained Audit Backup — Strictly Board Officers Only (#19, #20, #70)
   app.get(
     '/api/pilot/backup',
     requireServerRole(['baskan', 'sekreter', 'sayman']),
@@ -1724,7 +2183,7 @@ export function createPilotExpressApp(customDbFile?: string) {
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.setHeader(
           'Content-Disposition',
-          `attachment; filename="RotaClub_${authorizedClubId}_Backup_v5_2.json"`
+          `attachment; filename="RotaClub_${authorizedClubId}_Backup_v5_3.json"`
         );
         res.send(
           JSON.stringify(
@@ -1746,6 +2205,52 @@ export function createPilotExpressApp(customDbFile?: string) {
         res.status(500).json({
           error: 'BACKUP_ERROR',
           message: err instanceof Error ? err.message : 'Yedekleme hatası',
+        });
+      }
+    }
+  );
+
+  // 10b. Verified Tenant Backup Restore Endpoint — Strictly 'baskan' Only (#19, #70)
+  app.post(
+    '/api/pilot/restore',
+    requireServerRole(['baskan']),
+    (req: AuthenticatedRequest, res) => {
+      try {
+        const user = req.authUser!;
+        const { clubId, backup } = req.body || {};
+        const authorizedClubId = verifyTenantBoundary(
+          user,
+          typeof clubId === 'string' ? clubId : undefined,
+          store,
+          res
+        );
+        if (!authorizedClubId) return;
+
+        const restored = store.restoreTenantFromVerifiedBackup({
+          clubId: authorizedClubId,
+          backupPayload: backup,
+          actor: user,
+          timestamp: formatNowTR(),
+        });
+
+        if (!restored.ok) {
+          res.status(422).json({
+            error: restored.error,
+            message: restored.message,
+          });
+          return;
+        }
+
+        const ledger = store.getAuditLedger(authorizedClubId);
+        res.json({
+          ok: true,
+          revision: restored.state.revision,
+          state: redactStateForRole(restored.state, ledger, user),
+        });
+      } catch (err) {
+        res.status(500).json({
+          error: 'RESTORE_ERROR',
+          message: err instanceof Error ? err.message : 'Yedek geri yükleme hatası',
         });
       }
     }
@@ -1789,7 +2294,7 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(
-      `RotaClub Hardened Pilot Server v5.2 running on http://localhost:${PORT}`
+      `RotaClub Hardened Pilot Server v5.3 running on http://localhost:${PORT}`
     );
   });
 }

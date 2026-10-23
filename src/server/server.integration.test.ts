@@ -7,6 +7,25 @@ import path from 'path';
 import type { Server } from 'http';
 import { createPilotExpressApp } from '../../server';
 
+// Configure test environment credentials via environment variables (no hardcoded PINs in production source code)
+process.env.ROTACLUB_PIN_UYE = 'GalataUye#2026';
+process.env.ROTACLUB_PIN_SEKRETER = 'GalataSek#2026';
+process.env.ROTACLUB_PIN_SAYMAN = 'GalataSay#2026';
+process.env.ROTACLUB_PIN_BASKAN = 'GalataBsk#2026';
+process.env.ROTACLUB_PIN_KARAKOY_BASKAN = 'KarakoyBsk#2026';
+process.env.ROTACLUB_PIN_MACKA_BASKAN = 'MackaBsk#2026';
+process.env.ROTACLUB_PIN_DISTRICT_GOV = 'DistrictGov#2420';
+
+const TEST_PINS = {
+  uye: process.env.ROTACLUB_PIN_UYE,
+  sekreter: process.env.ROTACLUB_PIN_SEKRETER,
+  sayman: process.env.ROTACLUB_PIN_SAYMAN,
+  baskan: process.env.ROTACLUB_PIN_BASKAN,
+  karakoyBaskan: process.env.ROTACLUB_PIN_KARAKOY_BASKAN,
+  mackaBaskan: process.env.ROTACLUB_PIN_MACKA_BASKAN,
+  districtGov: process.env.ROTACLUB_PIN_DISTRICT_GOV,
+};
+
 async function withTestServer(
   fn: (baseUrl: string, tmpDbFile: string) => Promise<void>
 ) {
@@ -71,7 +90,11 @@ test('Issue #76 / #12 / #20: Unauthenticated GET /api/pilot/state, URL ?token= q
     assert.equal(backdoorRes.status, 404);
 
     // URL query token must be rejected (#20)
-    const baskanSession = await loginRole(baseUrl, 'TR-2420-74105', '242044');
+    const baskanSession = await loginRole(
+      baseUrl,
+      'TR-2420-74105',
+      TEST_PINS.baskan
+    );
     const queryTokenRes = await fetch(
       `${baseUrl}/api/pilot/backup?token=${encodeURIComponent(
         baskanSession.token
@@ -83,19 +106,28 @@ test('Issue #76 / #12 / #20: Unauthenticated GET /api/pilot/state, URL ?token= q
   });
 });
 
-test('Issue #76 / #22 / #23: Header spoofing x-rotaclub-role, PIN exposure, PIN rotation, and session logout revocation', async () => {
+test('Issue #76 / #22 / #23: Zero hardcoded PINs in source, weak PIN rejection, secure member account creation, header spoofing block, and session revocation', async () => {
   await withTestServer(async (baseUrl) => {
-    // 1. /api/auth/pilot-accounts must NOT expose plaintext PINs or demoPinHint (#22)
+    // 1. Source code audit: pilotEngine.ts must NOT contain hardcoded precomputedSalt or precomputedHash literals (#22)
+    const engineSource = fs.readFileSync(
+      path.resolve(process.cwd(), 'src/server/pilotEngine.ts'),
+      'utf8'
+    );
+    assert.equal(engineSource.includes('precomputedSalt'), false);
+    assert.equal(engineSource.includes('precomputedHash'), false);
+
+    // 2. /api/auth/pilot-accounts must NOT expose plaintext PINs, salts, or passwordHash (#22)
     const accountsRes = await fetch(`${baseUrl}/api/auth/pilot-accounts`);
     const accountsBody = await accountsRes.json();
     for (const acc of accountsBody.accounts) {
       assert.equal('demoPinHint' in acc, false);
       assert.equal('pinCode' in acc, false);
       assert.equal('passwordHash' in acc, false);
+      assert.equal('passwordSalt' in acc, false);
     }
 
-    // 2. Authenticate as regular 'uye' and attempt to spoof x-rotaclub-role: baskan
-    const uyeSession = await loginRole(baseUrl, 'TR-2420-88412', '242011');
+    // 3. Authenticate as regular 'uye' and attempt to spoof x-rotaclub-role: baskan
+    const uyeSession = await loginRole(baseUrl, 'TR-2420-88412', TEST_PINS.uye);
     assert.equal(uyeSession.user.role, 'uye');
 
     const spoofRes = await fetch(`${baseUrl}/api/pilot/state`, {
@@ -108,28 +140,111 @@ test('Issue #76 / #22 / #23: Header spoofing x-rotaclub-role, PIN exposure, PIN 
     const spoofBody = await spoofRes.json();
     assert.equal(spoofBody.error, 'ROLE_SPOOFING_DETECTED');
 
-    // 3. Rotate PIN and verify old PIN fails while new PIN succeeds
+    // 4. Weak/repeating PINs (e.g. '11111111' or '123456') are rejected on PIN change (#22)
+    const weakPinRes = await fetch(`${baseUrl}/api/auth/change-pin`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${uyeSession.token}`,
+      },
+      body: JSON.stringify({
+        currentPin: TEST_PINS.uye,
+        newPin: '11111111',
+      }),
+    });
+    assert.equal(weakPinRes.status, 400);
+    const weakPinBody = await weakPinRes.json();
+    assert.equal(weakPinBody.error, 'WEAK_PIN_REJECTED');
+
+    // 5. Strong credential rotation succeeds, old credential fails, new credential succeeds
     const changePinRes = await fetch(`${baseUrl}/api/auth/change-pin`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${uyeSession.token}`,
       },
-      body: JSON.stringify({ currentPin: '242011', newPin: '998877' }),
+      body: JSON.stringify({
+        currentPin: TEST_PINS.uye,
+        newPin: 'RifatStrong#2026!',
+      }),
     });
     assert.equal(changePinRes.status, 200);
 
     const oldPinLogin = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier: 'TR-2420-88412', pinCode: '242011' }),
+      body: JSON.stringify({
+        identifier: 'TR-2420-88412',
+        pinCode: TEST_PINS.uye,
+      }),
     });
     assert.equal(oldPinLogin.status, 401);
 
-    const newPinSession = await loginRole(baseUrl, 'TR-2420-88412', '998877');
+    const newPinSession = await loginRole(
+      baseUrl,
+      'TR-2420-88412',
+      'RifatStrong#2026!'
+    );
     assert.equal(newPinSession.ok, true);
 
-    // 4. Logout revokes session token immediately
+    // 6. Secure member account registration (/api/auth/register-member-account):
+    // Regular member cannot register new accounts (403), Başkan can register a new member with strong credential
+    const forbiddenRegRes = await fetch(
+      `${baseUrl}/api/auth/register-member-account`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${newPinSession.token}`,
+        },
+        body: JSON.stringify({
+          memberId: 'm-new-1',
+          rotaryId: 'TR-2420-95001',
+          fullName: 'Rtn. Canan Ersoy',
+          email: 'canan.ersoy@galatarotary.org',
+          role: 'uye',
+          clubId: 'club-galata',
+          initialPinOrPassword: 'CananStrong#2026',
+        }),
+      }
+    );
+    assert.equal(forbiddenRegRes.status, 403);
+
+    const baskanSession = await loginRole(
+      baseUrl,
+      'TR-2420-74105',
+      TEST_PINS.baskan
+    );
+    const createdAccRes = await fetch(
+      `${baseUrl}/api/auth/register-member-account`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${baskanSession.token}`,
+        },
+        body: JSON.stringify({
+          memberId: 'm-new-1',
+          rotaryId: 'TR-2420-95001',
+          fullName: 'Rtn. Canan Ersoy',
+          email: 'canan.ersoy@galatarotary.org',
+          role: 'uye',
+          clubId: 'club-galata',
+          initialPinOrPassword: 'CananStrong#2026',
+        }),
+      }
+    );
+    assert.equal(createdAccRes.status, 201);
+
+    const newMemberSession = await loginRole(
+      baseUrl,
+      'TR-2420-95001',
+      'CananStrong#2026',
+      'club-galata'
+    );
+    assert.equal(newMemberSession.user.role, 'uye');
+
+    // 7. Logout revokes session token immediately
     const logoutRes = await fetch(`${baseUrl}/api/auth/logout`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${newPinSession.token}` },
@@ -143,7 +258,7 @@ test('Issue #76 / #22 / #23: Header spoofing x-rotaclub-role, PIN exposure, PIN 
   });
 });
 
-test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, cryptographic assertion verification, rpIdHash, monotonic signCount, and replay/forgery rejection', async () => {
+test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, strict origin verification, rpIdHash, monotonic signCount, and replay/forgery rejection', async () => {
   await withTestServer(async (baseUrl) => {
     // 1. Unauthenticated WebAuthn registration attempt MUST be blocked with 401 (#12, #22)
     const unauthRegRes = await fetch(
@@ -157,7 +272,7 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, cr
     assert.equal(unauthRegRes.status, 401);
 
     // 2. Authenticate as Rifat Akın and register a real ECDSA P-256 passkey
-    const uyeSession = await loginRole(baseUrl, 'TR-2420-88412', '242011');
+    const uyeSession = await loginRole(baseUrl, 'TR-2420-88412', TEST_PINS.uye);
     const regOptRes = await fetch(
       `${baseUrl}/api/auth/webauthn-register-options`,
       {
@@ -179,10 +294,53 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, cr
     ).toString('base64url');
     const credentialId = crypto.randomBytes(16).toString('base64url');
 
-    const regClientDataJSON = Buffer.from(
+    // 2b. Attempting registration with a mismatched phishing origin is rejected with 401 WEBAUTHN_ORIGIN_MISMATCH (#22)
+    const badOriginClientData = Buffer.from(
       JSON.stringify({
         type: 'webauthn.create',
         challenge: regOpt.challenge,
+        origin: 'https://evil-phishing.example.com',
+      }),
+      'utf8'
+    ).toString('base64url');
+
+    const badOriginRegRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-verify`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+        body: JSON.stringify({
+          challengeId: regOpt.challengeId,
+          credentialId,
+          clientDataJSON: badOriginClientData,
+          publicKeySpkiB64,
+        }),
+      }
+    );
+    assert.equal(badOriginRegRes.status, 401);
+    const badOriginRegBody = await badOriginRegRes.json();
+    assert.equal(badOriginRegBody.error, 'WEBAUTHN_ORIGIN_MISMATCH');
+
+    // Request fresh registration options and register with the legitimate origin
+    const regOptRes2 = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-options`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+      }
+    );
+    const regOpt2 = await regOptRes2.json();
+
+    const regClientDataJSON = Buffer.from(
+      JSON.stringify({
+        type: 'webauthn.create',
+        challenge: regOpt2.challenge,
         origin: baseUrl,
       }),
       'utf8'
@@ -197,7 +355,7 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, cr
           Authorization: `Bearer ${uyeSession.token}`,
         },
         body: JSON.stringify({
-          challengeId: regOpt.challengeId,
+          challengeId: regOpt2.challengeId,
           credentialId,
           clientDataJSON: regClientDataJSON,
           publicKeySpkiB64,
@@ -363,9 +521,17 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, cr
 
 test('Issue #76 / #14 / #16 / #20: KVKK redaction for uye and prevention of redacted state clobbering when sekreter syncs members', async () => {
   await withTestServer(async (baseUrl) => {
-    const uyeSession = await loginRole(baseUrl, 'TR-2420-88412', '242011');
-    const sekreterSession = await loginRole(baseUrl, 'TR-2420-81024', '242022');
-    const saymanSession = await loginRole(baseUrl, 'TR-2420-79310', '242033');
+    const uyeSession = await loginRole(baseUrl, 'TR-2420-88412', TEST_PINS.uye);
+    const sekreterSession = await loginRole(
+      baseUrl,
+      'TR-2420-81024',
+      TEST_PINS.sekreter
+    );
+    const saymanSession = await loginRole(
+      baseUrl,
+      'TR-2420-79310',
+      TEST_PINS.sayman
+    );
 
     // Regular member blocked from /api/pilot/backup
     const backupRes = await fetch(`${baseUrl}/api/pilot/backup`, {
@@ -419,20 +585,47 @@ test('Issue #76 / #14 / #16 / #20: KVKK redaction for uye and prevention of reda
       (m: { fullName: string }) => m.fullName.includes('Kerem Soylu')
     );
     assert.ok(kerem);
-    assert.ok(kerem.duesBalance > 0, 'Sekreter sync must not zero out member debt balances!');
+    assert.ok(
+      kerem.duesBalance > 0,
+      'Sekreter sync must not zero out member debt balances!'
+    );
   });
 });
 
-test('Issue #76 / #14 / #18: Mandatory server-side audit logging on sync, atomic CAS expectedRevision check, and reset preservation', async () => {
-  await withTestServer(async (baseUrl) => {
-    const sekreterSession = await loginRole(baseUrl, 'TR-2420-81024', '242022');
-    const baskanSession = await loginRole(baseUrl, 'TR-2420-74105', '242044');
+test('Issue #76 / #14 / #18 / #19: Mandatory expectedRevision (428 if missing, 409 if stale), lossless schema migration with .bak backup, and verified backup restore', async () => {
+  await withTestServer(async (baseUrl, tmpDbFile) => {
+    const sekreterSession = await loginRole(
+      baseUrl,
+      'TR-2420-81024',
+      TEST_PINS.sekreter
+    );
+    const baskanSession = await loginRole(
+      baseUrl,
+      'TR-2420-74105',
+      TEST_PINS.baskan
+    );
 
     const forbiddenReset = await fetch(`${baseUrl}/api/pilot/reset`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${sekreterSession.token}` },
     });
     assert.equal(forbiddenReset.status, 403);
+
+    // 1. Omitting expectedRevision on POST /api/pilot/sync is rejected with 428 REVISION_REQUIRED (#14)
+    const missingRevRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${baskanSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        state: { rsvpStatus: 'excused' },
+      }),
+    });
+    assert.equal(missingRevRes.status, 428);
+    const missingRevBody = await missingRevRes.json();
+    assert.equal(missingRevBody.error, 'REVISION_REQUIRED');
 
     const beforeVerifyRes = await fetch(`${baseUrl}/api/pilot/audit-verify`, {
       headers: { Authorization: `Bearer ${baskanSession.token}` },
@@ -441,7 +634,7 @@ test('Issue #76 / #14 / #18: Mandatory server-side audit logging on sync, atomic
     assert.equal(beforeVerify.valid, true);
     const countBefore = beforeVerify.totalEntries;
 
-    // Sync WITHOUT client auditEvent still creates a mandatory server-generated audit entry (#18)
+    // 2. Sync WITH valid expectedRevision succeeds and increments revision (#14, #18)
     const syncRes = await fetch(`${baseUrl}/api/pilot/sync`, {
       method: 'POST',
       headers: {
@@ -456,9 +649,10 @@ test('Issue #76 / #14 / #18: Mandatory server-side audit logging on sync, atomic
     });
     assert.equal(syncRes.status, 200);
     const syncBody = await syncRes.json();
+    assert.equal(syncBody.revision, 2);
     assert.equal(syncBody.auditVerification.totalEntries, countBefore + 1);
 
-    // Stale expectedRevision is rejected with 409 REVISION_CONFLICT (#14)
+    // 3. Stale expectedRevision is rejected with 409 REVISION_CONFLICT (#14)
     const staleSyncRes = await fetch(`${baseUrl}/api/pilot/sync`, {
       method: 'POST',
       headers: {
@@ -475,32 +669,181 @@ test('Issue #76 / #14 / #18: Mandatory server-side audit logging on sync, atomic
     const staleBody = await staleSyncRes.json();
     assert.equal(staleBody.error, 'REVISION_CONFLICT');
 
-    // Başkan can reset operational data, and audit log grows instead of being wiped
-    const allowedReset = await fetch(`${baseUrl}/api/pilot/reset`, {
+    // 4. Export backup, tamper with checksum -> restore fails (422 BACKUP_CHECKSUM_MISMATCH); valid restore succeeds (#19)
+    const backupRes = await fetch(`${baseUrl}/api/pilot/backup`, {
+      headers: { Authorization: `Bearer ${baskanSession.token}` },
+    });
+    assert.equal(backupRes.status, 200);
+    const backupJson = await backupRes.json();
+    assert.ok(backupJson.backupChecksum);
+
+    const tamperedRestoreRes = await fetch(`${baseUrl}/api/pilot/restore`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${baskanSession.token}`,
       },
-      body: JSON.stringify({ clubId: 'club-galata' }),
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        backup: {
+          ...backupJson,
+          backupChecksum: '0000000000000000000000000000000000000000000000000000000000000000',
+        },
+      }),
     });
-    assert.equal(allowedReset.status, 200);
+    assert.equal(tamperedRestoreRes.status, 422);
+    const tamperedBody = await tamperedRestoreRes.json();
+    assert.equal(tamperedBody.error, 'BACKUP_CHECKSUM_MISMATCH');
 
-    const afterVerifyRes = await fetch(`${baseUrl}/api/pilot/audit-verify`, {
-      headers: { Authorization: `Bearer ${baskanSession.token}` },
+    const validRestoreRes = await fetch(`${baseUrl}/api/pilot/restore`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${baskanSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        backup: backupJson,
+      }),
     });
-    const afterVerify = await afterVerifyRes.json();
-    assert.equal(afterVerify.valid, true);
-    assert.equal(afterVerify.totalEntries, countBefore + 2);
+    assert.equal(validRestoreRes.status, 200);
+
+    // 5. Lossless Schema Migration test (#19): simulate an older schemaVersion ('5.1.0-hardened') on disk with custom data
+    const rawDisk = JSON.parse(fs.readFileSync(tmpDbFile, 'utf8'));
+    rawDisk.schemaVersion = '5.1.0-hardened';
+    rawDisk.tenants['club-galata'].guestNameInput = 'Lossless Migration Preserved Guest';
+    fs.writeFileSync(tmpDbFile, JSON.stringify(rawDisk, null, 2), 'utf8');
+
+    const { store: migratedStore } = createPilotExpressApp(tmpDbFile);
+    const migratedTenant = migratedStore.getTenantState('club-galata');
+    assert.equal(
+      migratedTenant.guestNameInput,
+      'Lossless Migration Preserved Guest'
+    );
+    const bakPath = `${tmpDbFile}.pre-migration-5.1.0-hardened.bak`;
+    assert.equal(fs.existsSync(bakPath), true);
   });
 });
 
-test('Issue #76 / #39 / #6: Accounting integrity blocks reused bankRef (409), cross-member receiptRef theft (409), sender mismatch (422), and unreconciled approval via sync (422)', async () => {
+test('Issue #76 / #39 / #6: Server-managed accounting ledger blocks direct sync mutations to treasuryLedger/balances (422), blocks reused bankRef (409), and validates expenses & accruals', async () => {
   await withTestServer(async (baseUrl) => {
-    const uyeSession = await loginRole(baseUrl, 'TR-2420-88412', '242011');
-    const saymanSession = await loginRole(baseUrl, 'TR-2420-79310', '242033');
+    const uyeSession = await loginRole(baseUrl, 'TR-2420-88412', TEST_PINS.uye);
+    const saymanSession = await loginRole(
+      baseUrl,
+      'TR-2420-79310',
+      TEST_PINS.sayman
+    );
 
-    // 1. Sayman cannot mark a pending payment 'Onaylandı' via /api/pilot/sync bypassing bank reconciliation (#39)
+    const initStateRes = await fetch(`${baseUrl}/api/pilot/state`, {
+      headers: { Authorization: `Bearer ${saymanSession.token}` },
+    });
+    const initState = await initStateRes.json();
+
+    // 1. Even Sayman CANNOT directly mutate treasuryLedger via /api/pilot/sync (#39)
+    const directLedgerSyncRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${saymanSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: initState.revision,
+        state: {
+          treasuryLedger: [
+            {
+              id: 'tr-fake-999',
+              date: '23 Ekim 2026',
+              type: 'Gelir',
+              category: 'Aidat & Kuver Tahsilatı',
+              title: 'Mutabakatsız Sahte Gelir',
+              counterparty: 'Test',
+              amount: 50000,
+              referenceNo: 'FAKE-REF-999',
+            },
+          ],
+        },
+      }),
+    });
+    assert.equal(directLedgerSyncRes.status, 422);
+    const directLedgerBody = await directLedgerSyncRes.json();
+    assert.equal(directLedgerBody.error, 'DIRECT_LEDGER_MUTATION_FORBIDDEN');
+
+    // 2. Sayman CANNOT record 'Gelir' (income) via /api/pilot/reconcile-expense — income requires bank reconciliation (#39)
+    const fakeIncomeExpenseRes = await fetch(
+      `${baseUrl}/api/pilot/reconcile-expense`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${saymanSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          type: 'Gelir',
+          category: 'Aidat & Kuver Tahsilatı',
+          title: 'Sahte Gelir Denemesi',
+          counterparty: 'Bilinmeyen',
+          amount: 10000,
+          referenceNo: 'EXP-2026-001',
+        }),
+      }
+    );
+    assert.equal(fakeIncomeExpenseRes.status, 422);
+    const fakeIncomeBody = await fakeIncomeExpenseRes.json();
+    assert.equal(fakeIncomeBody.error, 'INCOME_REQUIRES_BANK_RECONCILIATION');
+
+    // 3. Sayman CAN record a valid club expense via /api/pilot/reconcile-expense, and duplicate referenceNo is blocked with 409 (#39)
+    const validExpenseRes = await fetch(
+      `${baseUrl}/api/pilot/reconcile-expense`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${saymanSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          type: 'Gider',
+          category: 'Otel & Banket Gideri',
+          title: 'Pera Palace Ses Sistemi Faturası',
+          counterparty: 'Pera Palace Hotel',
+          amount: 8500,
+          referenceNo: 'PERA-INV-2026-771',
+        }),
+      }
+    );
+    assert.equal(validExpenseRes.status, 200);
+
+    const dupExpenseRes = await fetch(
+      `${baseUrl}/api/pilot/reconcile-expense`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${saymanSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          type: 'Gider',
+          category: 'Otel & Banket Gideri',
+          title: 'Mükerrer Fatura Kaydı',
+          counterparty: 'Pera Palace Hotel',
+          amount: 8500,
+          referenceNo: '#pera-inv-2026-771',
+        }),
+      }
+    );
+    assert.equal(dupExpenseRes.status, 409);
+    const dupExpenseBody = await dupExpenseRes.json();
+    assert.equal(dupExpenseBody.error, 'DUPLICATE_LEDGER_REFERENCE');
+
+    // 4. Sayman cannot mark a pending payment 'Onaylandı' via /api/pilot/sync bypassing bank reconciliation (#39)
+    const currentStateRes = await fetch(`${baseUrl}/api/pilot/state`, {
+      headers: { Authorization: `Bearer ${saymanSession.token}` },
+    });
+    const currentState = await currentStateRes.json();
+
     const bypassApprovalRes = await fetch(`${baseUrl}/api/pilot/sync`, {
       method: 'POST',
       headers: {
@@ -509,6 +852,7 @@ test('Issue #76 / #39 / #6: Accounting integrity blocks reused bankRef (409), cr
       },
       body: JSON.stringify({
         clubId: 'club-galata',
+        expectedRevision: currentState.revision,
         state: {
           paymentNotifications: [
             {
@@ -530,7 +874,7 @@ test('Issue #76 / #39 / #6: Accounting integrity blocks reused bankRef (409), cr
     const bypassBody = await bypassApprovalRes.json();
     assert.equal(bypassBody.error, 'UNRECONCILED_PAYMENT_APPROVAL_FORBIDDEN');
 
-    // 2. Regular member ('m-rifat') cannot submit a payment claiming another member's receiptRef ('GAR-2026-88341' belonging to Kerem Soylu) (#39)
+    // 5. Regular member ('m-rifat') cannot submit a payment claiming another member's receiptRef ('GAR-2026-88341' belonging to Kerem Soylu) (#39)
     const crossMemberRefTheftRes = await fetch(`${baseUrl}/api/pilot/sync`, {
       method: 'POST',
       headers: {
@@ -539,6 +883,7 @@ test('Issue #76 / #39 / #6: Accounting integrity blocks reused bankRef (409), cr
       },
       body: JSON.stringify({
         clubId: 'club-galata',
+        expectedRevision: currentState.revision,
         state: {
           paymentNotifications: [
             {
@@ -560,7 +905,7 @@ test('Issue #76 / #39 / #6: Accounting integrity blocks reused bankRef (409), cr
     const theftBody = await crossMemberRefTheftRes.json();
     assert.equal(theftBody.error, 'DUPLICATE_RECEIPT_REF');
 
-    // 3. Reconciling Kerem Soylu's valid payment (pay-901, GAR-2026-88341, 9000 TL) succeeds
+    // 6. Reconciling Kerem Soylu's valid payment (pay-901, GAR-2026-88341, 9000 TL) succeeds
     const validRefRes = await fetch(`${baseUrl}/api/pilot/reconcile-payment`, {
       method: 'POST',
       headers: {
@@ -575,7 +920,7 @@ test('Issue #76 / #39 / #6: Accounting integrity blocks reused bankRef (409), cr
     });
     assert.equal(validRefRes.status, 200);
 
-    // 4. Member submits a valid project contribution (GAR-2026-99501 for 5000 TL)
+    // 7. Member submits a valid project contribution (GAR-2026-99501 for 5000 TL)
     const stateBeforeRes = await fetch(`${baseUrl}/api/pilot/state`, {
       headers: { Authorization: `Bearer ${saymanSession.token}` },
     });
@@ -591,6 +936,7 @@ test('Issue #76 / #39 / #6: Accounting integrity blocks reused bankRef (409), cr
       },
       body: JSON.stringify({
         clubId: 'club-galata',
+        expectedRevision: stateBefore.revision,
         state: {
           paymentNotifications: [
             {
@@ -611,7 +957,7 @@ test('Issue #76 / #39 / #6: Accounting integrity blocks reused bankRef (409), cr
     });
     assert.equal(projectPaymentSync.status, 200);
 
-    // 5. Reconcile pay-proj-5000 with GAR-2026-99501 -> collectedAmount increases by 5000
+    // 8. Reconcile pay-proj-5000 with GAR-2026-99501 -> collectedAmount increases by 5000
     const reconcileProjRes = await fetch(
       `${baseUrl}/api/pilot/reconcile-payment`,
       {
@@ -634,7 +980,7 @@ test('Issue #76 / #39 / #6: Accounting integrity blocks reused bankRef (409), cr
       initialCollected + 5000
     );
 
-    // 6. Attempting to reuse the already-reconciled GAR-2026-99501 on another 5000 TL payment is blocked with 409 BANK_REF_ALREADY_USED (#39)
+    // 9. Attempting to reuse the already-reconciled GAR-2026-99501 on another 5000 TL payment is blocked with 409 BANK_REF_ALREADY_USED (#39)
     await fetch(`${baseUrl}/api/pilot/sync`, {
       method: 'POST',
       headers: {
@@ -643,6 +989,7 @@ test('Issue #76 / #39 / #6: Accounting integrity blocks reused bankRef (409), cr
       },
       body: JSON.stringify({
         clubId: 'club-galata',
+        expectedRevision: reconcileProjBody.state.revision,
         state: {
           paymentNotifications: [
             {
@@ -682,59 +1029,30 @@ test('Issue #76 / #39 / #6: Accounting integrity blocks reused bankRef (409), cr
   });
 });
 
-test('Issue #76 / #70 / #19: P0 Multi-club isolation enforces per-club membership on login & switch-club, blocks cross-tenant IDOR, and rejects unknown clubs', async () => {
+test('Issue #76 / #70: Authentic per-club role bindings — Galata President (m-emre) cannot access Karaköy; Karaköy has its own President; District Governor is visiting uye in individual clubs', async () => {
   await withTestServer(async (baseUrl) => {
-    // 1. Galata-only member (m-rifat) CANNOT log directly into club-karakoy (#70)
-    const unauthorizedClubLogin = await fetch(`${baseUrl}/api/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        identifier: 'TR-2420-88412',
-        pinCode: '242011',
-        clubId: 'club-karakoy',
-      }),
-    });
-    assert.equal(unauthorizedClubLogin.status, 403);
-    const unauthLoginBody = await unauthorizedClubLogin.json();
-    assert.equal(unauthLoginBody.error, 'CLUB_MEMBERSHIP_FORBIDDEN');
-
-    // 2. Galata-only member (m-rifat) CANNOT switch to club-karakoy via /api/auth/switch-club (#70)
-    const uyeGalata = await loginRole(
-      baseUrl,
-      'TR-2420-88412',
-      '242011',
-      'club-galata'
-    );
-    const forbiddenSwitchRes = await fetch(`${baseUrl}/api/auth/switch-club`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${uyeGalata.token}`,
-      },
-      body: JSON.stringify({ targetClubId: 'club-karakoy' }),
-    });
-    assert.equal(forbiddenSwitchRes.status, 403);
-    const forbiddenSwitchBody = await forbiddenSwitchRes.json();
-    assert.equal(forbiddenSwitchBody.error, 'CLUB_MEMBERSHIP_FORBIDDEN');
-
-    // 3. Unknown club ID is rejected with 404 UNKNOWN_CLUB_TENANT (#70)
+    // 1. Galata President (m-emre) is baskan ONLY in club-galata and CANNOT log into or switch to club-karakoy (#70)
     const baskanGalata = await loginRole(
       baseUrl,
       'TR-2420-74105',
-      '242044',
+      TEST_PINS.baskan,
       'club-galata'
     );
-    const unknownClubSwitch = await fetch(`${baseUrl}/api/auth/switch-club`, {
+    assert.equal(baskanGalata.user.role, 'baskan');
+
+    const emreSwitchKarakoy = await fetch(`${baseUrl}/api/auth/switch-club`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${baskanGalata.token}`,
       },
-      body: JSON.stringify({ targetClubId: 'club-nonexistent-999' }),
+      body: JSON.stringify({ targetClubId: 'club-karakoy' }),
     });
-    assert.equal(unknownClubSwitch.status, 404);
+    assert.equal(emreSwitchKarakoy.status, 403);
+    const emreSwitchBody = await emreSwitchKarakoy.json();
+    assert.equal(emreSwitchBody.error, 'CLUB_MEMBERSHIP_FORBIDDEN');
 
-    // 4. Cross-tenant GET /api/pilot/state?clubId=club-karakoy with a club-galata token MUST fail with 403 CROSS_TENANT_FORBIDDEN (#70)
+    // 2. Cross-tenant GET /api/pilot/state?clubId=club-karakoy with a club-galata token fails with 403 CROSS_TENANT_FORBIDDEN (#70)
     const crossReadRes = await fetch(
       `${baseUrl}/api/pilot/state?clubId=club-karakoy`,
       { headers: { Authorization: `Bearer ${baskanGalata.token}` } }
@@ -743,37 +1061,57 @@ test('Issue #76 / #70 / #19: P0 Multi-club isolation enforces per-club membershi
     const crossReadBody = await crossReadRes.json();
     assert.equal(crossReadBody.error, 'CROSS_TENANT_FORBIDDEN');
 
-    // 5. District-authorized officer (m-emre) switches to club-karakoy via POST /api/auth/switch-club (#70)
-    const switchRes = await fetch(`${baseUrl}/api/auth/switch-club`, {
+    // 3. Karaköy Rotary Club's own President (TR-2420-KRK-01) logs into club-karakoy as baskan, but CANNOT switch to club-galata (#70)
+    const baskanKarakoy = await loginRole(
+      baseUrl,
+      'TR-2420-KRK-01',
+      TEST_PINS.karakoyBaskan,
+      'club-karakoy'
+    );
+    assert.equal(baskanKarakoy.user.clubId, 'club-karakoy');
+    assert.equal(baskanKarakoy.user.role, 'baskan');
+
+    const karakoyToGalataRes = await fetch(`${baseUrl}/api/auth/switch-club`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${baskanGalata.token}`,
+        Authorization: `Bearer ${baskanKarakoy.token}`,
+      },
+      body: JSON.stringify({ targetClubId: 'club-galata' }),
+    });
+    assert.equal(karakoyToGalataRes.status, 403);
+
+    // 4. District 2420 Governor (TR-2420-GOV-01) is baskan in club-district2420, and switches to club-karakoy as visiting 'uye' (NOT baskan!)
+    const districtGov = await loginRole(
+      baseUrl,
+      'TR-2420-GOV-01',
+      TEST_PINS.districtGov,
+      'club-district2420'
+    );
+    assert.equal(districtGov.user.role, 'baskan');
+
+    const govSwitchKarakoy = await fetch(`${baseUrl}/api/auth/switch-club`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${districtGov.token}`,
       },
       body: JSON.stringify({ targetClubId: 'club-karakoy' }),
     });
-    assert.equal(switchRes.status, 200);
-    const switchData = await switchRes.json();
-    assert.equal(switchData.user.clubId, 'club-karakoy');
+    assert.equal(govSwitchKarakoy.status, 200);
+    const govKarakoyData = await govSwitchKarakoy.json();
+    assert.equal(govKarakoyData.user.clubId, 'club-karakoy');
+    assert.equal(govKarakoyData.user.role, 'uye');
 
-    // Old club-galata token is revoked upon club switch
-    const oldTokenCheck = await fetch(`${baseUrl}/api/pilot/state`, {
-      headers: { Authorization: `Bearer ${baskanGalata.token}` },
+    // Because District Governor is only a visiting 'uye' in club-karakoy, they CANNOT reset Karaköy's operational data (403 RBAC_FORBIDDEN)
+    const govResetKarakoy = await fetch(`${baseUrl}/api/pilot/reset`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${govKarakoyData.token}`,
+      },
+      body: JSON.stringify({ clubId: 'club-karakoy' }),
     });
-    assert.equal(oldTokenCheck.status, 401);
-
-    // Karaköy state has isolated members, 0 Galata payment notifications, and its own audit ledger
-    const karakoyRes = await fetch(
-      `${baseUrl}/api/pilot/state?clubId=club-karakoy`,
-      { headers: { Authorization: `Bearer ${switchData.token}` } }
-    );
-    assert.equal(karakoyRes.status, 200);
-    const karakoyState = await karakoyRes.json();
-    assert.equal(karakoyState.clubName, 'Karaköy Rotary Kulübü');
-    assert.equal(karakoyState.paymentNotifications.length, 0);
-    assert.equal(
-      karakoyState.members.some((m: { id: string }) => m.id === 'm-rifat'),
-      false
-    );
+    assert.equal(govResetKarakoy.status, 403);
   });
 });

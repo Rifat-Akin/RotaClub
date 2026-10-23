@@ -22,11 +22,12 @@ interface SplashLockScreenModalProps {
 
 interface BrowserPasskeyEntry {
   credentialId: string;
-  keyPair: CryptoKeyPair;
+  mode: 'hardware-webauthn' | 'webcrypto-p256';
+  keyPair?: CryptoKeyPair;
   signCount: number;
 }
 
-// In-memory WebCrypto ECDSA P-256 passkey store for registered device credentials
+// Registered passkeys for the current browser session
 const registeredBrowserPasskeys = new Map<string, BrowserPasskeyEntry>();
 
 const PILOT_ACCOUNT_PROFILES: {
@@ -74,25 +75,32 @@ function bytesToBase64Url(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
+function base64UrlToBytes(b64url: string): ArrayBuffer {
+  const padded = b64url.replace(/-/g, '+').replace(/_/g, '/');
+  const padLen = (4 - (padded.length % 4)) % 4;
+  const binStr = atob(padded + '='.repeat(padLen));
+  const out = new Uint8Array(binStr.length);
+  for (let i = 0; i < binStr.length; i++) {
+    out[i] = binStr.charCodeAt(i);
+  }
+  return out.buffer;
+}
+
 function stringToBase64Url(str: string): string {
   const bytes = new TextEncoder().encode(str);
   return bytesToBase64Url(bytes);
 }
 
 /**
- * Registers a real WebCrypto ECDSA P-256 passkey on the server for an authenticated session (#12, #22)
+ * Registers a passkey on the server for an authenticated session (#12, #22).
+ * Attempts standard W3C hardware WebAuthn (`navigator.credentials.create`) first,
+ * and falls back to WebCrypto ECDSA P-256 when hardware authenticators are unavailable in iframe/headless environments.
  */
-async function registerBrowserEcdsaPasskey(
+async function registerPasskeyWithServer(
   rotaryId: string,
   bearerToken: string
 ): Promise<BrowserPasskeyEntry | null> {
-  if (
-    typeof window === 'undefined' ||
-    !window.crypto ||
-    !window.crypto.subtle
-  ) {
-    return null;
-  }
+  if (typeof window === 'undefined') return null;
 
   const optionsRes = await fetch('/api/auth/webauthn-register-options', {
     method: 'POST',
@@ -103,6 +111,82 @@ async function registerBrowserEcdsaPasskey(
   });
   if (!optionsRes.ok) return null;
   const optionsData = await optionsRes.json();
+
+  // 1. Try W3C navigator.credentials.create (Platform/Hardware Authenticator)
+  if (
+    typeof window.PublicKeyCredential !== 'undefined' &&
+    navigator.credentials &&
+    typeof navigator.credentials.create === 'function'
+  ) {
+    try {
+      const createdCred = (await navigator.credentials.create({
+        publicKey: {
+          challenge: base64UrlToBytes(optionsData.challenge),
+          rp: optionsData.rp,
+          user: {
+            id: base64UrlToBytes(optionsData.user.id),
+            name: optionsData.user.name,
+            displayName: optionsData.user.displayName,
+          },
+          pubKeyCredParams: optionsData.pubKeyCredParams,
+          authenticatorSelection: {
+            userVerification: 'required',
+          },
+          timeout: optionsData.timeout || 30000,
+          attestation: 'none',
+        },
+      })) as PublicKeyCredential | null;
+
+      if (createdCred && createdCred.response) {
+        const attestationRes =
+          createdCred.response as AuthenticatorAttestationResponse & {
+            getPublicKey?: () => ArrayBuffer | null;
+          };
+        const spkiBuf =
+          typeof attestationRes.getPublicKey === 'function'
+            ? attestationRes.getPublicKey()
+            : null;
+
+        if (spkiBuf) {
+          const credentialId = bytesToBase64Url(
+            new Uint8Array(createdCred.rawId)
+          );
+          const clientDataJSON = bytesToBase64Url(
+            new Uint8Array(attestationRes.clientDataJSON)
+          );
+          const publicKeySpkiB64 = bytesToBase64Url(new Uint8Array(spkiBuf));
+
+          const verifyRes = await fetch('/api/auth/webauthn-register-verify', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${bearerToken}`,
+            },
+            body: JSON.stringify({
+              challengeId: optionsData.challengeId,
+              credentialId,
+              clientDataJSON,
+              publicKeySpkiB64,
+            }),
+          });
+          if (verifyRes.ok) {
+            const entry: BrowserPasskeyEntry = {
+              credentialId,
+              mode: 'hardware-webauthn',
+              signCount: 0,
+            };
+            registeredBrowserPasskeys.set(rotaryId, entry);
+            return entry;
+          }
+        }
+      }
+    } catch {
+      // If hardware authenticator is blocked by iframe policy or user environment, continue to WebCrypto P-256 fallback
+    }
+  }
+
+  // 2. WebCrypto ECDSA P-256 Cryptographic Fallback
+  if (!window.crypto || !window.crypto.subtle) return null;
 
   const keyPair = await window.crypto.subtle.generateKey(
     { name: 'ECDSA', namedCurve: 'P-256' },
@@ -145,6 +229,7 @@ async function registerBrowserEcdsaPasskey(
 
   const entry: BrowserPasskeyEntry = {
     credentialId,
+    mode: 'webcrypto-p256',
     keyPair,
     signCount: 0,
   };
@@ -196,8 +281,8 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
 
   /**
    * Real Server Authentication via POST /api/auth/login (#22, #23)
-   * Validates Scrypt PIN hash on the server and automatically enrolls a genuine
-   * WebCrypto ECDSA P-256 Passkey for subsequent hardware/biometric assertions.
+   * Validates Scrypt PIN hash on the server and automatically enrolls a
+   * W3C WebAuthn / ECDSA P-256 Passkey for subsequent assertions.
    */
   const handleServerAuthenticate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -231,9 +316,8 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
         return;
       }
 
-      // Enroll a genuine WebCrypto ECDSA P-256 Passkey for this authenticated user if not yet registered
       if (!registeredBrowserPasskeys.has(data.user.rotaryId)) {
-        await registerBrowserEcdsaPasskey(data.user.rotaryId, data.token).catch(
+        await registerPasskeyWithServer(data.user.rotaryId, data.token).catch(
           () => null
         );
       }
@@ -249,19 +333,13 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
   };
 
   /**
-   * Full End-to-End Cryptographic WebAuthn Passkey Challenge & ECDSA P-256 Assertion (#12, #22)
+   * Full End-to-End W3C WebAuthn / ECDSA P-256 Passkey Assertion (#12, #22)
    */
   const handleWebAuthnVerify = async () => {
     if (!kvkkAccepted || authenticating) return;
     setErrorMessage(null);
 
     const passkeyEntry = registeredBrowserPasskeys.get(identifierInput.trim());
-    if (!passkeyEntry) {
-      setErrorMessage(
-        'Bu tarayıcı oturumunda kayıtlı ECDSA P-256 Passkey bulunamadı. Lütfen önce Kurumsal PIN ile giriş yaparak cihaz açık anahtarını (SPKI) kaydedin.'
-      );
-      return;
-    }
 
     setAuthenticating(true);
     setWebAuthnStatus(
@@ -286,55 +364,110 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
         return;
       }
 
-      const clientDataObj = {
-        type: 'webauthn.get',
-        challenge: challengeData.challenge,
-        origin: window.location.origin,
-        crossOrigin: false,
-      };
-      const clientDataBytes = new TextEncoder().encode(
-        JSON.stringify(clientDataObj)
-      );
-      const clientDataJSON = bytesToBase64Url(clientDataBytes);
+      let credentialId = passkeyEntry?.credentialId || '';
+      let clientDataJSON = '';
+      let authenticatorData = '';
+      let signature = '';
+      let nextSignCount = (passkeyEntry?.signCount || 0) + 1;
 
-      // Construct genuine 37-byte authenticatorData:
-      // [0..31]: SHA-256(rpId)
-      // [32]: flags (0x05 = User Present + User Verified)
-      // [33..36]: monotonic big-endian signCount
-      const rpIdBytes = new TextEncoder().encode(
-        challengeData.rpId || window.location.hostname || 'localhost'
-      );
-      const rpIdHashBuffer = await window.crypto.subtle.digest(
-        'SHA-256',
-        rpIdBytes
-      );
-      const authDataBytes = new Uint8Array(37);
-      authDataBytes.set(new Uint8Array(rpIdHashBuffer), 0);
-      authDataBytes[32] = 0x05; // UP (0x01) | UV (0x04)
+      // 1. If hardware W3C WebAuthn credential is available, call navigator.credentials.get
+      if (
+        (!passkeyEntry || passkeyEntry.mode === 'hardware-webauthn') &&
+        typeof window.PublicKeyCredential !== 'undefined' &&
+        navigator.credentials &&
+        typeof navigator.credentials.get === 'function' &&
+        Array.isArray(challengeData.allowCredentials) &&
+        challengeData.allowCredentials.length > 0
+      ) {
+        try {
+          const assertion = (await navigator.credentials.get({
+            publicKey: {
+              challenge: base64UrlToBytes(challengeData.challenge),
+              rpId: challengeData.rpId,
+              allowCredentials: challengeData.allowCredentials.map(
+                (c: { id: string; type: PublicKeyCredentialType }) => ({
+                  type: c.type,
+                  id: base64UrlToBytes(c.id),
+                })
+              ),
+              userVerification: 'required',
+              timeout: 30000,
+            },
+          })) as PublicKeyCredential | null;
 
-      const nextSignCount = passkeyEntry.signCount + 1;
-      const view = new DataView(authDataBytes.buffer);
-      view.setUint32(33, nextSignCount, false);
-      const authenticatorData = bytesToBase64Url(authDataBytes);
+          if (assertion && assertion.response) {
+            const assertionRes =
+              assertion.response as AuthenticatorAssertionResponse;
+            credentialId = bytesToBase64Url(new Uint8Array(assertion.rawId));
+            clientDataJSON = bytesToBase64Url(
+              new Uint8Array(assertionRes.clientDataJSON)
+            );
+            authenticatorData = bytesToBase64Url(
+              new Uint8Array(assertionRes.authenticatorData)
+            );
+            signature = bytesToBase64Url(new Uint8Array(assertionRes.signature));
+          }
+        } catch {
+          // Fallback to WebCrypto if available
+        }
+      }
 
-      // Compute SHA-256(clientDataJSON) and sign (authenticatorData || clientDataHash) with ECDSA P-256 private key
-      const clientDataHashBuffer = await window.crypto.subtle.digest(
-        'SHA-256',
-        clientDataBytes
-      );
-      const signedData = new Uint8Array(37 + 32);
-      signedData.set(authDataBytes, 0);
-      signedData.set(new Uint8Array(clientDataHashBuffer), 37);
+      // 2. If WebCrypto P-256 keyPair is registered for this session, sign the challenge
+      if (!signature) {
+        if (!passkeyEntry || !passkeyEntry.keyPair) {
+          setErrorMessage(
+            'Bu tarayıcı oturumunda kayıtlı W3C WebAuthn / ECDSA P-256 Passkey bulunamadı. Lütfen önce Kurumsal PIN ile giriş yaparak cihaz açık anahtarını (SPKI) kaydedin.'
+          );
+          setAuthenticating(false);
+          return;
+        }
 
-      const rawSignatureBuffer = await window.crypto.subtle.sign(
-        { name: 'ECDSA', hash: 'SHA-256' },
-        passkeyEntry.keyPair.privateKey,
-        signedData
-      );
-      const signature = bytesToBase64Url(new Uint8Array(rawSignatureBuffer));
+        const clientDataObj = {
+          type: 'webauthn.get',
+          challenge: challengeData.challenge,
+          origin: window.location.origin,
+          crossOrigin: false,
+        };
+        const clientDataBytes = new TextEncoder().encode(
+          JSON.stringify(clientDataObj)
+        );
+        clientDataJSON = bytesToBase64Url(clientDataBytes);
+
+        const rpIdBytes = new TextEncoder().encode(
+          challengeData.rpId || window.location.hostname || 'localhost'
+        );
+        const rpIdHashBuffer = await window.crypto.subtle.digest(
+          'SHA-256',
+          rpIdBytes
+        );
+        const authDataBytes = new Uint8Array(37);
+        authDataBytes.set(new Uint8Array(rpIdHashBuffer), 0);
+        authDataBytes[32] = 0x05; // UP (0x01) | UV (0x04)
+
+        nextSignCount = passkeyEntry.signCount + 1;
+        const view = new DataView(authDataBytes.buffer);
+        view.setUint32(33, nextSignCount, false);
+        authenticatorData = bytesToBase64Url(authDataBytes);
+
+        const clientDataHashBuffer = await window.crypto.subtle.digest(
+          'SHA-256',
+          clientDataBytes
+        );
+        const signedData = new Uint8Array(37 + 32);
+        signedData.set(authDataBytes, 0);
+        signedData.set(new Uint8Array(clientDataHashBuffer), 37);
+
+        const rawSignatureBuffer = await window.crypto.subtle.sign(
+          { name: 'ECDSA', hash: 'SHA-256' },
+          passkeyEntry.keyPair.privateKey,
+          signedData
+        );
+        signature = bytesToBase64Url(new Uint8Array(rawSignatureBuffer));
+        credentialId = passkeyEntry.credentialId;
+      }
 
       setWebAuthnStatus(
-        `2/2 · ECDSA P-256 İmzası ve Challenge #${String(
+        `2/2 · W3C WebAuthn P-256 İmzası ve Challenge #${String(
           challengeData.challengeId
         ).slice(0, 8)} sunucuda doğrulanıyor...`
       );
@@ -344,7 +477,7 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           challengeId: challengeData.challengeId,
-          credentialId: passkeyEntry.credentialId,
+          credentialId,
           clientDataJSON,
           authenticatorData,
           signature,
@@ -360,7 +493,9 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
         return;
       }
 
-      passkeyEntry.signCount = nextSignCount;
+      if (passkeyEntry) {
+        passkeyEntry.signCount = nextSignCount;
+      }
       setAuthenticating(false);
       onUnlock(
         verifyData.user.role as ClubRole,
@@ -387,11 +522,11 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
       {/* Top Security Status Bar */}
       <div className="w-full max-w-md flex items-center justify-between text-xs text-slate-300 pt-1">
         <span className="font-mono-num font-semibold">
-          UR 2420 · RotaClub v5.2 Hardened
+          UR 2420 · RotaClub v5.3 Hardened
         </span>
         <div className="flex items-center gap-1.5 text-[#F7A81B]">
           <Lock className="w-3.5 h-3.5" />
-          <span>HMAC-SHA256 + ECDSA P-256 WebAuthn</span>
+          <span>HMAC-SHA256 + W3C WebAuthn P-256</span>
         </div>
       </div>
 
@@ -414,7 +549,7 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
             RotaClub Kimlik Doğrulama
           </h1>
           <p className="text-xs text-slate-200 font-medium">
-            Gerçek Sunucu Oturumu (Scrypt PIN + ECDSA P-256 Passkey + HMAC-SHA256)
+            Gerçek Sunucu Oturumu (CSPRNG Scrypt + W3C WebAuthn Passkey + HMAC-SHA256)
           </p>
         </div>
 
@@ -468,14 +603,14 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
                 htmlFor="login-pin-code"
                 className="block text-[11px] font-semibold text-slate-300 mb-1"
               >
-                Kurumsal PIN Şifresi
+                Kurumsal PIN / Parola
               </label>
               <input
                 id="login-pin-code"
                 type="password"
                 value={pinInput}
                 onChange={(e) => setPinInput(e.target.value)}
-                placeholder="6 Haneli PIN"
+                placeholder="Kurumsal PIN"
                 autoComplete="current-password"
                 className="w-full text-xs font-mono-num bg-[#09152B]/90 border border-white/20 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-[#F7A81B]"
               />
@@ -548,8 +683,8 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
               <Fingerprint className="w-4 h-4 text-[#F7A81B]" />
               <span>
                 {hasRegisteredPasskey
-                  ? 'Kayıtlı ECDSA P-256 Passkey ile Oturum Aç (/api/auth/webauthn-verify)'
-                  : 'ECDSA P-256 WebAuthn Passkey ile Doğrula (/api/auth/webauthn-verify)'}
+                  ? 'Kayıtlı W3C WebAuthn Passkey ile Oturum Aç (/api/auth/webauthn-verify)'
+                  : 'W3C WebAuthn P-256 Passkey ile Doğrula (/api/auth/webauthn-verify)'}
               </span>
             </button>
           </div>
