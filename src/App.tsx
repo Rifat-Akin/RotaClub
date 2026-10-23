@@ -82,6 +82,8 @@ export default function App() {
   const [activeRole, setActiveRole] = useState<ClubRole>('uye');
   const [sessionToken, setSessionToken] = useState<string>('');
   const sessionTokenRef = useRef<string>('');
+  const roleTokensRef = useRef<Partial<Record<ClubRole, string>>>({});
+  const serverRevisionRef = useRef<number | undefined>(undefined);
   const [activeTenantClubId, setActiveTenantClubId] = useState<string>('club-galata');
   const [activeTenantClubName, setActiveTenantClubName] = useState<string>(
     'Galata Rotary Kulübü'
@@ -168,6 +170,9 @@ export default function App() {
 
   const applyServerTenantState = (serverData: Record<string, unknown>) => {
     if (!serverData) return;
+    if (typeof serverData.revision === 'number') {
+      serverRevisionRef.current = serverData.revision;
+    }
     if (typeof serverData.updatedAt === 'string') {
       setServerSyncedAt(serverData.updatedAt);
     }
@@ -222,21 +227,12 @@ export default function App() {
     explicitToken?: string
   ) => {
     try {
-      let token = explicitToken || '';
+      const token = explicitToken || roleTokensRef.current[role] || '';
       if (!token) {
-        const sessionRes = await fetch('/api/auth/pilot-role-session', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            role,
-            clubId,
-          }),
-        });
-        if (!sessionRes.ok) return;
-        const sessionData = await sessionRes.json();
-        token = sessionData.token;
+        return false;
       }
 
+      roleTokensRef.current[role] = token;
       sessionTokenRef.current = token;
       setSessionToken(token);
 
@@ -248,19 +244,19 @@ export default function App() {
           },
         }
       );
-      if (!stateRes.ok) return;
+      if (!stateRes.ok) return false;
       const serverData = await stateRes.json();
       applyServerTenantState(serverData);
+      return true;
     } catch {
-      // Fallback to in-memory initial state if offline
+      return false;
     }
   };
 
-  // Authenticate initial pilot session on mount
-  useEffect(() => {
-    authenticateAndFetchClubState(activeRole, activeTenantClubId);
-  }, []);
-
+  /**
+   * Sends ONLY the changed delta patch with optimistic concurrency control (expectedRevision) (#14, #18)
+   * Never dumps stale full-state arrays over concurrent edits!
+   */
   const recordServerAudit = (
     module: AuditLogEntry['module'],
     action: string,
@@ -279,49 +275,43 @@ export default function App() {
       },
       body: JSON.stringify({
         clubId: activeTenantClubId,
+        expectedRevision: serverRevisionRef.current,
         auditEvent: {
           module,
           action,
           detail,
           requiredRoles,
         },
-        state: {
-          termInfo,
-          meetings,
-          selectedMeetingNo,
-          rsvpStatus,
-          menuPreference,
-          guestNameInput,
-          ritualSteps,
-          celebrations,
-          speakerProposals,
-          qrCheckedIn,
-          makeupSubmissions,
-          guestMakeupCards,
-          firesideGroups,
-          financialItems,
-          paymentNotifications,
-          overdueMembers,
-          treasuryLedger,
-          projects,
-          scholars,
-          members,
-          committees,
-          pastPresidents,
-          boardResolutions,
-          kvkkMaskPhone,
-          ...patchOverride,
-        },
+        state: patchOverride || {},
       }),
     })
-      .then((res) => (res.ok ? res.json() : null))
+      .then(async (res) => {
+        if (res.status === 409) {
+          // Revision conflict or duplicate reference: reload authoritative server state
+          await authenticateAndFetchClubState(
+            activeRole,
+            activeTenantClubId,
+            token
+          );
+          return null;
+        }
+        return res.ok ? res.json() : null;
+      })
       .then((data) => {
-        if (data?.auditLogs) setAuditLogs(data.auditLogs);
-        if (data?.updatedAt) setServerSyncedAt(data.updatedAt);
-        if (data?.auditVerification) {
-          setAuditChainValid(Boolean(data.auditVerification.valid));
-          if (data.auditVerification.headHash) {
-            setAuditHeadHash(data.auditVerification.headHash);
+        if (!data) return;
+        if (typeof data.revision === 'number') {
+          serverRevisionRef.current = data.revision;
+        }
+        if (data.state) {
+          applyServerTenantState(data.state);
+        } else {
+          if (data.auditLogs) setAuditLogs(data.auditLogs);
+          if (data.updatedAt) setServerSyncedAt(data.updatedAt);
+          if (data.auditVerification) {
+            setAuditChainValid(Boolean(data.auditVerification.valid));
+            if (data.auditVerification.headHash) {
+              setAuditHeadHash(data.auditVerification.headHash);
+            }
           }
         }
       })
@@ -338,18 +328,20 @@ export default function App() {
 
   // Demo Reset Handler — Requires 'baskan' authenticated token & preserves SHA-256 Audit Ledger (#14, #18, #23)
   const handleResetDemoData = async () => {
-    try {
-      const baskanRes = await fetch('/api/auth/pilot-role-session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          role: 'baskan',
-          clubId: activeTenantClubId,
-        }),
-      });
-      const baskanData = await baskanRes.json();
-      const baskanToken = baskanData?.token || sessionTokenRef.current;
+    const baskanToken =
+      roleTokensRef.current.baskan ||
+      (activeRole === 'baskan' ? sessionTokenRef.current : '');
+    if (!baskanToken) {
+      setActiveRole('baskan');
+      setIsSplashModalOpen(true);
+      showToast(
+        'Başkan Kimlik Doğrulaması Gerekli (#23)',
+        'Veritabanını sıfırlamak için lütfen Dönem Başkanı (TR-2420-74105) oturumu ile kimlik doğrulaması yapın.'
+      );
+      return;
+    }
 
+    try {
       const resetRes = await fetch('/api/pilot/reset', {
         method: 'POST',
         headers: {
@@ -359,23 +351,24 @@ export default function App() {
         body: JSON.stringify({ clubId: activeTenantClubId }),
       });
 
-      if (resetRes.ok) {
-        const freshData = await resetRes.json();
-        applyServerTenantState(freshData);
+      if (!resetRes.ok) {
+        const errData = await resetRes.json().catch(() => ({}));
+        showToast(
+          'Sıfırlama Yetki Reddi',
+          errData?.message || 'Yalnızca doğrulanmış Başkan oturumu sıfırlama yapabilir.'
+        );
+        return;
       }
 
-      // Restore current activeRole session
-      await authenticateAndFetchClubState(activeRole, activeTenantClubId);
+      const freshData = await resetRes.json();
+      applyServerTenantState(freshData);
 
       showToast(
         'Operasyonel Veriler Sıfırlandı (SHA-256 Denetim Defteri Korundu)',
         'Kulüp tabloları başlangıç durumuna döndürüldü; değiştirilemez SHA-256 denetim zincirine sıfırlama kaydı eklendi.'
       );
     } catch {
-      showToast(
-        'Sıfırlama Uyarısı',
-        'Sunucu bağlantısı doğrulanamadı.'
-      );
+      showToast('Sıfırlama Uyarısı', 'Sunucu bağlantısı doğrulanamadı.');
     }
   };
 
@@ -397,7 +390,7 @@ export default function App() {
       if (!res.ok) {
         showToast(
           'Yedekleme Yetki Uyarısı',
-          'Yedek dosyası yalnızca yetkili Yönetim Kurulu oturumu ile indirilebilir.'
+          'Yedek dosyası yalnızca doğrulanmış Yönetim Kurulu oturumu ile indirilebilir.'
         );
         return;
       }
@@ -405,14 +398,14 @@ export default function App() {
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = `RotaClub_${activeTenantClubId}_Backup_v5_1.json`;
+      link.download = `RotaClub_${activeTenantClubId}_Backup_v5_2.json`;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
       showToast(
         'Kulüp Veritabanı & SHA-256 Denetim Zinciri İndirildi (.JSON)',
-        `RotaClub_${activeTenantClubId}_Backup_v5_1.json dosyası Authorization Bearer başlığı ile güvenli şekilde indirildi.`
+        `RotaClub_${activeTenantClubId}_Backup_v5_2.json dosyası Authorization Bearer başlığı ile güvenli şekilde indirildi.`
       );
     } catch {
       showToast('Yedekleme Hatası', 'Sunucu yedekleme servisine ulaşılamadı.');
@@ -450,7 +443,7 @@ export default function App() {
       'Yönetim & Güvenlik',
       `KVKK Telefon Maskeleme ${nextState ? 'Aktif Edildi' : 'Kapatıldı'}`,
       `Üye rehberi telefon numaraları KVKK gizlilik modu kapsamında ${nextState ? 'maskelendi' : 'tam görünüme açıldı'}.`,
-      undefined,
+      ['sekreter', 'sayman', 'baskan'],
       { kvkkMaskPhone: nextState }
     );
     showToast(
@@ -505,25 +498,34 @@ export default function App() {
   // Handlers
   const handleSelectRole = async (role: ClubRole, explicitToken?: string) => {
     setActiveRole(role);
-    await authenticateAndFetchClubState(role, activeTenantClubId, explicitToken);
+    const hasSession = await authenticateAndFetchClubState(
+      role,
+      activeTenantClubId,
+      explicitToken
+    );
     const roleNames: Record<ClubRole, string> = {
       uye: 'Üye: Rifat Akın (Veri Minimizasyonu Aktif)',
       sekreter: 'Genel Sekreter (Rtn. Av. Nazlı Denizmen)',
       sayman: 'Kulüp Saymanı (Rtn. YMM Levent Soydan)',
       baskan: 'Dönem Başkanı (Rtn. Mimar Emre Karaca)',
     };
-    showToast(
-      `İmzalı Sunucu Oturumu: ${roleNames[role]}`,
-      'Sunucu tarafından HMAC-SHA256 Bearer Token doğrulandı ve rol bazlı veri erişim filtreleri uygulandı.'
-    );
+    if (hasSession) {
+      showToast(
+        `İmzalı Sunucu Oturumu: ${roleNames[role]}`,
+        'Sunucu tarafından HMAC-SHA256 Bearer Token doğrulandı ve rol bazlı veri erişim filtreleri uygulandı.'
+      );
+    } else {
+      showToast(
+        `Görünüm: ${roleNames[role]}`,
+        'Sunucu yazma/okuma yetkisi için sağ üstteki Kilit Ekranından PIN veya ECDSA P-256 Passkey ile oturum açabilirsiniz.'
+      );
+    }
   };
 
   const handleSelectTenantClub = async (tenant: TenantClubOption) => {
-    setActiveTenantClubId(tenant.id);
-    setActiveTenantClubName(tenant.name);
     const currentToken = sessionTokenRef.current || sessionToken;
-    try {
-      if (currentToken) {
+    if (currentToken) {
+      try {
         const switchRes = await fetch('/api/auth/switch-club', {
           method: 'POST',
           headers: {
@@ -532,27 +534,36 @@ export default function App() {
           },
           body: JSON.stringify({ targetClubId: tenant.id }),
         });
-        if (switchRes.ok) {
-          const switchData = await switchRes.json();
-          await authenticateAndFetchClubState(
-            activeRole,
-            tenant.id,
-            switchData.token
-          );
+        const switchData = await switchRes.json();
+        if (!switchRes.ok) {
           showToast(
-            `Çoklu Kulüp İzolasyonu: ${tenant.name}`,
-            `${tenant.name} (${tenant.district}) için yeni kulüp kapsamlı imzalı oturum açıldı ve izole veritabanı yüklendi.`
+            'Kulüp Üyelik İzolasyonu Engeli (403)',
+            switchData?.message ||
+              `Mevcut oturumunuzun "${tenant.name}" kulübünde üyelik yetkisi bulunmamaktadır.`
           );
           return;
         }
+        setActiveTenantClubId(tenant.id);
+        setActiveTenantClubName(tenant.name);
+        await authenticateAndFetchClubState(
+          activeRole,
+          tenant.id,
+          switchData.token
+        );
+        showToast(
+          `Çoklu Kulüp İzolasyonu: ${tenant.name}`,
+          `${tenant.name} (${tenant.district}) için doğrulanmış kulüp üyeliği ile izole oturum açıldı.`
+        );
+        return;
+      } catch {
+        // Offline fallback
       }
-      await authenticateAndFetchClubState(activeRole, tenant.id);
-    } catch {
-      // Offline fallback
     }
+    setActiveTenantClubId(tenant.id);
+    setActiveTenantClubName(tenant.name);
     showToast(
-      `Çoklu Kulüp İzolasyonu: ${tenant.name}`,
-      `${tenant.name} (${tenant.district}) için izole edilmiş veritabanı oturumu sunucudan yüklendi.`
+      `Çoklu Kulüp Görünümü: ${tenant.name}`,
+      `${tenant.name} (${tenant.district}) seçildi.`
     );
   };
 

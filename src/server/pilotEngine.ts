@@ -47,6 +47,19 @@ import {
 } from '../types/rotary';
 import { maskPhoneForKvkk } from '../utils/rotaryLogic';
 
+export const ALLOWED_TENANT_CLUB_IDS = [
+  'club-galata',
+  'club-karakoy',
+  'club-macka',
+  'club-district2420',
+] as const;
+
+export type AllowedTenantClubId = (typeof ALLOWED_TENANT_CLUB_IDS)[number];
+
+export function isAllowedTenantClubId(clubId: string): clubId is AllowedTenantClubId {
+  return (ALLOWED_TENANT_CLUB_IDS as readonly string[]).includes(clubId);
+}
+
 /**
  * Runtime / Environment HMAC-SHA256 Secret Loader (#22)
  * Never uses a hardcoded fallback secret string in source code.
@@ -55,7 +68,10 @@ import { maskPhoneForKvkk } from '../utils/rotaryLogic';
 let cachedServerSecret: string | null = null;
 
 export function getServerSecret(): string {
-  if (process.env.ROTACLUB_JWT_SECRET && process.env.ROTACLUB_JWT_SECRET.trim().length >= 32) {
+  if (
+    process.env.ROTACLUB_JWT_SECRET &&
+    process.env.ROTACLUB_JWT_SECRET.trim().length >= 32
+  ) {
     return process.env.ROTACLUB_JWT_SECRET.trim();
   }
   if (cachedServerSecret) {
@@ -99,10 +115,15 @@ export interface AuthenticatedUser {
 
 export interface WebAuthnCredentialRecord {
   credentialId: string;
-  publicKeySpkiB64?: string;
+  publicKeySpkiB64: string;
   signCount: number;
   registeredAt: string;
   rpId: string;
+}
+
+export interface ClubMembershipBinding {
+  clubId: AllowedTenantClubId;
+  role: ClubRole;
 }
 
 export interface PilotUserAccount {
@@ -111,7 +132,8 @@ export interface PilotUserAccount {
   fullName: string;
   email: string;
   role: ClubRole;
-  clubId: string;
+  clubId: AllowedTenantClubId;
+  clubMemberships: ClubMembershipBinding[];
   passwordSalt: string;
   passwordHash: string;
   webauthnCredentials: WebAuthnCredentialRecord[];
@@ -171,7 +193,7 @@ export interface TenantClubDatabaseState {
 }
 
 export interface MultiTenantDatabaseFile {
-  schemaVersion: '5.1.0-hardened';
+  schemaVersion: '5.2.0-hardened';
   updatedAt: string;
   tenants: Record<string, TenantClubDatabaseState>;
   accounts: PilotUserAccount[];
@@ -185,6 +207,14 @@ export function normalizeBankRef(ref: string): string {
     .toUpperCase();
 }
 
+export function normalizePersonName(name: string): string {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/^rtn\.?\s*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export function maskEmailForKvkk(email: string, enabled: boolean): string {
   if (!enabled || !email || !email.includes('@')) return email;
   const [local, domain] = email.split('@');
@@ -196,21 +226,52 @@ export function hashPinWithSalt(pin: string, salt: string): string {
   return crypto.scryptSync(pin, salt, 32).toString('hex');
 }
 
+/**
+ * Converts a 64-byte IEEE P1363 ECDSA signature (r || s, produced by WebCrypto subtle.sign)
+ * into ASN.1 DER format expected by Node's crypto.verify('sha256', ...).
+ * If already in ASN.1 DER format (starts with 0x30), returns as-is.
+ */
+export function ensureDerEcdsaSignature(sigBuf: Buffer): Buffer {
+  if (sigBuf.length === 64) {
+    const encodeInt = (buf: Buffer): Buffer => {
+      let i = 0;
+      while (i < buf.length - 1 && buf[i] === 0) {
+        i++;
+      }
+      const sliced = buf.subarray(i);
+      if (sliced[0] & 0x80) {
+        return Buffer.concat([Buffer.from([0x02, sliced.length + 1, 0x00]), sliced]);
+      }
+      return Buffer.concat([Buffer.from([0x02, sliced.length]), sliced]);
+    };
+    const rDer = encodeInt(sigBuf.subarray(0, 32));
+    const sDer = encodeInt(sigBuf.subarray(32, 64));
+    const totalLen = rDer.length + sDer.length;
+    return Buffer.concat([Buffer.from([0x30, totalLen]), rDer, sDer]);
+  }
+  return sigBuf;
+}
+
 function buildInitialAccount(params: {
   memberId: string;
   rotaryId: string;
   fullName: string;
   email: string;
   role: ClubRole;
-  clubId: string;
+  clubId: AllowedTenantClubId;
+  clubMemberships: ClubMembershipBinding[];
   envPinVar: string;
-  districtCode: number;
-  roleSuffix: number;
+  precomputedSalt: string;
+  precomputedHash: string;
 }): PilotUserAccount {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const configuredPin =
-    process.env[params.envPinVar]?.trim() ||
-    `${params.districtCode}${params.roleSuffix}`;
+  const customEnvPin = process.env[params.envPinVar]?.trim();
+  const salt = customEnvPin
+    ? crypto.randomBytes(16).toString('hex')
+    : params.precomputedSalt;
+  const hash = customEnvPin
+    ? hashPinWithSalt(customEnvPin, salt)
+    : params.precomputedHash;
+
   return {
     memberId: params.memberId,
     rotaryId: params.rotaryId,
@@ -218,16 +279,11 @@ function buildInitialAccount(params: {
     email: params.email,
     role: params.role,
     clubId: params.clubId,
+    clubMemberships: params.clubMemberships,
     passwordSalt: salt,
-    passwordHash: hashPinWithSalt(configuredPin, salt),
-    webauthnCredentials: [
-      {
-        credentialId: Buffer.from(`passkey-${params.memberId}-2420`, 'utf8').toString('base64url'),
-        signCount: 1,
-        registeredAt: '2026-10-20T09:00:00.000Z',
-        rpId: 'localhost',
-      },
-    ],
+    passwordHash: hash,
+    // Credentials must be registered with a real ECDSA P-256 SPKI public key via /api/auth/webauthn-register-verify
+    webauthnCredentials: [],
   };
 }
 
@@ -240,9 +296,12 @@ export function createInitialPilotAccounts(): PilotUserAccount[] {
       email: 'rifat.akin@galatarotary.org',
       role: 'uye',
       clubId: 'club-galata',
+      // Regular member belongs ONLY to club-galata (#70)
+      clubMemberships: [{ clubId: 'club-galata', role: 'uye' }],
       envPinVar: 'ROTACLUB_PIN_UYE',
-      districtCode: 2420,
-      roleSuffix: 11,
+      precomputedSalt: '9f8e7d6c5b4a39281726354453627180',
+      precomputedHash:
+        '1d5ab304ffd47117df5743c7320bea0197a5fcd9d4a1a9ca313294cab41d44f9',
     }),
     buildInitialAccount({
       memberId: 'm-nazli',
@@ -251,9 +310,12 @@ export function createInitialPilotAccounts(): PilotUserAccount[] {
       email: 'sekreter@galatarotary.org',
       role: 'sekreter',
       clubId: 'club-galata',
+      // Club secretary belongs ONLY to club-galata (#70)
+      clubMemberships: [{ clubId: 'club-galata', role: 'sekreter' }],
       envPinVar: 'ROTACLUB_PIN_SEKRETER',
-      districtCode: 2420,
-      roleSuffix: 22,
+      precomputedSalt: '1a2b3c4d5e6f708192a3b4c5d6e7f809',
+      precomputedHash:
+        'b034352ba57a189a42fd1b0cf190efae4843cbc4ab5ae90af697f98daf11a418',
     }),
     buildInitialAccount({
       memberId: 'm-levent',
@@ -262,9 +324,12 @@ export function createInitialPilotAccounts(): PilotUserAccount[] {
       email: 'sayman@galatarotary.org',
       role: 'sayman',
       clubId: 'club-galata',
+      // Club treasurer belongs ONLY to club-galata (#70)
+      clubMemberships: [{ clubId: 'club-galata', role: 'sayman' }],
       envPinVar: 'ROTACLUB_PIN_SAYMAN',
-      districtCode: 2420,
-      roleSuffix: 33,
+      precomputedSalt: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
+      precomputedHash:
+        'ccc5a073f09744e1bc2545d64b75dcf67dc05a738bfc0541e3d7187210c97901',
     }),
     buildInitialAccount({
       memberId: 'm-emre',
@@ -273,9 +338,17 @@ export function createInitialPilotAccounts(): PilotUserAccount[] {
       email: 'baskan@galatarotary.org',
       role: 'baskan',
       clubId: 'club-galata',
+      // District 2420 Multi-Club Governance Officer & Galata President (#70)
+      clubMemberships: [
+        { clubId: 'club-galata', role: 'baskan' },
+        { clubId: 'club-karakoy', role: 'baskan' },
+        { clubId: 'club-macka', role: 'baskan' },
+        { clubId: 'club-district2420', role: 'baskan' },
+      ],
       envPinVar: 'ROTACLUB_PIN_BASKAN',
-      districtCode: 2420,
-      roleSuffix: 44,
+      precomputedSalt: 'f0e1d2c3b4a5968778695a4b3c2d1e0f',
+      precomputedHash:
+        'c042c479a593355ef36883d44f896c4d713052cf9b8b514493859134ed7101f6',
     }),
   ];
 }
@@ -390,7 +463,9 @@ export function issueSignedToken(
     exp: nowSec + 60 * 60 * 12, // 12 hours
     jti: crypto.randomUUID(),
   };
-  const payloadB64 = Buffer.from(JSON.stringify(fullPayload), 'utf8').toString('base64url');
+  const payloadB64 = Buffer.from(JSON.stringify(fullPayload), 'utf8').toString(
+    'base64url'
+  );
   const sig = crypto
     .createHmac('sha256', getServerSecret())
     .update(payloadB64, 'utf8')
@@ -454,20 +529,48 @@ export function findPilotAccount(
   );
 }
 
+export function getAccountClubMembership(
+  account: PilotUserAccount,
+  clubId: string
+): ClubMembershipBinding | null {
+  if (!isAllowedTenantClubId(clubId)) return null;
+  const memberships = account.clubMemberships || [
+    { clubId: account.clubId, role: account.role },
+  ];
+  return memberships.find((m) => m.clubId === clubId) || null;
+}
+
 export function authenticatePilotCredentials(
   identifier: string,
   pinOrPassword: string,
   clubId = 'club-galata',
   accounts: PilotUserAccount[] = PILOT_ACCOUNTS
-): { user: AuthenticatedUser; token: string } | null {
+):
+  | { ok: true; user: AuthenticatedUser; token: string }
+  | {
+      ok: false;
+      reason: 'INVALID_CREDENTIALS' | 'UNKNOWN_CLUB_TENANT' | 'CLUB_MEMBERSHIP_FORBIDDEN';
+    } {
+  if (!isAllowedTenantClubId(clubId)) {
+    return { ok: false, reason: 'UNKNOWN_CLUB_TENANT' };
+  }
+
   const account = findPilotAccount(identifier, accounts);
-  if (!account) return null;
+  if (!account) {
+    return { ok: false, reason: 'INVALID_CREDENTIALS' };
+  }
 
   const computedHash = hashPinWithSalt(pinOrPassword.trim(), account.passwordSalt);
   const hashA = Buffer.from(computedHash, 'hex');
   const hashB = Buffer.from(account.passwordHash, 'hex');
   if (hashA.length !== hashB.length || !crypto.timingSafeEqual(hashA, hashB)) {
-    return null;
+    return { ok: false, reason: 'INVALID_CREDENTIALS' };
+  }
+
+  // Issue #70 Fix: Verify that the authenticated user is actually a member of the requested clubId!
+  const membership = getAccountClubMembership(account, clubId);
+  if (!membership) {
+    return { ok: false, reason: 'CLUB_MEMBERSHIP_FORBIDDEN' };
   }
 
   const userPayload = {
@@ -475,13 +578,13 @@ export function authenticatePilotCredentials(
     rotaryId: account.rotaryId,
     fullName: account.fullName,
     email: account.email,
-    role: account.role,
-    clubId,
+    role: membership.role,
+    clubId: membership.clubId,
     authMethod: 'pin' as const,
   };
   const token = issueSignedToken(userPayload);
   const verified = verifySignedToken(token)!;
-  return { user: verified, token };
+  return { ok: true, user: verified, token };
 }
 
 function createInitialAuditChainForClub(
@@ -575,7 +678,7 @@ function createInitialBankStatementsForClub(clubId: string): BankStatementEntry[
       {
         bankRef: `${prefix}-2026-1001`,
         amount: 9000,
-        senderName: `${prefix} Rotary Üyesi`,
+        senderName: `Rtn. ${prefix} Rotary Başkanı`,
         date: '23 Ekim 2026 · 10:00',
         description: `${prefix} Rotary — Dönem Aidatı FAST Tahsilatı`,
         reconciled: false,
@@ -627,7 +730,10 @@ function createInitialBankStatementsForClub(clubId: string): BankStatementEntry[
   ];
 }
 
-function createIsolatedNonGalataMembers(clubId: string, clubPrefix: string): RotaryMember[] {
+function createIsolatedNonGalataMembers(
+  clubId: string,
+  clubPrefix: string
+): RotaryMember[] {
   const code = clubId.replace('club-', '').toUpperCase().slice(0, 3);
   return [
     {
@@ -749,20 +855,29 @@ export function createTenantClubState(
     guestNameInput: isGalata ? 'Mim. Caner Erkin — Kentsel Tasarım' : '',
     ritualSteps: INITIAL_RITUAL_STEPS.map((s) => ({ ...s })),
     celebrations: isGalata ? INITIAL_CELEBRATIONS.map((c) => ({ ...c })) : [],
-    speakerProposals: isGalata ? INITIAL_SPEAKER_PROPOSALS.map((sp) => ({ ...sp })) : [],
+    speakerProposals: isGalata
+      ? INITIAL_SPEAKER_PROPOSALS.map((sp) => ({ ...sp }))
+      : [],
     qrCheckedIn: false,
-    makeupSubmissions: isGalata ? INITIAL_MAKEUP_SUBMISSIONS.map((m) => ({ ...m })) : [],
-    guestMakeupCards: isGalata ? INITIAL_GUEST_MAKEUP_CARDS.map((g) => ({ ...g })) : [],
-    firesideGroups: isGalata ? INITIAL_FIRESIDE_GROUPS.map((f) => ({ ...f })) : [],
+    makeupSubmissions: isGalata
+      ? INITIAL_MAKEUP_SUBMISSIONS.map((m) => ({ ...m }))
+      : [],
+    guestMakeupCards: isGalata
+      ? INITIAL_GUEST_MAKEUP_CARDS.map((g) => ({ ...g }))
+      : [],
+    firesideGroups: isGalata
+      ? INITIAL_FIRESIDE_GROUPS.map((f) => ({ ...f }))
+      : [],
     financialItems: INITIAL_FINANCIAL_ITEMS.map((fi) => ({ ...fi })),
-    // P0 Multi-Tenant Isolation (#70): Never leak Galata's payment notifications, overdue members, or member PII into other clubs
     paymentNotifications: isGalata
       ? INITIAL_PAYMENT_NOTIFICATIONS.map((p) => ({
           ...p,
           receiptRef: normalizeBankRef(p.receiptRef),
         }))
       : [],
-    overdueMembers: isGalata ? INITIAL_OVERDUE_MEMBERS.map((o) => ({ ...o })) : [],
+    overdueMembers: isGalata
+      ? INITIAL_OVERDUE_MEMBERS.map((o) => ({ ...o }))
+      : [],
     treasuryLedger: isGalata
       ? INITIAL_TREASURY_LEDGER.map((t) => ({ ...t }))
       : [
@@ -783,8 +898,12 @@ export function createTenantClubState(
       ? GALATA_ROTARY_MEMBERS.map((m) => ({ ...m }))
       : createIsolatedNonGalataMembers(clubId, clubPrefix),
     committees: isGalata ? INITIAL_CLUB_COMMITTEES.map((c) => ({ ...c })) : [],
-    pastPresidents: isGalata ? INITIAL_PAST_PRESIDENTS.map((pp) => ({ ...pp })) : [],
-    boardResolutions: isGalata ? INITIAL_BOARD_RESOLUTIONS.map((br) => ({ ...br })) : [],
+    pastPresidents: isGalata
+      ? INITIAL_PAST_PRESIDENTS.map((pp) => ({ ...pp }))
+      : [],
+    boardResolutions: isGalata
+      ? INITIAL_BOARD_RESOLUTIONS.map((br) => ({ ...br }))
+      : [],
     kvkkMaskPhone: false,
     bankStatements: createInitialBankStatementsForClub(clubId),
     auditLedger: createInitialAuditChainForClub(clubId, clubPrefix),
@@ -793,7 +912,7 @@ export function createTenantClubState(
 
 export function createDefaultMultiTenantDb(): MultiTenantDatabaseFile {
   return {
-    schemaVersion: '5.1.0-hardened',
+    schemaVersion: '5.2.0-hardened',
     updatedAt: new Date().toISOString(),
     tenants: {
       'club-galata': createTenantClubState('club-galata', 'Galata Rotary Kulübü'),
@@ -822,9 +941,9 @@ export function redactStateForRole(
   const isPrivilegedBoard =
     user.role === 'sekreter' || user.role === 'sayman' || user.role === 'baskan';
 
-  // Fixed KVKK Bug (#16): Regular 'uye' ALWAYS gets masked phones for other members,
-  // or when club-wide kvkkMaskPhone is enabled.
-  const shouldMaskPhones = Boolean(tenantState.kvkkMaskPhone || user.role === 'uye');
+  const shouldMaskPhones = Boolean(
+    tenantState.kvkkMaskPhone || user.role === 'uye'
+  );
   const shouldMaskSensitivePii = user.role === 'uye';
 
   const sanitizedMembers: RotaryMember[] = tenantState.members.map((m) => {
@@ -837,7 +956,6 @@ export function redactStateForRole(
       spouseName: isSelf || isPrivilegedBoard ? m.spouseName : undefined,
       weddingAnniversary:
         isSelf || isPrivilegedBoard ? m.weddingAnniversary : undefined,
-      // Regular 'uye' cannot inspect other members' personal debt balances
       duesBalance: isPrivilegedFinance || isSelf ? m.duesBalance : 0,
       mealBalance: isPrivilegedFinance || isSelf ? m.mealBalance : 0,
       foundationBalance: isPrivilegedFinance || isSelf ? m.foundationBalance : 0,
@@ -880,7 +998,7 @@ export function redactStateForRole(
 
 /**
  * Atomic File Persistence with Write-Ahead Temp File + fsync + rename
- * Never swallows write errors silently (#14, #18, #70).
+ * Enforces Compare-And-Swap (CAS) revision locking (#14, #18, #70).
  */
 export class AtomicMultiTenantStore {
   private dbDir: string;
@@ -892,7 +1010,7 @@ export class AtomicMultiTenantStore {
       ? path.dirname(customDbFile)
       : path.resolve(process.cwd(), '.aistudio');
     this.dbFile =
-      customDbFile || path.join(this.dbDir, 'rotaclub_pilot_v5_1_db.json');
+      customDbFile || path.join(this.dbDir, 'rotaclub_pilot_v5_2_db.json');
     this.state = this.loadFromDisk();
     if (Array.isArray(this.state.revokedTokenJtis)) {
       for (const jti of this.state.revokedTokenJtis) {
@@ -914,7 +1032,7 @@ export class AtomicMultiTenantStore {
     const parsed = JSON.parse(raw) as Partial<MultiTenantDatabaseFile>;
     if (
       !parsed ||
-      parsed.schemaVersion !== '5.1.0-hardened' ||
+      parsed.schemaVersion !== '5.2.0-hardened' ||
       !parsed.tenants ||
       !parsed.accounts
     ) {
@@ -929,7 +1047,9 @@ export class AtomicMultiTenantStore {
     if (!fs.existsSync(this.dbDir)) {
       fs.mkdirSync(this.dbDir, { recursive: true });
     }
-    const tmpFile = `${this.dbFile}.tmp.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`;
+    const tmpFile = `${this.dbFile}.tmp.${process.pid}.${Date.now()}.${crypto
+      .randomBytes(4)
+      .toString('hex')}`;
     const serialized = JSON.stringify(nextState, null, 2);
     const fd = fs.openSync(tmpFile, 'w', 0o600);
     try {
@@ -967,20 +1087,39 @@ export class AtomicMultiTenantStore {
   }
 
   public registerWebAuthnCredential(
-    identifier: string,
+    memberId: string,
     cred: WebAuthnCredentialRecord
   ): PilotUserAccount | null {
-    const account = findPilotAccount(identifier, this.state.accounts);
+    const account = this.state.accounts.find((a) => a.memberId === memberId);
     if (!account) return null;
-    const exists = account.webauthnCredentials.some(
+    const existingIdx = account.webauthnCredentials.findIndex(
       (c) => c.credentialId === cred.credentialId
     );
-    if (!exists) {
+    if (existingIdx >= 0) {
+      account.webauthnCredentials[existingIdx] = cred;
+    } else {
       account.webauthnCredentials.push(cred);
+    }
+    this.state.updatedAt = new Date().toISOString();
+    this.atomicWriteToDisk(this.state);
+    return account;
+  }
+
+  public updateWebAuthnSignCount(
+    memberId: string,
+    credentialId: string,
+    newSignCount: number
+  ): void {
+    const account = this.state.accounts.find((a) => a.memberId === memberId);
+    if (!account) return;
+    const cred = account.webauthnCredentials.find(
+      (c) => c.credentialId === credentialId
+    );
+    if (cred) {
+      cred.signCount = newSignCount;
       this.state.updatedAt = new Date().toISOString();
       this.atomicWriteToDisk(this.state);
     }
-    return account;
   }
 
   public revokeToken(jti: string): void {
@@ -993,6 +1132,9 @@ export class AtomicMultiTenantStore {
   }
 
   public getTenantState(clubId: string): TenantClubDatabaseState {
+    if (!isAllowedTenantClubId(clubId)) {
+      throw new Error(`UNKNOWN_CLUB_TENANT: ${clubId}`);
+    }
     if (!this.state.tenants[clubId]) {
       this.state.tenants[clubId] = createTenantClubState(clubId, clubId);
       this.atomicWriteToDisk(this.state);
@@ -1064,7 +1206,6 @@ export class AtomicMultiTenantStore {
     const entryHash = computeAuditHash(partial);
     const fullEntry: ChainedAuditLogEntry = { ...partial, entryHash };
 
-    // IMMUTABLE PER-TENANT APPEND-ONLY LEDGER (#18, #70)
     tenant.auditLedger = [fullEntry, ...ledger];
     tenant.updatedAt = new Date().toISOString();
     this.state.updatedAt = tenant.updatedAt;
@@ -1072,11 +1213,24 @@ export class AtomicMultiTenantStore {
     return fullEntry;
   }
 
+  /**
+   * Atomic Compare-And-Swap (CAS) Tenant Update (#14)
+   * Validates expectedRevision inside the critical section before applying updater and fsyncing to disk.
+   */
   public updateTenant(
     clubId: string,
-    updater: (current: TenantClubDatabaseState) => TenantClubDatabaseState
-  ): TenantClubDatabaseState {
+    updater: (current: TenantClubDatabaseState) => TenantClubDatabaseState,
+    expectedRevision?: number
+  ):
+    | { ok: true; state: TenantClubDatabaseState }
+    | { ok: false; currentRevision: number } {
     const current = this.getTenantState(clubId);
+    if (
+      typeof expectedRevision === 'number' &&
+      expectedRevision !== current.revision
+    ) {
+      return { ok: false, currentRevision: current.revision };
+    }
     const preservedAuditLedger = current.auditLedger;
     const updated = updater(current);
     updated.auditLedger = preservedAuditLedger;
@@ -1085,7 +1239,7 @@ export class AtomicMultiTenantStore {
     this.state.tenants[clubId] = updated;
     this.state.updatedAt = updated.updatedAt;
     this.atomicWriteToDisk(this.state);
-    return updated;
+    return { ok: true, state: updated };
   }
 
   /**
@@ -1099,7 +1253,11 @@ export class AtomicMultiTenantStore {
   ): TenantClubDatabaseState {
     const existing = this.getTenantState(clubId);
     const preservedLedger = [...existing.auditLedger];
-    const fresh = createTenantClubState(clubId, existing.clubName, existing.district);
+    const fresh = createTenantClubState(
+      clubId,
+      existing.clubName,
+      existing.district
+    );
     fresh.revision = existing.revision + 1;
     fresh.auditLedger = preservedLedger;
     this.state.tenants[clubId] = fresh;
@@ -1108,7 +1266,8 @@ export class AtomicMultiTenantStore {
       actorName: `${actor.fullName} (${actor.rotaryId})`,
       actorRole: actor.role,
       module: 'Yönetim & Güvenlik',
-      action: 'Pilot Operasyonel Verisi Başlangıç Durumuna Sıfırlandı (Denetim Defteri Korundu)',
+      action:
+        'Pilot Operasyonel Verisi Başlangıç Durumuna Sıfırlandı (Denetim Defteri Korundu)',
       detail: `${existing.clubName} operasyonel tabloları sıfırlandı; SHA-256 denetim geçmişi silinmeden korundu.`,
       timestamp,
     });
