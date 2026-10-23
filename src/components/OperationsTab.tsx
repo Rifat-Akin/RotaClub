@@ -28,6 +28,8 @@ interface OperationsTabProps {
   onSelectRole: (role: ClubRole) => void;
   qrCheckedIn: boolean;
   onSimulateQrCheckIn: (qrTokenInput?: string) => void;
+  onGenerateMeetingQrToken?: () => Promise<string | null>;
+  activeSalonQrToken?: string;
   makeupSubmissions: MakeupSubmission[];
   onAddMakeupSubmission: (
     submission: Omit<MakeupSubmission, 'id' | 'status' | 'attendanceBoost' | 'memberName'>
@@ -53,6 +55,8 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
   onSelectRole,
   qrCheckedIn,
   onSimulateQrCheckIn,
+  onGenerateMeetingQrToken,
+  activeSalonQrToken,
   makeupSubmissions,
   onAddMakeupSubmission,
   onApproveMakeupSubmission,
@@ -300,20 +304,47 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                   </div>
                 </div>
 
+                {isBoardLeader && onGenerateMeetingQrToken && (
+                  <div className="p-3 rounded-xl bg-[#0C3C7C]/5 border border-[#0C3C7C]/20 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11px] font-bold text-[#0C3C7C]">
+                        Sekreterlik / Başkanlık Salon Görevlisi Paneli (#33)
+                      </span>
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const generated = await onGenerateMeetingQrToken();
+                          if (generated) {
+                            setQrTokenDraft(generated);
+                          }
+                        }}
+                        className="px-3 py-1.5 rounded-lg bg-[#0C3C7C] hover:bg-[#17458F] text-white text-[11px] font-semibold cursor-pointer"
+                      >
+                        Salon Masa QR Kodu Üret (5 Dk)
+                      </button>
+                    </div>
+                    {activeSalonQrToken && (
+                      <div className="text-[11px] font-mono-num text-slate-700 break-all">
+                        Aktif Salon Kodu: <strong>{activeSalonQrToken}</strong>
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {!qrCheckedIn && (
                   <div>
                     <label
                       htmlFor="meeting-qr-token-input"
                       className="block text-[11px] font-semibold text-slate-600 mb-1"
                     >
-                      Salon Masa QR Doğrulama Kodu (Boş bırakılırsa aktif toplantı QR kodu okunur)
+                      Salon Masa QR Doğrulama Kodu (Sekreterlik / Başkanlık tarafından üretilen 5 dk geçerli kod)
                     </label>
                     <input
                       id="meeting-qr-token-input"
                       type="text"
-                      value={qrTokenDraft}
+                      value={qrTokenDraft || activeSalonQrToken || ''}
                       onChange={(e) => setQrTokenDraft(e.target.value)}
-                      placeholder="Örn: RCQR-1842-... (İmzalı Salon Kodu)"
+                      placeholder="Örn: RCQR-1842-... (Kısa Ömürlü İmzalı Salon Kodu)"
                       className="w-full text-xs font-mono-num bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-slate-900 focus:outline-none focus:bg-white focus:border-[#0C3C7C]"
                     />
                   </div>
@@ -321,7 +352,11 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
 
                 <button
                   type="button"
-                  onClick={() => onSimulateQrCheckIn(qrTokenDraft.trim() || undefined)}
+                  onClick={() =>
+                    onSimulateQrCheckIn(
+                      (qrTokenDraft || activeSalonQrToken || '').trim() || undefined
+                    )
+                  }
                   disabled={qrCheckedIn}
                   className={`w-full min-h-[46px] px-4 py-2.5 rounded-xl text-xs font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer ${
                     qrCheckedIn
@@ -655,7 +690,7 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                             ROTACLUB · GALATA ROTARY KULÜBÜ (UR 2420. BÖLGE)
                           </div>
                           <div className="text-[11px] text-slate-500">
-                            Resmi Dijital Make-up Katılım Belgesi (Islak İmzalı & Mühürlü Sertifika)
+                            Resmi Dijital Make-up Katılım Belgesi (Sunucu Doğrulama Kodlu Sertifika)
                           </div>
                         </div>
                       </div>
@@ -690,7 +725,7 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                       </div>
                       <div className="text-right">
                         <span className="font-semibold text-slate-800">
-                          Dönem Başkanı & Genel Sekreter Islak İmzalı
+                          Kulüp Sunucu Doğrulama Kodlu Dijital Kayıt
                         </span>
                       </div>
                     </div>

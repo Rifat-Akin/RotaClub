@@ -11,6 +11,7 @@ import {
   ensureDerEcdsaSignature,
   findPilotAccount,
   getAccountClubMembership,
+  getServerSecret,
   isAllowedTenantClubId,
   issueSignedToken,
   normalizeBankRef,
@@ -2170,20 +2171,41 @@ export function createPilotExpressApp(
     }
   );
 
-  // 7d. Cryptographic Meeting QR Token Generator & Verified Check-in Endpoints (#33, #76)
-  const QR_SIGNING_SECRET =
-    process.env.ROTACLUB_QR_SECRET ||
-    process.env.ROTACLUB_TOKEN_SECRET ||
-    'rotaclub-galata-2420-meeting-qr-hmac-secret-v1';
+  // 7d. Cryptographic Short-Lived Meeting QR Token Generator (Officer-Only) & Per-Member Check-in Endpoints (#33, #76)
+  const getQrSigningSecret = (): string => {
+    if (
+      process.env.ROTACLUB_QR_SECRET &&
+      process.env.ROTACLUB_QR_SECRET.trim().length >= 32
+    ) {
+      return process.env.ROTACLUB_QR_SECRET.trim();
+    }
+    return getServerSecret();
+  };
 
-  const generateMeetingQrToken = (clubId: string, meetingNo: number): string => {
-    const digest = crypto
-      .createHmac('sha256', QR_SIGNING_SECRET)
-      .update(`rotaclub-qr-v1:${clubId}:${meetingNo}`)
+  const computeMeetingQrHmacHex = (
+    clubId: string,
+    meetingNo: number,
+    expiresAtEpochSec: number
+  ): string => {
+    return crypto
+      .createHmac('sha256', getQrSigningSecret())
+      .update(`rotaclub-qr-v2:${clubId}:${meetingNo}:${expiresAtEpochSec}`)
       .digest('hex')
-      .slice(0, 12)
+      .slice(0, 16)
       .toUpperCase();
-    return `RCQR-${meetingNo}-${digest}`;
+  };
+
+  const generateMeetingQrToken = (
+    clubId: string,
+    meetingNo: number,
+    expiresAtEpochSec: number
+  ): string => {
+    const digest = computeMeetingQrHmacHex(
+      clubId,
+      meetingNo,
+      expiresAtEpochSec
+    );
+    return `RCQR-${meetingNo}-${expiresAtEpochSec}-${digest}`;
   };
 
   app.get(
@@ -2191,6 +2213,16 @@ export function createPilotExpressApp(
     requireAuth,
     (req: AuthenticatedRequest, res) => {
       const user = req.authUser!;
+      // Issue #33 Fix: Only authorized venue officers (Genel Sekreter or Dönem Başkanı) may generate the meeting QR token
+      if (user.role !== 'sekreter' && user.role !== 'baskan') {
+        res.status(403).json({
+          error: 'QR_GENERATION_FORBIDDEN',
+          message:
+            'QR yoklama güvenlik sınırı (#33): Toplantı salonu masa QR kodu yalnızca Genel Sekreter veya Dönem Başkanı tarafından üretilebilir; standart üyeler kendi kendine QR anahtarı alamaz.',
+        });
+        return;
+      }
+
       const requestedClubId =
         typeof req.query.clubId === 'string' ? req.query.clubId.trim() : undefined;
       const authorizedClubId = verifyTenantBoundary(
@@ -2211,13 +2243,27 @@ export function createPilotExpressApp(
         tenant.meetings.find((m) => m.meetingNo === targetMeetingNo) ||
         tenant.meetings[0];
 
-      const qrToken = generateMeetingQrToken(authorizedClubId, targetMeetingNo);
+      const rawTtl =
+        req.query.ttlSeconds !== undefined ? Number(req.query.ttlSeconds) : 300;
+      const ttlSeconds = Number.isFinite(rawTtl)
+        ? Math.max(-3600, Math.min(900, Math.trunc(rawTtl)))
+        : 300;
+      const nowEpochSec = Math.floor(Date.now() / 1000);
+      const expiresAtEpochSec = nowEpochSec + ttlSeconds;
+
+      const qrToken = generateMeetingQrToken(
+        authorizedClubId,
+        targetMeetingNo,
+        expiresAtEpochSec
+      );
       res.json({
         ok: true,
         clubId: authorizedClubId,
         meetingNo: targetMeetingNo,
         venue: meetingObj?.venue || 'Pera Palace Hotel',
         qrToken,
+        expiresAt: expiresAtEpochSec * 1000,
+        ttlSeconds,
       });
     }
   );
@@ -2245,28 +2291,85 @@ export function createPilotExpressApp(
             ? meetingNo
             : tenant.selectedMeetingNo || 1842;
 
-        const expectedQrToken = generateMeetingQrToken(
-          authorizedClubId,
-          targetMeetingNo
-        );
         const submittedToken =
           typeof qrToken === 'string' ? qrToken.trim().toUpperCase() : '';
+        const match = submittedToken.match(
+          /^RCQR-(\d+)-(\d+)-([0-9A-F]{16})$/
+        );
 
-        if (!submittedToken || submittedToken !== expectedQrToken) {
+        if (!match) {
           res.status(422).json({
             error: 'INVALID_MEETING_QR_TOKEN',
             message:
-              'QR yoklama doğrulama hatası (#33): Sunulan toplantı salonu QR kodu geçersiz veya doğrulanamadı.',
+              'QR yoklama doğrulama hatası (#33): Sunulan toplantı salonu QR kodu geçersiz formatta veya doğrulanamadı.',
           });
           return;
         }
 
+        const tokenMeetingNo = Number(match[1]);
+        const tokenExpiresAtSec = Number(match[2]);
+        const tokenSignatureHex = match[3];
+
+        if (tokenMeetingNo !== targetMeetingNo) {
+          res.status(422).json({
+            error: 'INVALID_MEETING_QR_TOKEN',
+            message: `QR yoklama doğrulama hatası (#33): QR kodu farklı bir toplantı (#${tokenMeetingNo}) için üretilmiş.`,
+          });
+          return;
+        }
+
+        const expectedHmacHex = computeMeetingQrHmacHex(
+          authorizedClubId,
+          targetMeetingNo,
+          tokenExpiresAtSec
+        );
+        const sigBufA = Buffer.from(tokenSignatureHex, 'hex');
+        const sigBufB = Buffer.from(expectedHmacHex, 'hex');
+
+        if (
+          sigBufA.length !== sigBufB.length ||
+          !crypto.timingSafeEqual(sigBufA, sigBufB)
+        ) {
+          res.status(422).json({
+            error: 'INVALID_MEETING_QR_TOKEN',
+            message:
+              'QR yoklama doğrulama hatası (#33): Sunulan toplantı salonu QR kodunun kriptografik imzası doğrulanamadı.',
+          });
+          return;
+        }
+
+        const nowEpochSec = Math.floor(Date.now() / 1000);
+        if (nowEpochSec > tokenExpiresAtSec) {
+          res.status(422).json({
+            error: 'EXPIRED_MEETING_QR_TOKEN',
+            message:
+              'QR yoklama süresi doldu (#33): Bu salon QR kodunun geçerlilik süresi (5 dk) sona ermiştir. Lütfen Sekreterlik masasından güncel QR kodunu okutun.',
+          });
+          return;
+        }
+
+        const meetingKey = String(targetMeetingNo);
         const casResult = store.updateTenant(
           authorizedClubId,
-          (curr) => ({
-            ...curr,
-            qrCheckedIn: true,
-          }),
+          (curr) => {
+            const prevAttendances = curr.meetingAttendances || {};
+            const existingForMeeting = Array.isArray(
+              prevAttendances[meetingKey]
+            )
+              ? prevAttendances[meetingKey]
+              : [];
+            const nextForMeeting = existingForMeeting.includes(user.memberId)
+              ? existingForMeeting
+              : [...existingForMeeting, user.memberId];
+
+            return {
+              ...curr,
+              meetingAttendances: {
+                ...prevAttendances,
+                [meetingKey]: nextForMeeting,
+              },
+            };
+          },
           tenant.revision
         );
 
@@ -2283,15 +2386,17 @@ export function createPilotExpressApp(
           actorName: `${user.fullName} (${user.rotaryId})`,
           actorRole: user.role,
           module: 'QR Yoklama & Make-up',
-          action: `Sunucu Doğrulamalı Masa QR Yoklama (${expectedQrToken})`,
-          detail: `${user.fullName} (${user.rotaryId}) Toplantı #${targetMeetingNo} salon giriş yoklamasını imzalı QR kodu (${expectedQrToken}) ile doğruladı (+%2 katılım).`,
+          action: `Sunucu Doğrulamalı Masa QR Yoklama (Toplantı #${targetMeetingNo})`,
+          detail: `${user.fullName} (${user.rotaryId}) Toplantı #${targetMeetingNo} salon giriş yoklamasını kısa ömürlü imzalı QR kodu ile doğruladı (+%2 katılım).`,
           timestamp: formatNowTR(),
         });
 
         res.json({
           ok: true,
           revision: casResult.state.revision,
-          qrToken: expectedQrToken,
+          qrToken: submittedToken,
+          meetingNo: targetMeetingNo,
+          memberId: user.memberId,
           state: redactStateForRole(
             casResult.state,
             store.getAuditLedger(authorizedClubId),
@@ -2378,15 +2483,21 @@ export function createPilotExpressApp(
       const isMakeupApprover =
         user.role === 'sekreter' || user.role === 'baskan';
 
-      // Issue #33 Fix: Block direct client mutation of qrCheckedIn without cryptographic QR verification
+      // Issue #33 Fix: Block direct client mutation of qrCheckedIn or meetingAttendances without cryptographic QR verification
+      const currentMeetingKey = String(currentTenant.selectedMeetingNo || 1842);
+      const isCurrentlyCheckedIn = Boolean(
+        currentTenant.meetingAttendances?.[currentMeetingKey]?.includes(
+          user.memberId
+        )
+      );
       if (
-        incomingPatch.qrCheckedIn === true &&
-        !currentTenant.qrCheckedIn
+        (incomingPatch.qrCheckedIn === true && !isCurrentlyCheckedIn) ||
+        'meetingAttendances' in incomingPatch
       ) {
         res.status(422).json({
           error: 'QR_TOKEN_VERIFICATION_REQUIRED',
           message:
-            'QR yoklama bütünlüğü (#33): Salon yoklaması /api/pilot/sync üzerinden doğrudan işaretlenemez; /api/pilot/qr-checkin uç noktasından imzalı toplantı QR kodu (qrToken) ile doğrulanmalıdır.',
+            'QR yoklama bütünlüğü (#33): Salon yoklaması /api/pilot/sync üzerinden doğrudan işaretlenemez; /api/pilot/qr-checkin uç noktasından kısa ömürlü imzalı toplantı QR kodu (qrToken) ile doğrulanmalıdır.',
         });
         return;
       }
@@ -3032,6 +3143,7 @@ export function createPilotExpressApp(
             selectedMeetingNo:
               incomingPatch.selectedMeetingNo ?? curr.selectedMeetingNo,
             qrCheckedIn: curr.qrCheckedIn,
+            meetingAttendances: curr.meetingAttendances || {},
             makeupSubmissions: sanitizedMakeupSubmissions,
             speakerProposals:
               incomingPatch.speakerProposals ?? curr.speakerProposals,

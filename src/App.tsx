@@ -127,6 +127,10 @@ export default function App() {
 
   // Tab 2: Operations (QR, Make-up, Fireside) State
   const [qrCheckedIn, setQrCheckedIn] = useState<boolean>(false);
+  const [meetingAttendances, setMeetingAttendances] = useState<
+    Record<string, string[]>
+  >({});
+  const [activeSalonQrToken, setActiveSalonQrToken] = useState<string>('');
   const [makeupSubmissions, setMakeupSubmissions] = useState<MakeupSubmission[]>(
     INITIAL_MAKEUP_SUBMISSIONS
   );
@@ -226,6 +230,14 @@ export default function App() {
     }
     if (typeof serverData.qrCheckedIn === 'boolean') {
       setQrCheckedIn(serverData.qrCheckedIn);
+    }
+    if (
+      serverData.meetingAttendances &&
+      typeof serverData.meetingAttendances === 'object'
+    ) {
+      setMeetingAttendances(
+        serverData.meetingAttendances as Record<string, string[]>
+      );
     }
     if (Array.isArray(serverData.makeupSubmissions)) {
       setMakeupSubmissions(serverData.makeupSubmissions as MakeupSubmission[]);
@@ -541,17 +553,61 @@ export default function App() {
   const activeMemberDisplayName =
     sessionUser?.fullName || 'Rtn. Rifat Akın';
 
-  // Derived Calculations via Pure Logic (#35: Only officer-approved make-ups grant +%3 attendance boost)
+  // Derived Calculations via Pure Logic (#33 & #35: Per-member, per-meeting QR attendance + per-member approved make-up boost)
+  const normalizeMemberNameKey = (name: string) =>
+    String(name || '')
+      .toLowerCase()
+      .replace(/^rtn\.?\s*/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const activeMemberNameKey = normalizeMemberNameKey(activeMemberDisplayName);
+  const memberApprovedMakeupsCount = makeupSubmissions.filter(
+    (m) =>
+      m.status === 'Onaylandı' &&
+      normalizeMemberNameKey(m.memberName) === activeMemberNameKey
+  ).length;
+  const initialMemberApprovedMakeupsCount = INITIAL_MAKEUP_SUBMISSIONS.filter(
+    (m) =>
+      m.status === 'Onaylandı' &&
+      normalizeMemberNameKey(m.memberName) === activeMemberNameKey
+  ).length;
+
   const extraMakeupsCount = Math.max(
     0,
-    makeupSubmissions.filter((m) => m.status === 'Onaylandı').length -
-      INITIAL_MAKEUP_SUBMISSIONS.filter((m) => m.status === 'Onaylandı').length
+    memberApprovedMakeupsCount - initialMemberApprovedMakeupsCount
   );
+
+  const selectedMeetingAttendees =
+    meetingAttendances[String(selectedMeetingNo)] || [];
+  const isCurrentMemberCheckedInForMeeting =
+    selectedMeetingAttendees.includes(activeMemberId) ||
+    (Object.keys(meetingAttendances).length === 0 && qrCheckedIn);
+
+  const activeMemberObj = members.find((m) => m.id === activeMemberId);
+  const baseMemberAttendance = activeMemberObj?.attendancePercent ?? 92;
+
   const attendancePercent = calculateUpdatedAttendance(
-    92,
+    baseMemberAttendance,
     extraMakeupsCount,
-    qrCheckedIn
+    isCurrentMemberCheckedInForMeeting
   );
+
+  const copyTextToClipboard = async (text: string): Promise<boolean> => {
+    if (
+      typeof navigator === 'undefined' ||
+      !navigator.clipboard ||
+      typeof navigator.clipboard.writeText !== 'function'
+    ) {
+      return false;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   const combinedRsvpList: MemberRsvp[] = [
     ...members
@@ -738,22 +794,31 @@ export default function App() {
     );
   };
 
-  const handleRemindUnrespondedMembers = () => {
+  const handleRemindUnrespondedMembers = async () => {
     const pendingList = members.filter((m) => m.rsvpStatus === 'pending');
-    const draftMessage =
-      pendingList.length > 0
-        ? `Galata Rotary Kulübü Toplantı #${selectedMeetingNo} LCV Hatırlatması — Yanıt beklenen üyeler: ${pendingList
-            .map((m) => m.fullName)
-            .join(', ')}`
-        : 'Tüm üyelerin LCV yanıtı güncel durumda.';
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(draftMessage).catch(() => {});
+    if (pendingList.length === 0) {
+      showToast(
+        'LCV Durumu Güncel',
+        'Tüm üyelerin LCV yanıtı güncel durumda.'
+      );
+      return;
+    }
+    const draftMessage = `Galata Rotary Kulübü Toplantı #${selectedMeetingNo} LCV Hatırlatması — Yanıt beklenen üyeler: ${pendingList
+      .map((m) => m.fullName)
+      .join(', ')}`;
+    const copied = await copyTextToClipboard(draftMessage);
+    if (!copied) {
+      showToast(
+        'Panoya Kopyalama Başarısız (#32)',
+        'Tarayıcı pano erişim izni reddedildi veya kullanılamıyor; hatırlatma metni kopyalanamadı.'
+      );
+      return;
     }
     showToast(
       'LCV Hatırlatma Taslağı Panoya Kopyalandı',
-      pendingList.length > 0
-        ? `Henüz yanıt vermeyen ${pendingList.map((m) => m.fullName).join(', ')} için hatırlatma metni panoya kopyalandı.`
-        : 'Tüm üyelerin LCV yanıtı güncel durumda.'
+      `Henüz yanıt vermeyen ${pendingList
+        .map((m) => m.fullName)
+        .join(', ')} için hatırlatma metni panoya kopyalandı.`
     );
   };
 
@@ -910,6 +975,52 @@ export default function App() {
     );
   };
 
+  const handleGenerateMeetingQrToken = async (): Promise<string | null> => {
+    const token = sessionTokenRef.current || sessionToken;
+    if (!token) {
+      showToast(
+        'Sunucu Oturumu Gerekli (401)',
+        'Salon QR kodu üretmek için doğrulanmış Genel Sekreter veya Dönem Başkanı oturumu gereklidir.'
+      );
+      return null;
+    }
+
+    try {
+      const tokenRes = await fetch(
+        `/api/pilot/meeting-qr-token?clubId=${encodeURIComponent(
+          activeTenantClubId
+        )}&meetingNo=${selectedMeetingNo}`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
+      const tokenData = await tokenRes.json().catch(() => ({}));
+      if (!tokenRes.ok || !tokenData?.qrToken) {
+        showToast(
+          `Salon QR Kodu Üretilemedi (${tokenRes.status})`,
+          tokenData?.message ||
+            'Toplantı QR doğrulama anahtarı yalnızca Genel Sekreter veya Dönem Başkanı tarafından üretilebilir.'
+        );
+        return null;
+      }
+
+      setActiveSalonQrToken(tokenData.qrToken);
+      showToast(
+        `Kısa Ömürlü Salon QR Kodu Üretildi (#${selectedMeetingNo})`,
+        `5 dakika geçerli masa QR kodu (${tokenData.qrToken}) oluşturuldu. Salon girişindeki üyeler bu kodu okutarak yoklama yapabilir.`
+      );
+      return tokenData.qrToken as string;
+    } catch {
+      showToast(
+        'Bağlantı Hatası',
+        'Sunucu QR üretim servisine ulaşılamadı.'
+      );
+      return null;
+    }
+  };
+
   const handleSimulateQrCheckIn = async (customQrToken?: string) => {
     const token = sessionTokenRef.current || sessionToken;
     if (!token) {
@@ -920,30 +1031,16 @@ export default function App() {
       return;
     }
 
-    try {
-      let qrToken = customQrToken?.trim();
-      if (!qrToken) {
-        const tokenRes = await fetch(
-          `/api/pilot/meeting-qr-token?clubId=${encodeURIComponent(
-            activeTenantClubId
-          )}&meetingNo=${selectedMeetingNo}`,
-          {
-            headers: {
-              Authorization: `Bearer ${token}`,
-            },
-          }
-        );
-        const tokenData = await tokenRes.json().catch(() => ({}));
-        if (!tokenRes.ok || !tokenData?.qrToken) {
-          showToast(
-            `QR Yoklama Anahtarı Alınamadı (${tokenRes.status})`,
-            tokenData?.message || 'Toplantı QR doğrulama anahtarı oluşturulamadı.'
-          );
-          return;
-        }
-        qrToken = tokenData.qrToken;
-      }
+    const qrToken = (customQrToken || activeSalonQrToken || '').trim();
+    if (!qrToken) {
+      showToast(
+        'Salon Masa QR Kodu Gerekli (#33)',
+        'Yoklama için Genel Sekreter veya Dönem Başkanı tarafından salonda üretilen 5 dk geçerli QR doğrulama kodunu giriniz.'
+      );
+      return;
+    }
 
+    try {
       const res = await fetch('/api/pilot/qr-checkin', {
         method: 'POST',
         headers: {
@@ -972,7 +1069,7 @@ export default function App() {
       }
       showToast(
         'QR Yoklama Sunucuda Doğrulandı (+%2 Katılım)',
-        `Toplantı #${selectedMeetingNo} imzalı QR kodu (${qrToken}) sunucu tarafından doğrulandı ve yoklamanız işlendi.`
+        `Toplantı #${selectedMeetingNo} kısa ömürlü imzalı QR kodu (${qrToken}) sunucu tarafından doğrulandı ve yoklamanız işlendi.`
       );
     } catch {
       showToast(
@@ -1076,7 +1173,7 @@ export default function App() {
     setActiveCertificateCard(newCard);
     showToast(
       'Resmi Dijital Make-up Sertifikası Hazır',
-      `${payload.guestName} (${payload.guestClub}) için ıslak imzalı ve mühürlü katılım belgesi sunucu onayıyla oluşturuldu.`
+      `${payload.guestName} (${payload.guestClub}) için kulüp doğrulama kodlu (${newCard.verificationCode}) dijital katılım belgesi sunucu onayıyla oluşturuldu.`
     );
   };
 
@@ -1134,9 +1231,14 @@ export default function App() {
     );
   };
 
-  const handleCopyIban = (iban: string) => {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(iban).catch(() => {});
+  const handleCopyIban = async (iban: string) => {
+    const copied = await copyTextToClipboard(iban);
+    if (!copied) {
+      showToast(
+        'Panoya Kopyalama Başarısız (#32)',
+        'Tarayıcı pano erişimi kullanılamadığı için IBAN kopyalanamadı.'
+      );
+      return;
     }
     showToast(
       'Kulüp IBAN Adresi Kopyalandı',
@@ -1251,14 +1353,19 @@ export default function App() {
     );
   };
 
-  const handleSendGentleReminder = (overdueId: string) => {
+  const handleSendGentleReminder = async (overdueId: string) => {
     const target = overdueMembers.find((o) => o.id === overdueId);
     if (!target) return;
     const reminderText = `Sayın ${target.memberName}, Galata Rotary Kulübü cari bakiyeniz (${formatTL(
       target.overdueAmount
     )}) için nazik hatırlatma bilginize sunulur.`;
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(reminderText).catch(() => {});
+    const copied = await copyTextToClipboard(reminderText);
+    if (!copied) {
+      showToast(
+        'Panoya Kopyalama Başarısız (#32)',
+        'Tarayıcı pano erişim izni reddedildi veya kullanılamıyor; hatırlatma metni kopyalanamadı.'
+      );
+      return;
     }
     showToast(
       'Nazik Hatırlatma Metni Panoya Kopyalandı',
@@ -1266,12 +1373,20 @@ export default function App() {
     );
   };
 
-  const handleRemindMemberBalance = (memberName: string, totalDebt: number) => {
+  const handleRemindMemberBalance = async (
+    memberName: string,
+    totalDebt: number
+  ) => {
     const reminderText = `Sayın Rtn. ${memberName}, Galata Rotary Kulübü güncel cari bakiyeniz ${formatTL(
       totalDebt
     )} olarak görünmektedir.`;
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(reminderText).catch(() => {});
+    const copied = await copyTextToClipboard(reminderText);
+    if (!copied) {
+      showToast(
+        'Panoya Kopyalama Başarısız (#32)',
+        'Tarayıcı pano erişim izni reddedildi veya kullanılamıyor; bakiye hatırlatma metni kopyalanamadı.'
+      );
+      return;
     }
     showToast(
       `Cari Bakiye Metni Kopyalandı: ${memberName}`,
@@ -1562,7 +1677,16 @@ export default function App() {
     );
   };
 
-  const handleCopyVCard = (member: RotaryMember) => {
+  const handleCopyVCard = async (member: RotaryMember) => {
+    const vcardText = `BEGIN:VCARD\nVERSION:3.0\nFN:Rtn. ${member.fullName}\nORG:${member.companyName}\nTITLE:${member.classification}\nTEL:${member.phone}\nEMAIL:${member.email}\nEND:VCARD`;
+    const copied = await copyTextToClipboard(vcardText);
+    if (!copied) {
+      showToast(
+        'Panoya Kopyalama Başarısız (#32)',
+        'Tarayıcı pano erişimi kullanılamadığı için vCard kartvizit bilgisi kopyalanamadı.'
+      );
+      return;
+    }
     showToast(
       'vCard Kartvizit Bilgisi Kopyalandı',
       `Rtn. ${member.fullName} (${member.rotaryId}) dijital iletişim kartı panoya kopyalandı.`
@@ -1737,8 +1861,10 @@ export default function App() {
           <OperationsTab
             activeRole={activeRole}
             onSelectRole={(role) => handleSelectRole(role)}
-            qrCheckedIn={qrCheckedIn}
+            qrCheckedIn={isCurrentMemberCheckedInForMeeting}
             onSimulateQrCheckIn={handleSimulateQrCheckIn}
+            onGenerateMeetingQrToken={handleGenerateMeetingQrToken}
+            activeSalonQrToken={activeSalonQrToken}
             makeupSubmissions={makeupSubmissions}
             onAddMakeupSubmission={handleAddMakeupSubmission}
             onApproveMakeupSubmission={handleApproveMakeupSubmission}

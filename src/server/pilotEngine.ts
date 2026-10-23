@@ -186,6 +186,7 @@ export interface TenantClubDatabaseState {
   celebrations: CelebrationItem[];
   speakerProposals: SpeakerProposal[];
   qrCheckedIn: boolean;
+  meetingAttendances?: Record<string, string[]>;
   makeupSubmissions: MakeupSubmission[];
   guestMakeupCards: GuestRotaryMakeupCard[];
   firesideGroups: FiresideGroup[];
@@ -1898,6 +1899,7 @@ export function createTenantClubState(
       ? INITIAL_SPEAKER_PROPOSALS.map((sp) => ({ ...sp }))
       : [],
     qrCheckedIn: false,
+    meetingAttendances: {},
     makeupSubmissions: isGalata
       ? INITIAL_MAKEUP_SUBMISSIONS.map((m) => ({ ...m }))
       : [],
@@ -2043,6 +2045,11 @@ export function migrateDatabaseLossless(
       speakerProposals: Array.isArray(existingTenant.speakerProposals)
         ? existingTenant.speakerProposals
         : defaultTenant.speakerProposals,
+      meetingAttendances:
+        existingTenant.meetingAttendances &&
+        typeof existingTenant.meetingAttendances === 'object'
+          ? existingTenant.meetingAttendances
+          : {},
       makeupSubmissions: Array.isArray(existingTenant.makeupSubmissions)
         ? existingTenant.makeupSubmissions
         : defaultTenant.makeupSubmissions,
@@ -2292,9 +2299,18 @@ export function redactStateForRole(
       }));
 
   const chainVerification = verifyAuditChain(auditLedger, tenantState.clubId);
+  const activeMeetingKey = String(tenantState.selectedMeetingNo || 1842);
+  const currentMeetingAttendees = Array.isArray(
+    tenantState.meetingAttendances?.[activeMeetingKey]
+  )
+    ? tenantState.meetingAttendances![activeMeetingKey]
+    : [];
+  const isUserCheckedIn = currentMeetingAttendees.includes(user.memberId);
 
   return {
     ...tenantState,
+    qrCheckedIn: isUserCheckedIn,
+    meetingAttendances: tenantState.meetingAttendances || {},
     members: sanitizedMembers,
     paymentNotifications: sanitizedPayments,
     overdueMembers: sanitizedOverdue,

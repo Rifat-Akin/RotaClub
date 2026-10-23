@@ -110,40 +110,24 @@ export const OfficialMakeupCertificateModal: React.FC<
               </p>
             </div>
 
-            {/* Official Seal & Wet Signature Simulation Row */}
+            {/* Official Seal & Digital Server Verification Row (#36: No fake wet signature claims) */}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 items-center pt-5 border-t border-slate-200">
-              {/* Dönem Başkanı Wet Signature */}
+              {/* Dönem Başkanı Digital Record Confirmation */}
               <div className="text-center sm:text-left space-y-1">
                 <div className="text-[11px] font-semibold text-slate-500">
                   GALATA RK DÖNEM BAŞKANI
                 </div>
-                <svg
-                  viewBox="0 0 180 48"
-                  className="w-36 h-10 mx-auto sm:mx-0 text-[#0C3C7C]"
-                  aria-label="Dönem Başkanı Islak İmzası"
-                >
-                  <path
-                    d="M10 34 Q32 8 52 30 T94 20 Q118 10 135 28 T168 16"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2.2"
-                    strokeLinecap="round"
-                  />
-                  <path
-                    d="M28 38 Q78 26 148 34"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.2"
-                    strokeOpacity="0.7"
-                  />
-                </svg>
+                <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#0C3C7C]/5 border border-[#0C3C7C]/20 text-[11px] font-mono-num font-semibold text-[#0C3C7C]">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-[#0C3C7C]" />
+                  <span>Sunucu Kayıt Onayı</span>
+                </div>
                 <div className="text-xs font-bold text-slate-900">
                   {termInfo.president}
                 </div>
                 <div className="text-[11px] text-slate-500">{termInfo.termLabel}</div>
               </div>
 
-              {/* Center Gold Rotary & RotaClub Official Seal */}
+              {/* Center Gold Rotary & RotaClub Digital Verification Seal */}
               <div className="flex flex-col items-center justify-center">
                 <div className="w-20 h-20 rounded-full border-2 border-[#F7A81B] bg-[#0C3C7C]/5 flex flex-col items-center justify-center p-2 text-center shadow-inner">
                   <RotaryWheelIcon className="w-7 h-7 text-[#0C3C7C]" />
@@ -151,36 +135,20 @@ export const OfficialMakeupCertificateModal: React.FC<
                     GALATA ROTARY
                   </span>
                   <span className="text-[7px] font-mono-num text-slate-600">
-                    RESMİ MÜHÜR
+                    DİJİTAL KAYIT
                   </span>
                 </div>
               </div>
 
-              {/* Genel Sekreter Wet Signature */}
+              {/* Genel Sekreter Digital Record Confirmation */}
               <div className="text-center sm:text-right space-y-1">
                 <div className="text-[11px] font-semibold text-slate-500">
                   GALATA RK GENEL SEKRETERİ
                 </div>
-                <svg
-                  viewBox="0 0 180 48"
-                  className="w-36 h-10 mx-auto sm:ml-auto sm:mr-0 text-[#0C3C7C]"
-                  aria-label="Genel Sekreter Islak İmzası"
-                >
-                  <path
-                    d="M16 32 C35 10, 55 40, 78 18 C98 6, 118 34, 158 14"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2.2"
-                    strokeLinecap="round"
-                  />
-                  <path
-                    d="M40 38 Q95 30 155 36"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.2"
-                    strokeOpacity="0.7"
-                  />
-                </svg>
+                <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#0C3C7C]/5 border border-[#0C3C7C]/20 text-[11px] font-mono-num font-semibold text-[#0C3C7C]">
+                  <ShieldCheck className="w-3.5 h-3.5 text-[#0C3C7C]" />
+                  <span>Doğrulama: {card.verificationCode}</span>
+                </div>
                 <div className="text-xs font-bold text-slate-900">
                   {termInfo.secretary}
                 </div>
