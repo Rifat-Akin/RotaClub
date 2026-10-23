@@ -27,11 +27,13 @@ interface OperationsTabProps {
   activeRole: ClubRole;
   onSelectRole: (role: ClubRole) => void;
   qrCheckedIn: boolean;
-  onSimulateQrCheckIn: () => void;
+  onSimulateQrCheckIn: (qrTokenInput?: string) => void;
   makeupSubmissions: MakeupSubmission[];
   onAddMakeupSubmission: (
     submission: Omit<MakeupSubmission, 'id' | 'status' | 'attendanceBoost' | 'memberName'>
   ) => void;
+  onApproveMakeupSubmission?: (makeupId: string) => void;
+  onRejectMakeupSubmission?: (makeupId: string) => void;
   guestMakeupCards: GuestRotaryMakeupCard[];
   onSendGuestMakeupCard: (
     card: Omit<GuestRotaryMakeupCard, 'id' | 'sentAt' | 'verificationCode'>
@@ -53,6 +55,8 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
   onSimulateQrCheckIn,
   makeupSubmissions,
   onAddMakeupSubmission,
+  onApproveMakeupSubmission,
+  onRejectMakeupSubmission,
   guestMakeupCards,
   onSendGuestMakeupCard,
   onOpenOfficialCertificateModal,
@@ -67,6 +71,7 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
   const [makeupSubTab, setMakeupSubTab] = useState<'member_makeup' | 'guest_makeup'>(
     'member_makeup'
   );
+  const [qrTokenDraft, setQrTokenDraft] = useState('');
 
   // Member Make-up Form State
   const [targetClub, setTargetClub] = useState('Karaköy Rotary Kulübü Toplantısı');
@@ -267,7 +272,7 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                 </div>
                 <div className="mt-2.5 text-center">
                   <div className="text-xs font-mono-num text-[#F7A81B] font-semibold">
-                    TR-2420-88412 · Rifat Akın
+                    {effectiveVolunteerName}
                   </div>
                   <div className="text-[11px] text-slate-300">
                     {qrCheckedIn ? 'Yoklama Kaydedildi' : 'Okutmaya Hazır'}
@@ -278,13 +283,13 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
               {/* QR Action & Status Details */}
               <div className="sm:col-span-7 space-y-3">
                 <p className="text-sm text-slate-600 leading-relaxed">
-                  Toplantı girişinde Sekreterlik masasında bulunan karekod okuyucuya ekranınızı gösterin veya simülasyon butonuyla anında yoklama kaydınızı oluşturun.
+                  Toplantı girişinde Sekreterlik masasında üretilen imzalı salon QR kodunu (HMAC-SHA256) doğrulayarak yoklama kaydınızı oluşturun (#33).
                 </p>
                 <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs space-y-1">
                   <div className="flex justify-between">
-                    <span className="text-slate-500">Üye Sicil No:</span>
+                    <span className="text-slate-500">Aktif Oturum Üyesi:</span>
                     <span className="font-mono-num font-semibold text-slate-900">
-                      TR-2420-88412
+                      {effectiveVolunteerName}
                     </span>
                   </div>
                   <div className="flex justify-between">
@@ -295,9 +300,28 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                   </div>
                 </div>
 
+                {!qrCheckedIn && (
+                  <div>
+                    <label
+                      htmlFor="meeting-qr-token-input"
+                      className="block text-[11px] font-semibold text-slate-600 mb-1"
+                    >
+                      Salon Masa QR Doğrulama Kodu (Boş bırakılırsa aktif toplantı QR kodu okunur)
+                    </label>
+                    <input
+                      id="meeting-qr-token-input"
+                      type="text"
+                      value={qrTokenDraft}
+                      onChange={(e) => setQrTokenDraft(e.target.value)}
+                      placeholder="Örn: RCQR-1842-... (İmzalı Salon Kodu)"
+                      className="w-full text-xs font-mono-num bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-slate-900 focus:outline-none focus:bg-white focus:border-[#0C3C7C]"
+                    />
+                  </div>
+                )}
+
                 <button
                   type="button"
-                  onClick={onSimulateQrCheckIn}
+                  onClick={() => onSimulateQrCheckIn(qrTokenDraft.trim() || undefined)}
                   disabled={qrCheckedIn}
                   className={`w-full min-h-[46px] px-4 py-2.5 rounded-xl text-xs font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer ${
                     qrCheckedIn
@@ -309,7 +333,7 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                   <span>
                     {qrCheckedIn
                       ? 'QR Yoklama Başarıyla Kaydedildi'
-                      : 'QR Kodu Simüle Et & Yoklamaya Katıl (+%2 Katılım)'}
+                      : 'Masa QR Kodunu Doğrula & Yoklamaya Katıl (+%2 Katılım)'}
                   </span>
                 </button>
               </div>
@@ -364,7 +388,7 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                       : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
-                  Misafir Make-up Gönder (Sekreter)
+                  Misafir Make-up Belgesi (Sekreter)
                 </button>
               </div>
             </div>
@@ -461,26 +485,32 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                     className="w-full min-h-[44px] py-2.5 px-4 rounded-xl bg-[#0C3C7C] text-white text-xs font-semibold hover:bg-[#17458F] transition-colors flex items-center justify-center gap-2 cursor-pointer"
                   >
                     <PlusCircle className="w-4 h-4" />
-                    <span>Make-up Bildir ve Devam Yüzdemi Artır (+%3 Katılım)</span>
+                    <span>Make-up Bildirimi Gönder (Sekreterlik Onayına İlet)</span>
                   </button>
                 </form>
 
                 {/* Recent Make-ups List */}
                 <div className="space-y-2 pt-2 border-t border-slate-100">
                   <div className="text-xs font-semibold text-slate-700">
-                    Dönem İçi Kayıtlı Make-up Bildirimleriniz ({makeupSubmissions.length})
+                    Dönem İçi Kayıtlı Make-up Bildirimleri ({makeupSubmissions.length})
                   </div>
                   <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
                     {makeupSubmissions.map((mk) => (
                       <div
                         key={mk.id}
-                        className="p-3 bg-white flex items-start justify-between gap-3"
+                        className="p-3 bg-white flex flex-col sm:flex-row sm:items-start justify-between gap-3"
                       >
                         <div className="min-w-0">
                           <div className="text-xs font-semibold text-slate-900">
                             {mk.targetClubOrEvent}
                           </div>
                           <div className="text-[11px] text-slate-500 mt-0.5">
+                            <span className="font-semibold text-[#0C3C7C]">
+                              {mk.memberName}
+                            </span>
+                            <span className="mx-1.5" aria-hidden="true">
+                              ·
+                            </span>
                             <span>{mk.activityType}</span>
                             <span className="mx-1.5" aria-hidden="true">
                               ·
@@ -489,13 +519,48 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                           </div>
                           <p className="text-xs text-slate-600 mt-1">{mk.description}</p>
                         </div>
-                        <div className="text-right shrink-0">
-                          <div className="text-xs font-semibold text-emerald-700">
-                            {mk.status}
+                        <div className="sm:text-right shrink-0 space-y-1.5">
+                          <div>
+                            <div
+                              className={`text-xs font-semibold ${
+                                mk.status === 'Onaylandı'
+                                  ? 'text-emerald-700'
+                                  : mk.status === 'Reddedildi'
+                                  ? 'text-rose-600'
+                                  : 'text-amber-700'
+                              }`}
+                            >
+                              {mk.status}
+                            </div>
+                            <div className="text-[11px] font-mono-num text-[#0C3C7C] font-semibold">
+                              {mk.status === 'Onaylandı'
+                                ? `+ %${mk.attendanceBoost} Katılım`
+                                : mk.status === 'Reddedildi'
+                                ? '0% Katılım'
+                                : 'Onay Bekliyor (+%3)'}
+                            </div>
                           </div>
-                          <div className="text-[11px] font-mono-num text-[#0C3C7C] font-semibold">
-                            +%{mk.attendanceBoost} Katılım
-                          </div>
+                          {mk.status === 'İnceleniyor' &&
+                            isBoardLeader &&
+                            onApproveMakeupSubmission &&
+                            onRejectMakeupSubmission && (
+                              <div className="flex items-center sm:justify-end gap-1.5 pt-1">
+                                <button
+                                  type="button"
+                                  onClick={() => onApproveMakeupSubmission(mk.id)}
+                                  className="px-2.5 py-1 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-[11px] font-semibold cursor-pointer"
+                                >
+                                  Onayla (+%3)
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => onRejectMakeupSubmission(mk.id)}
+                                  className="px-2.5 py-1 rounded-lg bg-white border border-rose-300 hover:bg-rose-50 text-rose-700 text-[11px] font-semibold cursor-pointer"
+                                >
+                                  Reddet
+                                </button>
+                              </div>
+                            )}
                         </div>
                       </div>
                     ))}
@@ -508,7 +573,7 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                 {activeRole !== 'sekreter' && activeRole !== 'baskan' && (
                   <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 flex flex-wrap items-center justify-between gap-3">
                     <p className="text-xs text-amber-900">
-                      Resmi antetli <strong>Dijital Make-up Sertifikası</strong> gönderimi Genel Sekreter ve Başkan yetkisindedir. Önizlemeyi test edebilir veya tek tuşla Genel Sekreter rolüne geçebilirsiniz.
+                      Resmi antetli <strong>Dijital Make-up Sertifikası</strong> düzenleme yetkisi Genel Sekreter ve Başkana aittir. Önizlemeyi test edebilir veya tek tuşla Genel Sekreter rolüne geçebilirsiniz.
                     </p>
                     <button
                       type="button"
@@ -637,7 +702,7 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                   >
                     <Send className="w-4 h-4 text-[#F7A81B]" />
                     <span>
-                      Resmi Make-up Katılım Belgesini Oluştur, Gönder & Yazdırılabilir Sertifikayı Aç
+                      Resmi Make-up Katılım Belgesini Sunucuda Oluştur & Yazdırılabilir Sertifikayı Aç
                     </span>
                   </button>
                 </form>
@@ -645,7 +710,7 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                 {/* Sent Guest Make-up History */}
                 <div className="space-y-2 pt-2 border-t border-slate-100">
                   <div className="text-xs font-semibold text-slate-700">
-                    Gönderilen Misafir Rotaryen Make-up Sertifikaları ({guestMakeupCards.length})
+                    Düzenlenen Misafir Rotaryen Make-up Sertifikaları ({guestMakeupCards.length})
                   </div>
                   <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
                     {guestMakeupCards.map((card) => (

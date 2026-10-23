@@ -25,6 +25,7 @@ import {
   AuditLogEntry,
   ClubRole,
   FinancialLineItem,
+  MakeupSubmission,
   RotaryMember,
   TreasuryLedgerEntry,
 } from './src/types/rotary';
@@ -2169,6 +2170,143 @@ export function createPilotExpressApp(
     }
   );
 
+  // 7d. Cryptographic Meeting QR Token Generator & Verified Check-in Endpoints (#33, #76)
+  const QR_SIGNING_SECRET =
+    process.env.ROTACLUB_QR_SECRET ||
+    process.env.ROTACLUB_TOKEN_SECRET ||
+    'rotaclub-galata-2420-meeting-qr-hmac-secret-v1';
+
+  const generateMeetingQrToken = (clubId: string, meetingNo: number): string => {
+    const digest = crypto
+      .createHmac('sha256', QR_SIGNING_SECRET)
+      .update(`rotaclub-qr-v1:${clubId}:${meetingNo}`)
+      .digest('hex')
+      .slice(0, 12)
+      .toUpperCase();
+    return `RCQR-${meetingNo}-${digest}`;
+  };
+
+  app.get(
+    '/api/pilot/meeting-qr-token',
+    requireAuth,
+    (req: AuthenticatedRequest, res) => {
+      const user = req.authUser!;
+      const requestedClubId =
+        typeof req.query.clubId === 'string' ? req.query.clubId.trim() : undefined;
+      const authorizedClubId = verifyTenantBoundary(
+        user,
+        requestedClubId,
+        store,
+        res
+      );
+      if (!authorizedClubId) return;
+
+      const tenant = store.getTenantState(authorizedClubId);
+      const parsedMeetingNo = Number(req.query.meetingNo);
+      const targetMeetingNo =
+        Number.isInteger(parsedMeetingNo) && parsedMeetingNo > 0
+          ? parsedMeetingNo
+          : tenant.selectedMeetingNo || 1842;
+      const meetingObj =
+        tenant.meetings.find((m) => m.meetingNo === targetMeetingNo) ||
+        tenant.meetings[0];
+
+      const qrToken = generateMeetingQrToken(authorizedClubId, targetMeetingNo);
+      res.json({
+        ok: true,
+        clubId: authorizedClubId,
+        meetingNo: targetMeetingNo,
+        venue: meetingObj?.venue || 'Pera Palace Hotel',
+        qrToken,
+      });
+    }
+  );
+
+  app.post(
+    '/api/pilot/qr-checkin',
+    requireAuth,
+    (req: AuthenticatedRequest, res) => {
+      try {
+        const user = req.authUser!;
+        const { clubId, meetingNo, qrToken } = req.body || {};
+        const authorizedClubId = verifyTenantBoundary(
+          user,
+          typeof clubId === 'string' ? clubId.trim() : undefined,
+          store,
+          res
+        );
+        if (!authorizedClubId) return;
+
+        const tenant = store.getTenantState(authorizedClubId);
+        const targetMeetingNo =
+          typeof meetingNo === 'number' &&
+          Number.isInteger(meetingNo) &&
+          meetingNo > 0
+            ? meetingNo
+            : tenant.selectedMeetingNo || 1842;
+
+        const expectedQrToken = generateMeetingQrToken(
+          authorizedClubId,
+          targetMeetingNo
+        );
+        const submittedToken =
+          typeof qrToken === 'string' ? qrToken.trim().toUpperCase() : '';
+
+        if (!submittedToken || submittedToken !== expectedQrToken) {
+          res.status(422).json({
+            error: 'INVALID_MEETING_QR_TOKEN',
+            message:
+              'QR yoklama doğrulama hatası (#33): Sunulan toplantı salonu QR kodu geçersiz veya doğrulanamadı.',
+          });
+          return;
+        }
+
+        const casResult = store.updateTenant(
+          authorizedClubId,
+          (curr) => ({
+            ...curr,
+            qrCheckedIn: true,
+          }),
+          tenant.revision
+        );
+
+        if (!casResult.ok) {
+          res.status(409).json({
+            error: 'REVISION_CONFLICT',
+            currentRevision: casResult.currentRevision,
+          });
+          return;
+        }
+
+        store.appendAuditEntry({
+          clubId: authorizedClubId,
+          actorName: `${user.fullName} (${user.rotaryId})`,
+          actorRole: user.role,
+          module: 'QR Yoklama & Make-up',
+          action: `Sunucu Doğrulamalı Masa QR Yoklama (${expectedQrToken})`,
+          detail: `${user.fullName} (${user.rotaryId}) Toplantı #${targetMeetingNo} salon giriş yoklamasını imzalı QR kodu (${expectedQrToken}) ile doğruladı (+%2 katılım).`,
+          timestamp: formatNowTR(),
+        });
+
+        res.json({
+          ok: true,
+          revision: casResult.state.revision,
+          qrToken: expectedQrToken,
+          state: redactStateForRole(
+            casResult.state,
+            store.getAuditLedger(authorizedClubId),
+            user
+          ),
+        });
+      } catch (err) {
+        res.status(500).json({
+          error: 'QR_CHECKIN_ERROR',
+          message: err instanceof Error ? err.message : 'QR yoklama hatası',
+        });
+      }
+    }
+  );
+
   // 8. Authenticated State Synchronization, Mandatory CAS Revision Check, Immutable Payment Records & Closed Accounting Ledger Bypass (#14, #16, #18, #20, #39, #70, #76)
   app.post('/api/pilot/sync', requireAuth, (req: AuthenticatedRequest, res) => {
     try {
@@ -2237,6 +2375,102 @@ export function createPilotExpressApp(
         user.role === 'sekreter' ||
         user.role === 'sayman' ||
         user.role === 'baskan';
+      const isMakeupApprover =
+        user.role === 'sekreter' || user.role === 'baskan';
+
+      // Issue #33 Fix: Block direct client mutation of qrCheckedIn without cryptographic QR verification
+      if (
+        incomingPatch.qrCheckedIn === true &&
+        !currentTenant.qrCheckedIn
+      ) {
+        res.status(422).json({
+          error: 'QR_TOKEN_VERIFICATION_REQUIRED',
+          message:
+            'QR yoklama bütünlüğü (#33): Salon yoklaması /api/pilot/sync üzerinden doğrudan işaretlenemez; /api/pilot/qr-checkin uç noktasından imzalı toplantı QR kodu (qrToken) ile doğrulanmalıdır.',
+        });
+        return;
+      }
+
+      // Issue #35 Fix: Enforce officer-approved Make-up workflow & prevent self-approval or cross-member tampering
+      if (Array.isArray(incomingPatch.makeupSubmissions)) {
+        const existingMakeupsById = new Map(
+          currentTenant.makeupSubmissions.map((mk) => [mk.id, mk])
+        );
+        const stripTitle = (name: string) =>
+          normalizePersonName(String(name || '').replace(/^Rtn\.\s*/i, ''));
+        const selfCanonical = stripTitle(user.fullName);
+
+        if (!isMakeupApprover) {
+          const incomingIds = new Set(
+            incomingPatch.makeupSubmissions
+              .filter((mk: { id?: string }) => mk && typeof mk.id === 'string')
+              .map((mk: { id: string }) => mk.id)
+          );
+          for (const existingMk of currentTenant.makeupSubmissions) {
+            if (!incomingIds.has(existingMk.id)) {
+              res.status(403).json({
+                error: 'MAKEUP_FORBIDDEN_MUTATION',
+                message:
+                  'Make-up yetki sınırı (#35): Standart üye oturumu mevcut make-up kayıtlarını silemez.',
+              });
+              return;
+            }
+          }
+
+          for (const incMk of incomingPatch.makeupSubmissions) {
+            const existingMk = existingMakeupsById.get(incMk?.id);
+            if (existingMk) {
+              if (
+                incMk.status !== existingMk.status ||
+                incMk.attendanceBoost !== existingMk.attendanceBoost
+              ) {
+                res.status(403).json({
+                  error: 'MAKEUP_APPROVAL_FORBIDDEN',
+                  message:
+                    'Make-up onay yetki sınırı (#35): Make-up bildirimlerini onaylama veya reddetme yetkisi yalnızca Genel Sekreter ve Dönem Başkanına aittir.',
+                });
+                return;
+              }
+              if (
+                stripTitle(incMk.memberName) !==
+                  stripTitle(existingMk.memberName) ||
+                incMk.targetClubOrEvent !== existingMk.targetClubOrEvent ||
+                incMk.activityType !== existingMk.activityType ||
+                incMk.date !== existingMk.date ||
+                incMk.description !== existingMk.description
+              ) {
+                res.status(403).json({
+                  error: 'MAKEUP_FORBIDDEN_MUTATION',
+                  message:
+                    'Make-up yetki sınırı (#35): Mevcut make-up kayıtlarının içeriği değiştirilemez.',
+                });
+                return;
+              }
+            } else {
+              // New Make-up submission by regular member
+              if (
+                incMk?.status !== 'İnceleniyor' ||
+                (typeof incMk?.attendanceBoost === 'number' &&
+                  incMk.attendanceBoost > 0)
+              ) {
+                res.status(403).json({
+                  error: 'MAKEUP_APPROVAL_FORBIDDEN',
+                  message:
+                    'Make-up onay yetki sınırı (#35): Standart üye oturumu doğrudan onaylı make-up oluşturamaz; yeni bildirimler "İnceleniyor" durumunda açılmalıdır.',
+                });
+                return;
+              }
+              if (stripTitle(incMk?.memberName || '') !== selfCanonical) {
+                res.status(403).json({
+                  error: 'MAKEUP_FORBIDDEN_MUTATION',
+                  message: `Make-up yetki sınırı (#35): Standart üye oturumu (${user.fullName}) yalnızca kendi adına make-up bildirimi oluşturabilir.`,
+                });
+                return;
+              }
+            }
+          }
+        }
+      }
 
       // Issue #39 Fix: Close ALL direct client write paths to treasuryLedger, bankStatements, financialItems, and overdueMembers!
       if (
@@ -2748,6 +2982,48 @@ export function createPilotExpressApp(
                 })
             : curr.members;
 
+          const sanitizedMakeupSubmissions = Array.isArray(
+            incomingPatch.makeupSubmissions
+          )
+            ? isMakeupApprover
+              ? incomingPatch.makeupSubmissions.map(
+                  (mk: {
+                    id: string;
+                    memberName: string;
+                    targetClubOrEvent: string;
+                    activityType: MakeupSubmission['activityType'];
+                    date: string;
+                    description: string;
+                    status: MakeupSubmission['status'];
+                  }) => ({
+                    ...mk,
+                    attendanceBoost: mk.status === 'Onaylandı' ? 3 : 0,
+                  })
+                )
+              : [
+                  ...incomingPatch.makeupSubmissions
+                    .filter(
+                      (mk: { id: string }) =>
+                        !curr.makeupSubmissions.some((ex) => ex.id === mk.id)
+                    )
+                    .map(
+                      (mk: {
+                        id: string;
+                        targetClubOrEvent: string;
+                        activityType: MakeupSubmission['activityType'];
+                        date: string;
+                        description: string;
+                      }) => ({
+                        ...mk,
+                        memberName: user.fullName,
+                        status: 'İnceleniyor' as const,
+                        attendanceBoost: 0,
+                      })
+                    ),
+                  ...curr.makeupSubmissions,
+                ]
+            : curr.makeupSubmissions;
+
           return {
             ...curr,
             rsvpStatus: incomingPatch.rsvpStatus ?? curr.rsvpStatus,
@@ -2755,9 +3031,8 @@ export function createPilotExpressApp(
             guestNameInput: incomingPatch.guestNameInput ?? curr.guestNameInput,
             selectedMeetingNo:
               incomingPatch.selectedMeetingNo ?? curr.selectedMeetingNo,
-            qrCheckedIn: incomingPatch.qrCheckedIn ?? curr.qrCheckedIn,
-            makeupSubmissions:
-              incomingPatch.makeupSubmissions ?? curr.makeupSubmissions,
+            qrCheckedIn: curr.qrCheckedIn,
+            makeupSubmissions: sanitizedMakeupSubmissions,
             speakerProposals:
               incomingPatch.speakerProposals ?? curr.speakerProposals,
             celebrations: incomingPatch.celebrations ?? curr.celebrations,

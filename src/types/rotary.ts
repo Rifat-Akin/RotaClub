@@ -66,7 +66,7 @@ export interface MakeupSubmission {
   activityType: 'Kulüp Toplantısı' | 'Bölge Semineri' | 'Hizmet Projesi' | 'Komite Toplantısı';
   date: string;
   description: string;
-  status: 'Onaylandı' | 'İnceleniyor';
+  status: 'Onaylandı' | 'İnceleniyor' | 'Reddedildi';
   attendanceBoost: number;
 }
 

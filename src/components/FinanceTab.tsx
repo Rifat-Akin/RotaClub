@@ -652,9 +652,7 @@ export const FinanceTab: React.FC<FinanceTabProps> = ({
                           >
                             <BellRing className="w-3.5 h-3.5" />
                             <span>
-                              {ov.lastRemindedAt
-                                ? `Hatırlatma Gönderildi (${ov.lastRemindedAt})`
-                                : 'Nazik Hatırlatma Bildirimi Gönder'}
+                              Nazik Hatırlatma Metnini Kopyala
                             </span>
                           </button>
                         </div>

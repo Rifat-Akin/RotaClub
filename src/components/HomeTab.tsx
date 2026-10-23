@@ -951,7 +951,7 @@ export const HomeTab: React.FC<HomeTabProps> = ({
                         className="min-h-[34px] px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-[11px] font-semibold text-white flex items-center gap-1 transition-colors cursor-pointer"
                       >
                         <BellRing className="w-3 h-3 text-[#F7A81B]" />
-                        <span>Yanıtlamayanlara Hatırlatma Gönder</span>
+                        <span>LCV Hatırlatma Metnini Kopyala</span>
                       </button>
                       <button
                         type="button"
@@ -1132,7 +1132,7 @@ export const HomeTab: React.FC<HomeTabProps> = ({
                   className="w-full min-h-[44px] py-2.5 px-4 rounded-xl bg-[#F7A81B] text-[#0F172A] font-semibold text-xs hover:bg-[#f9b53b] transition-colors flex items-center justify-center gap-2 cursor-pointer"
                 >
                   <Send className="w-4 h-4" />
-                  <span>Pera Palace Banket Yönetimine Nihai Kuver Listesini İlet</span>
+                  <span>Kesin Kuver Mutabakat Özetini Sunucuya Kaydet</span>
                 </button>
               </section>
 

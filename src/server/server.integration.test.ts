@@ -2562,5 +2562,240 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
       }),
     });
     assert.equal(selimRealJoinRes.status, 200);
+    const selimRealJoinBody = await selimRealJoinRes.json();
+
+    // 9. Issue #33 QR Check-in Verification Test:
+    // 9a. Direct client sync attempting to set qrCheckedIn: true without QR token verification MUST fail with 422 QR_TOKEN_VERIFICATION_REQUIRED
+    const directQrBypassRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${uyeSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: selimRealJoinBody.revision,
+        state: { qrCheckedIn: true },
+      }),
+    });
+    assert.equal(directQrBypassRes.status, 422);
+    const directQrBypassBody = await directQrBypassRes.json();
+    assert.equal(directQrBypassBody.error, 'QR_TOKEN_VERIFICATION_REQUIRED');
+
+    // 9b. Submitting an invalid/forged QR token to /api/pilot/qr-checkin MUST fail with 422 INVALID_MEETING_QR_TOKEN
+    const badQrRes = await fetch(`${baseUrl}/api/pilot/qr-checkin`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${uyeSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        meetingNo: 1842,
+        qrToken: 'RCQR-1842-FORGEDTOKEN000',
+      }),
+    });
+    assert.equal(badQrRes.status, 422);
+    const badQrBody = await badQrRes.json();
+    assert.equal(badQrBody.error, 'INVALID_MEETING_QR_TOKEN');
+
+    // 9c. Fetching the signed meeting QR token from /api/pilot/meeting-qr-token and verifying via /api/pilot/qr-checkin succeeds (200 OK)
+    const qrTokenRes = await fetch(
+      `${baseUrl}/api/pilot/meeting-qr-token?clubId=club-galata&meetingNo=1842`,
+      {
+        headers: { Authorization: `Bearer ${uyeSession.token}` },
+      }
+    );
+    assert.equal(qrTokenRes.status, 200);
+    const qrTokenBody = await qrTokenRes.json();
+    assert.equal(typeof qrTokenBody.qrToken, 'string');
+    assert.equal(qrTokenBody.qrToken.startsWith('RCQR-1842-'), true);
+
+    const validQrCheckinRes = await fetch(`${baseUrl}/api/pilot/qr-checkin`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${uyeSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        meetingNo: 1842,
+        qrToken: qrTokenBody.qrToken,
+      }),
+    });
+    assert.equal(validQrCheckinRes.status, 200);
+    const validQrCheckinBody = await validQrCheckinRes.json();
+    assert.equal(validQrCheckinBody.state.qrCheckedIn, true);
+
+    // 10. Issue #35 Officer-Approved Make-up Workflow Test:
+    // 10a. Regular member ('uye') attempting to submit a pre-approved make-up (status: 'Onaylandı', attendanceBoost: 3) MUST fail with 403 MAKEUP_APPROVAL_FORBIDDEN
+    const currentMakeups = validQrCheckinBody.state.makeupSubmissions;
+    const selfApprovedMakeupRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${uyeSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: validQrCheckinBody.revision,
+        state: {
+          makeupSubmissions: [
+            {
+              id: 'mk-self-approve-attempt',
+              memberName: 'Rtn. Rifat Akın',
+              activityType: 'Kulüp Ziyareti',
+              targetClubOrEvent: 'Beşiktaş Rotary Kulübü',
+              date: '23 Ekim 2026',
+              proofNote: 'Konuk katılım',
+              status: 'Onaylandı',
+              attendanceBoost: 3,
+            },
+            ...currentMakeups,
+          ],
+        },
+      }),
+    });
+    assert.equal(selfApprovedMakeupRes.status, 403);
+    const selfApprovedMakeupBody = await selfApprovedMakeupRes.json();
+    assert.equal(selfApprovedMakeupBody.error, 'MAKEUP_APPROVAL_FORBIDDEN');
+
+    // 10b. Regular member ('uye') submitting a make-up with status: 'İnceleniyor' and attendanceBoost: 0 succeeds (200 OK)
+    const pendingMakeupEntry = {
+      id: 'mk-pending-review-1',
+      memberName: 'Rtn. Rifat Akın',
+      activityType: 'Kulüp Ziyareti' as const,
+      targetClubOrEvent: 'Beşiktaş Rotary Kulübü',
+      date: '23 Ekim 2026',
+      proofNote: 'Sekreterlik teyitli ziyaret',
+      status: 'İnceleniyor' as const,
+      attendanceBoost: 0,
+    };
+    const submitPendingMakeupRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${uyeSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: validQrCheckinBody.revision,
+        state: {
+          makeupSubmissions: [pendingMakeupEntry, ...currentMakeups],
+        },
+      }),
+    });
+    assert.equal(submitPendingMakeupRes.status, 200);
+    const submitPendingMakeupBody = await submitPendingMakeupRes.json();
+    const savedPending = submitPendingMakeupBody.state.makeupSubmissions.find(
+      (m: { id: string }) => m.id === 'mk-pending-review-1'
+    );
+    assert.equal(savedPending.status, 'İnceleniyor');
+    assert.equal(savedPending.attendanceBoost, 0);
+
+    // 10c. Regular member ('uye') attempting to approve their own pending make-up MUST fail with 403 MAKEUP_APPROVAL_FORBIDDEN
+    const memberSelfApproveExistingRes = await fetch(
+      `${baseUrl}/api/pilot/sync`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          expectedRevision: submitPendingMakeupBody.revision,
+          state: {
+            makeupSubmissions:
+              submitPendingMakeupBody.state.makeupSubmissions.map(
+                (m: { id: string }) =>
+                  m.id === 'mk-pending-review-1'
+                    ? { ...m, status: 'Onaylandı', attendanceBoost: 3 }
+                    : m
+              ),
+          },
+        }),
+      }
+    );
+    assert.equal(memberSelfApproveExistingRes.status, 403);
+    const memberSelfApproveExistingBody =
+      await memberSelfApproveExistingRes.json();
+    assert.equal(
+      memberSelfApproveExistingBody.error,
+      'MAKEUP_APPROVAL_FORBIDDEN'
+    );
+
+    // 10d. Club Secretary ('sekreter') approving the pending make-up succeeds (200 OK) and grants attendanceBoost: 3
+    const sekreterApproveMakeupRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${sekreterSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: submitPendingMakeupBody.revision,
+        state: {
+          makeupSubmissions:
+            submitPendingMakeupBody.state.makeupSubmissions.map(
+              (m: { id: string }) =>
+                m.id === 'mk-pending-review-1'
+                  ? { ...m, status: 'Onaylandı', attendanceBoost: 3 }
+                  : m
+            ),
+        },
+      }),
+    });
+    assert.equal(sekreterApproveMakeupRes.status, 200);
+    const sekreterApproveMakeupBody = await sekreterApproveMakeupRes.json();
+    const approvedMakeup =
+      sekreterApproveMakeupBody.state.makeupSubmissions.find(
+        (m: { id: string }) => m.id === 'mk-pending-review-1'
+      );
+    assert.equal(approvedMakeup.status, 'Onaylandı');
+    assert.equal(approvedMakeup.attendanceBoost, 3);
+
+    // 11. Issue #51 New Project Zeroed Collection Enforcement Test:
+    // Creating a new project via /api/pilot/sync with inflated initial collectedAmount/supportersCount forces both to 0 in returned server state
+    const existingProjects = sekreterApproveMakeupBody.state.projects;
+    const newProjectRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${sekreterSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: sekreterApproveMakeupBody.revision,
+        state: {
+          projects: [
+            {
+              id: 'proj-zero-test-51',
+              title: 'Beyoğlu Okulları Kodlama Atölyesi',
+              category: 'Toplum Hizmetleri',
+              summary: 'İlköğretim öğrencileri için robotik ve kodlama sınıfı',
+              targetBudget: 250000,
+              collectedAmount: 15000, // Even if client sends non-zero, server zeroes it
+              ticketPrice: 5000,
+              ticketLabel: '1 Eğitim Seti Sponsorluğu',
+              supportersCount: 3,
+              impactMetric: '60 Öğrenci',
+              committeeChair: 'Rtn. Av. Nazlı Denizmen',
+              volunteers: ['Rtn. Av. Nazlı Denizmen'],
+            },
+            ...existingProjects,
+          ],
+        },
+      }),
+    });
+    assert.equal(newProjectRes.status, 200);
+    const newProjectBody = await newProjectRes.json();
+    const createdProj = newProjectBody.state.projects.find(
+      (p: { id: string }) => p.id === 'proj-zero-test-51'
+    );
+    assert.ok(createdProj);
+    assert.equal(createdProj.collectedAmount, 0);
+    assert.equal(createdProj.supportersCount, 0);
   });
 });
+

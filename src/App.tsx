@@ -541,10 +541,11 @@ export default function App() {
   const activeMemberDisplayName =
     sessionUser?.fullName || 'Rtn. Rifat Akın';
 
-  // Derived Calculations via Pure Logic
+  // Derived Calculations via Pure Logic (#35: Only officer-approved make-ups grant +%3 attendance boost)
   const extraMakeupsCount = Math.max(
     0,
-    makeupSubmissions.length - INITIAL_MAKEUP_SUBMISSIONS.length
+    makeupSubmissions.filter((m) => m.status === 'Onaylandı').length -
+      INITIAL_MAKEUP_SUBMISSIONS.filter((m) => m.status === 'Onaylandı').length
   );
   const attendancePercent = calculateUpdatedAttendance(
     92,
@@ -739,10 +740,19 @@ export default function App() {
 
   const handleRemindUnrespondedMembers = () => {
     const pendingList = members.filter((m) => m.rsvpStatus === 'pending');
-    showToast(
-      'LCV Hatırlatma Bildirimi Gönderildi',
+    const draftMessage =
       pendingList.length > 0
-        ? `Henüz yanıt vermeyen ${pendingList.map((m) => m.fullName).join(', ')} için WhatsApp/Push LCV hatırlatması iletildi.`
+        ? `Galata Rotary Kulübü Toplantı #${selectedMeetingNo} LCV Hatırlatması — Yanıt beklenen üyeler: ${pendingList
+            .map((m) => m.fullName)
+            .join(', ')}`
+        : 'Tüm üyelerin LCV yanıtı güncel durumda.';
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(draftMessage).catch(() => {});
+    }
+    showToast(
+      'LCV Hatırlatma Taslağı Panoya Kopyalandı',
+      pendingList.length > 0
+        ? `Henüz yanıt vermeyen ${pendingList.map((m) => m.fullName).join(', ')} için hatırlatma metni panoya kopyalandı.`
         : 'Tüm üyelerin LCV yanıtı güncel durumda.'
     );
   };
@@ -900,20 +910,76 @@ export default function App() {
     );
   };
 
-  const handleSimulateQrCheckIn = async () => {
-    const ok = await recordServerAudit(
-      'QR Yoklama & Make-up',
-      'Pera Palace Masa QR Yoklama Okutuldu (+%2)',
-      `${sessionUser?.rotaryId || 'TR-2420-88412'} (${activeMemberDisplayName}) #${selectedMeetingNo}. Haftalık Toplantı salon giriş yoklaması sunucuya işlendi.`,
-      undefined,
-      { qrCheckedIn: true }
-    );
-    if (!ok) return;
-    setQrCheckedIn(true);
-    showToast(
-      'QR Yoklama Başarılı (+%2 Katılım)',
-      '1842. Haftalık Toplantı yoklamanız sunucu onayıyla işlendi ve devam yüzdeniz güncellendi.'
-    );
+  const handleSimulateQrCheckIn = async (customQrToken?: string) => {
+    const token = sessionTokenRef.current || sessionToken;
+    if (!token) {
+      showToast(
+        'Sunucu Oturumu Gerekli (401)',
+        'QR yoklama doğrulaması için sağ üstteki kilit ekranından doğrulanmış kulüp oturumu açmalısınız.'
+      );
+      return;
+    }
+
+    try {
+      let qrToken = customQrToken?.trim();
+      if (!qrToken) {
+        const tokenRes = await fetch(
+          `/api/pilot/meeting-qr-token?clubId=${encodeURIComponent(
+            activeTenantClubId
+          )}&meetingNo=${selectedMeetingNo}`,
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          }
+        );
+        const tokenData = await tokenRes.json().catch(() => ({}));
+        if (!tokenRes.ok || !tokenData?.qrToken) {
+          showToast(
+            `QR Yoklama Anahtarı Alınamadı (${tokenRes.status})`,
+            tokenData?.message || 'Toplantı QR doğrulama anahtarı oluşturulamadı.'
+          );
+          return;
+        }
+        qrToken = tokenData.qrToken;
+      }
+
+      const res = await fetch('/api/pilot/qr-checkin', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          clubId: activeTenantClubId,
+          meetingNo: selectedMeetingNo,
+          qrToken,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showToast(
+          `QR Yoklama Reddedildi (${res.status})`,
+          data?.message || 'Toplantı QR kodu sunucu tarafından doğrulanamadı.'
+        );
+        return;
+      }
+
+      if (data?.state) {
+        applyServerTenantState(data.state);
+      } else {
+        setQrCheckedIn(true);
+      }
+      showToast(
+        'QR Yoklama Sunucuda Doğrulandı (+%2 Katılım)',
+        `Toplantı #${selectedMeetingNo} imzalı QR kodu (${qrToken}) sunucu tarafından doğrulandı ve yoklamanız işlendi.`
+      );
+    } catch {
+      showToast(
+        'QR Yoklama Bağlantı Hatası',
+        'Sunucu QR doğrulama servisine ulaşılamadı.'
+      );
+    }
   };
 
   const handleAddMakeupSubmission = async (
@@ -926,22 +992,65 @@ export default function App() {
       id: `mk-${Date.now()}`,
       memberName: activeMemberDisplayName,
       ...payload,
-      status: 'Onaylandı',
-      attendanceBoost: 3,
+      status: 'İnceleniyor',
+      attendanceBoost: 0,
     };
     const nextMakeups = [newEntry, ...makeupSubmissions];
     const ok = await recordServerAudit(
       'QR Yoklama & Make-up',
-      `Make-up Bildirimi Kaydedildi: ${payload.targetClubOrEvent}`,
-      `${activeMemberDisplayName} · ${payload.activityType} (${payload.date}) katılımı devam oranına +%3 olarak işlendi.`,
+      `Make-up Bildirimi Onaya Sunuldu: ${payload.targetClubOrEvent}`,
+      `${activeMemberDisplayName} · ${payload.activityType} (${payload.date}) katılım bildirimi Sekreter/Başkan onay kuyruğuna eklendi.`,
       undefined,
       { makeupSubmissions: nextMakeups }
     );
     if (!ok) return;
-    setMakeupSubmissions(nextMakeups);
     showToast(
-      'Make-up Bildirimi Onaylandı (+%3 Katılım)',
-      `${payload.targetClubOrEvent} katılımınız sunucu onayıyla devam oranınıza eklendi.`
+      'Make-up Bildirimi Onay Kuyruğuna Eklendi',
+      `${payload.targetClubOrEvent} katılımınız Genel Sekreter / Başkan onayından sonra devam oranınıza (+%3) işlenecektir.`
+    );
+  };
+
+  const handleApproveMakeupSubmission = async (makeupId: string) => {
+    const target = makeupSubmissions.find((m) => m.id === makeupId);
+    if (!target) return;
+    const nextMakeups = makeupSubmissions.map((m) =>
+      m.id === makeupId
+        ? { ...m, status: 'Onaylandı' as const, attendanceBoost: 3 }
+        : m
+    );
+    const ok = await recordServerAudit(
+      'QR Yoklama & Make-up',
+      `Make-up Bildirimi Onaylandı (+%3): ${target.targetClubOrEvent}`,
+      `${target.memberName} (${target.targetClubOrEvent}) make-up bildirimi yetkili tarafından onaylandı ve devam oranına +%3 eklendi.`,
+      ['sekreter', 'baskan'],
+      { makeupSubmissions: nextMakeups }
+    );
+    if (!ok) return;
+    showToast(
+      `Make-up Onaylandı (+%3 Katılım): ${target.memberName}`,
+      `${target.targetClubOrEvent} katılımı sunucu onayıyla devam oranına işlendi.`
+    );
+  };
+
+  const handleRejectMakeupSubmission = async (makeupId: string) => {
+    const target = makeupSubmissions.find((m) => m.id === makeupId);
+    if (!target) return;
+    const nextMakeups = makeupSubmissions.map((m) =>
+      m.id === makeupId
+        ? { ...m, status: 'Reddedildi' as const, attendanceBoost: 0 }
+        : m
+    );
+    const ok = await recordServerAudit(
+      'QR Yoklama & Make-up',
+      `Make-up Bildirimi Reddedildi: ${target.targetClubOrEvent}`,
+      `${target.memberName} (${target.targetClubOrEvent}) make-up bildirimi yetkili incelemesinde reddedildi.`,
+      ['sekreter', 'baskan'],
+      { makeupSubmissions: nextMakeups }
+    );
+    if (!ok) return;
+    showToast(
+      `Make-up Bildirimi Reddedildi: ${target.memberName}`,
+      `${target.targetClubOrEvent} katılım kaydı sunucu onayıyla reddedildi.`
     );
   };
 
@@ -1145,16 +1254,28 @@ export default function App() {
   const handleSendGentleReminder = (overdueId: string) => {
     const target = overdueMembers.find((o) => o.id === overdueId);
     if (!target) return;
+    const reminderText = `Sayın ${target.memberName}, Galata Rotary Kulübü cari bakiyeniz (${formatTL(
+      target.overdueAmount
+    )}) için nazik hatırlatma bilginize sunulur.`;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(reminderText).catch(() => {});
+    }
     showToast(
-      'Nazik Hatırlatma Bildirimi Gönderildi',
-      `${target.memberName} için Rotary dostluk dilinde hazırlanan bakiye hatırlatması iletildi.`
+      'Nazik Hatırlatma Metni Panoya Kopyalandı',
+      `${target.memberName} için Rotary dostluk dilinde hazırlanan hatırlatma metni panoya kopyalandı.`
     );
   };
 
   const handleRemindMemberBalance = (memberName: string, totalDebt: number) => {
+    const reminderText = `Sayın Rtn. ${memberName}, Galata Rotary Kulübü güncel cari bakiyeniz ${formatTL(
+      totalDebt
+    )} olarak görünmektedir.`;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(reminderText).catch(() => {});
+    }
     showToast(
-      `Cari Bakiye Hatırlatması: ${memberName}`,
-      `Rtn. ${memberName} için ${formatTL(totalDebt)} cari bakiye hatırlatma mesajı iletildi.`
+      `Cari Bakiye Metni Kopyalandı: ${memberName}`,
+      `Rtn. ${memberName} için ${formatTL(totalDebt)} cari bakiye hatırlatma taslağı panoya kopyalandı.`
     );
   };
 
@@ -1345,23 +1466,22 @@ export default function App() {
     const created: GalataProject = {
       id: `proj-${Date.now()}`,
       ...newProject,
-      collectedAmount: newProject.ticketPrice * 2,
-      supportersCount: 2,
+      collectedAmount: 0,
+      supportersCount: 0,
       volunteers: [newProject.committeeChair, activeMemberDisplayName],
     };
     const nextProjects = [created, ...projects];
     const ok = await recordServerAudit(
       'Projeler & Burslar',
       `Yeni Hizmet Projesi Başlatıldı: ${newProject.title}`,
-      `Hedef bütçesi ${formatTL(newProject.targetBudget)} olan proje yayına alındı.`,
+      `Hedef bütçesi ${formatTL(newProject.targetBudget)} olan proje 0 TL başlangıç tahsilatıyla yayına alındı.`,
       ['sekreter', 'baskan'],
       { projects: nextProjects }
     );
     if (!ok) return;
-    setProjects(nextProjects);
     showToast(
       `Yeni Hizmet Projesi Başlatıldı: ${newProject.title}`,
-      `Hedef bütçesi ${formatTL(newProject.targetBudget)} olan proje bağış termometresiyle yayına alındı.`
+      `Hedef bütçesi ${formatTL(newProject.targetBudget)} olan proje 0 TL başlangıç bakiyesiyle yayına alındı.`
     );
   };
 
@@ -1621,6 +1741,8 @@ export default function App() {
             onSimulateQrCheckIn={handleSimulateQrCheckIn}
             makeupSubmissions={makeupSubmissions}
             onAddMakeupSubmission={handleAddMakeupSubmission}
+            onApproveMakeupSubmission={handleApproveMakeupSubmission}
+            onRejectMakeupSubmission={handleRejectMakeupSubmission}
             guestMakeupCards={guestMakeupCards}
             onSendGuestMakeupCard={handleSendGuestMakeupCard}
             onOpenOfficialCertificateModal={(card) =>
