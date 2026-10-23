@@ -138,6 +138,7 @@ export interface PilotUserAccount {
   clubMemberships: ClubMembershipBinding[];
   passwordSalt: string;
   passwordHash: string;
+  activated?: boolean;
   webauthnCredentials: WebAuthnCredentialRecord[];
 }
 
@@ -198,6 +199,7 @@ export interface TenantClubDatabaseState {
 export interface MultiTenantDatabaseFile {
   schemaVersion: '5.3.0-hardened';
   updatedAt: string;
+  bootstrapClaimed?: boolean;
   tenants: Record<string, TenantClubDatabaseState>;
   accounts: PilotUserAccount[];
   revokedTokenJtis: string[];
@@ -299,31 +301,26 @@ export function ensureDerEcdsaSignature(sigBuf: Buffer): Buffer {
 
 /**
  * Secure Account Provisioning (#22, #70):
- * Zero hardcoded salts or precomputed hashes in source code.
- * Uses fresh CSPRNG 16-byte salt per account and either environment-injected secret
- * or CSPRNG random 16-byte initial bootstrap secret written to a local 0o600 file.
+ * Zero hardcoded salts, zero precomputed hashes, and zero plaintext password files on disk.
+ * Accounts without an explicit environment secret start with activated=false until claimed
+ * via the one-time initial admin activation flow (/api/auth/bootstrap-claim) or provisioned by the President.
  */
-function buildProvisionedAccount(
-  params: {
-    memberId: string;
-    rotaryId: string;
-    fullName: string;
-    email: string;
-    role: ClubRole;
-    clubId: AllowedTenantClubId;
-    clubMemberships: ClubMembershipBinding[];
-    envPinVar: string;
-  },
-  bootstrapCollector: Record<string, string>
-): PilotUserAccount {
+function buildProvisionedAccount(params: {
+  memberId: string;
+  rotaryId: string;
+  fullName: string;
+  email: string;
+  role: ClubRole;
+  clubId: AllowedTenantClubId;
+  clubMemberships: ClubMembershipBinding[];
+  envPinVar: string;
+}): PilotUserAccount {
   const salt = crypto.randomBytes(16).toString('hex');
   const envSecret = process.env[params.envPinVar]?.trim();
-  const initialSecret =
-    envSecret && envSecret.length >= 6
-      ? envSecret
-      : crypto.randomBytes(12).toString('base64url');
-
-  bootstrapCollector[params.rotaryId] = initialSecret;
+  const hasExplicitEnvSecret = Boolean(envSecret && envSecret.length >= 6);
+  const initialSecret = hasExplicitEnvSecret
+    ? envSecret!
+    : crypto.randomBytes(24).toString('base64url');
 
   return {
     memberId: params.memberId,
@@ -335,143 +332,98 @@ function buildProvisionedAccount(
     clubMemberships: params.clubMemberships,
     passwordSalt: salt,
     passwordHash: hashPinWithSalt(initialSecret, salt),
+    activated: hasExplicitEnvSecret,
     webauthnCredentials: [],
   };
 }
 
-export function createInitialPilotAccounts(
-  bootstrapFileDir?: string
-): PilotUserAccount[] {
-  const bootstrapSecrets: Record<string, string> = {};
-
-  const accounts: PilotUserAccount[] = [
-    buildProvisionedAccount(
-      {
-        memberId: 'm-rifat',
-        rotaryId: 'TR-2420-88412',
-        fullName: 'Rtn. Rifat Akın',
-        email: 'rifat.akin@galatarotary.org',
-        role: 'uye',
-        clubId: 'club-galata',
-        // Strictly Galata member ONLY (#70)
-        clubMemberships: [{ clubId: 'club-galata', role: 'uye' }],
-        envPinVar: 'ROTACLUB_PIN_UYE',
-      },
-      bootstrapSecrets
-    ),
-    buildProvisionedAccount(
-      {
-        memberId: 'm-nazli',
-        rotaryId: 'TR-2420-81024',
-        fullName: 'Rtn. Av. Nazlı Denizmen',
-        email: 'sekreter@galatarotary.org',
-        role: 'sekreter',
-        clubId: 'club-galata',
-        // Strictly Galata secretary ONLY (#70)
-        clubMemberships: [{ clubId: 'club-galata', role: 'sekreter' }],
-        envPinVar: 'ROTACLUB_PIN_SEKRETER',
-      },
-      bootstrapSecrets
-    ),
-    buildProvisionedAccount(
-      {
-        memberId: 'm-levent',
-        rotaryId: 'TR-2420-79310',
-        fullName: 'Rtn. YMM Levent Soydan',
-        email: 'sayman@galatarotary.org',
-        role: 'sayman',
-        clubId: 'club-galata',
-        // Strictly Galata treasurer ONLY (#70)
-        clubMemberships: [{ clubId: 'club-galata', role: 'sayman' }],
-        envPinVar: 'ROTACLUB_PIN_SAYMAN',
-      },
-      bootstrapSecrets
-    ),
-    buildProvisionedAccount(
-      {
-        memberId: 'm-emre',
-        rotaryId: 'TR-2420-74105',
-        fullName: 'Rtn. Mimar Emre Karaca',
-        email: 'baskan@galatarotary.org',
-        role: 'baskan',
-        clubId: 'club-galata',
-        // Issue #70 Fix: Galata President is 'baskan' ONLY in club-galata!
-        // Does NOT hold 'baskan' over Karaköy or Maçka!
-        clubMemberships: [{ clubId: 'club-galata', role: 'baskan' }],
-        envPinVar: 'ROTACLUB_PIN_BASKAN',
-      },
-      bootstrapSecrets
-    ),
-    buildProvisionedAccount(
-      {
-        memberId: 'm-club-karakoy-baskan',
-        rotaryId: 'TR-2420-KRK-01',
-        fullName: 'Rtn. Karaköy Rotary Kulübü Başkanı',
-        email: 'baskan@karakoyrotary.org',
-        role: 'baskan',
-        clubId: 'club-karakoy',
-        // Strictly Karaköy President ONLY (#70)
-        clubMemberships: [{ clubId: 'club-karakoy', role: 'baskan' }],
-        envPinVar: 'ROTACLUB_PIN_KARAKOY_BASKAN',
-      },
-      bootstrapSecrets
-    ),
-    buildProvisionedAccount(
-      {
-        memberId: 'm-club-macka-baskan',
-        rotaryId: 'TR-2420-MCK-01',
-        fullName: 'Rtn. Maçka Rotary Kulübü Başkanı',
-        email: 'baskan@mackarotary.org',
-        role: 'baskan',
-        clubId: 'club-macka',
-        // Strictly Maçka President ONLY (#70)
-        clubMemberships: [{ clubId: 'club-macka', role: 'baskan' }],
-        envPinVar: 'ROTACLUB_PIN_MACKA_BASKAN',
-      },
-      bootstrapSecrets
-    ),
-    buildProvisionedAccount(
-      {
-        memberId: 'm-district-gov',
-        rotaryId: 'TR-2420-GOV-01',
-        fullName: 'Rtn. GDB Bölge Guvernörü',
-        email: 'guvernor@rotary2420.org',
-        role: 'baskan',
-        clubId: 'club-district2420',
-        // Issue #70 Fix: District Governor is 'baskan' in club-district2420,
-        // and only visiting 'uye' (observer) when switching into individual clubs!
-        clubMemberships: [
-          { clubId: 'club-district2420', role: 'baskan' },
-          { clubId: 'club-galata', role: 'uye' },
-          { clubId: 'club-karakoy', role: 'uye' },
-          { clubId: 'club-macka', role: 'uye' },
-        ],
-        envPinVar: 'ROTACLUB_PIN_DISTRICT_GOV',
-      },
-      bootstrapSecrets
-    ),
+export function createInitialPilotAccounts(): PilotUserAccount[] {
+  return [
+    buildProvisionedAccount({
+      memberId: 'm-rifat',
+      rotaryId: 'TR-2420-88412',
+      fullName: 'Rtn. Rifat Akın',
+      email: 'rifat.akin@galatarotary.org',
+      role: 'uye',
+      clubId: 'club-galata',
+      // Strictly Galata member ONLY (#70)
+      clubMemberships: [{ clubId: 'club-galata', role: 'uye' }],
+      envPinVar: 'ROTACLUB_PIN_UYE',
+    }),
+    buildProvisionedAccount({
+      memberId: 'm-nazli',
+      rotaryId: 'TR-2420-81024',
+      fullName: 'Rtn. Av. Nazlı Denizmen',
+      email: 'sekreter@galatarotary.org',
+      role: 'sekreter',
+      clubId: 'club-galata',
+      // Strictly Galata secretary ONLY (#70)
+      clubMemberships: [{ clubId: 'club-galata', role: 'sekreter' }],
+      envPinVar: 'ROTACLUB_PIN_SEKRETER',
+    }),
+    buildProvisionedAccount({
+      memberId: 'm-levent',
+      rotaryId: 'TR-2420-79310',
+      fullName: 'Rtn. YMM Levent Soydan',
+      email: 'sayman@galatarotary.org',
+      role: 'sayman',
+      clubId: 'club-galata',
+      // Strictly Galata treasurer ONLY (#70)
+      clubMemberships: [{ clubId: 'club-galata', role: 'sayman' }],
+      envPinVar: 'ROTACLUB_PIN_SAYMAN',
+    }),
+    buildProvisionedAccount({
+      memberId: 'm-emre',
+      rotaryId: 'TR-2420-74105',
+      fullName: 'Rtn. Mimar Emre Karaca',
+      email: 'baskan@galatarotary.org',
+      role: 'baskan',
+      clubId: 'club-galata',
+      // Issue #70 Fix: Galata President is 'baskan' ONLY in club-galata!
+      // Does NOT hold 'baskan' over Karaköy or Maçka!
+      clubMemberships: [{ clubId: 'club-galata', role: 'baskan' }],
+      envPinVar: 'ROTACLUB_PIN_BASKAN',
+    }),
+    buildProvisionedAccount({
+      memberId: 'm-club-karakoy-baskan',
+      rotaryId: 'TR-2420-KRK-01',
+      fullName: 'Rtn. Karaköy Rotary Kulübü Başkanı',
+      email: 'baskan@karakoyrotary.org',
+      role: 'baskan',
+      clubId: 'club-karakoy',
+      // Strictly Karaköy President ONLY (#70)
+      clubMemberships: [{ clubId: 'club-karakoy', role: 'baskan' }],
+      envPinVar: 'ROTACLUB_PIN_KARAKOY_BASKAN',
+    }),
+    buildProvisionedAccount({
+      memberId: 'm-club-macka-baskan',
+      rotaryId: 'TR-2420-MCK-01',
+      fullName: 'Rtn. Maçka Rotary Kulübü Başkanı',
+      email: 'baskan@mackarotary.org',
+      role: 'baskan',
+      clubId: 'club-macka',
+      // Strictly Maçka President ONLY (#70)
+      clubMemberships: [{ clubId: 'club-macka', role: 'baskan' }],
+      envPinVar: 'ROTACLUB_PIN_MACKA_BASKAN',
+    }),
+    buildProvisionedAccount({
+      memberId: 'm-district-gov',
+      rotaryId: 'TR-2420-GOV-01',
+      fullName: 'Rtn. GDB Bölge Guvernörü',
+      email: 'guvernor@rotary2420.org',
+      role: 'baskan',
+      clubId: 'club-district2420',
+      // Issue #70 Fix: District Governor is 'baskan' in club-district2420,
+      // and only visiting 'uye' (observer) when switching into individual clubs!
+      clubMemberships: [
+        { clubId: 'club-district2420', role: 'baskan' },
+        { clubId: 'club-galata', role: 'uye' },
+        { clubId: 'club-karakoy', role: 'uye' },
+        { clubId: 'club-macka', role: 'uye' },
+      ],
+      envPinVar: 'ROTACLUB_PIN_DISTRICT_GOV',
+    }),
   ];
-
-  const targetDir =
-    bootstrapFileDir || path.resolve(process.cwd(), '.aistudio');
-  try {
-    if (!fs.existsSync(targetDir)) {
-      fs.mkdirSync(targetDir, { recursive: true });
-    }
-    const bootstrapPath = path.join(
-      targetDir,
-      '.bootstrap_credentials.json'
-    );
-    fs.writeFileSync(
-      bootstrapPath,
-      JSON.stringify(bootstrapSecrets, null, 2),
-      { encoding: 'utf8', mode: 0o600 }
-    );
-  } catch {
-    // Ignore if filesystem is read-only
-  }
-
-  return accounts;
 }
 
 const runtimeRevokedJtis = new Set<string>();
@@ -670,6 +622,7 @@ export function authenticatePilotCredentials(
       ok: false;
       reason:
         | 'INVALID_CREDENTIALS'
+        | 'ACCOUNT_ACTIVATION_REQUIRED'
         | 'UNKNOWN_CLUB_TENANT'
         | 'CLUB_MEMBERSHIP_FORBIDDEN';
     } {
@@ -680,6 +633,10 @@ export function authenticatePilotCredentials(
   const account = findPilotAccount(identifier, accounts);
   if (!account) {
     return { ok: false, reason: 'INVALID_CREDENTIALS' };
+  }
+
+  if (account.activated === false) {
+    return { ok: false, reason: 'ACCOUNT_ACTIVATION_REQUIRED' };
   }
 
   const computedHash = hashPinWithSalt(
@@ -1062,12 +1019,13 @@ export function createTenantClubState(
   };
 }
 
-export function createDefaultMultiTenantDb(
-  bootstrapFileDir?: string
-): MultiTenantDatabaseFile {
+export function createDefaultMultiTenantDb(): MultiTenantDatabaseFile {
+  const accounts = createInitialPilotAccounts();
+  const baskanAcc = accounts.find((a) => a.memberId === 'm-emre');
   return {
     schemaVersion: '5.3.0-hardened',
     updatedAt: new Date().toISOString(),
+    bootstrapClaimed: Boolean(baskanAcc?.activated),
     tenants: {
       'club-galata': createTenantClubState('club-galata', 'Galata Rotary Kulübü'),
       'club-karakoy': createTenantClubState(
@@ -1080,7 +1038,7 @@ export function createDefaultMultiTenantDb(
         'UR 2420. Bölge Guvernörlüğü'
       ),
     },
-    accounts: createInitialPilotAccounts(bootstrapFileDir),
+    accounts,
     revokedTokenJtis: [],
   };
 }
@@ -1092,10 +1050,9 @@ export function createDefaultMultiTenantDb(
  * audit hash chains, rotated PINs, and registered WebAuthn credentials.
  */
 export function migrateDatabaseLossless(
-  rawParsed: Record<string, unknown>,
-  bootstrapFileDir?: string
+  rawParsed: Record<string, unknown>
 ): MultiTenantDatabaseFile {
-  const defaults = createDefaultMultiTenantDb(bootstrapFileDir);
+  const defaults = createDefaultMultiTenantDb();
   const rawTenants =
     rawParsed.tenants && typeof rawParsed.tenants === 'object'
       ? (rawParsed.tenants as Record<string, Partial<TenantClubDatabaseState>>)
@@ -1223,6 +1180,10 @@ export function migrateDatabaseLossless(
         clubMemberships: defAcc.clubMemberships,
         passwordSalt: rawAcc.passwordSalt || defAcc.passwordSalt,
         passwordHash: rawAcc.passwordHash || defAcc.passwordHash,
+        activated:
+          typeof rawAcc.activated === 'boolean'
+            ? rawAcc.activated
+            : Boolean(rawAcc.passwordHash) || defAcc.activated,
         webauthnCredentials: Array.isArray(rawAcc.webauthnCredentials)
           ? rawAcc.webauthnCredentials.filter(
               (c): c is WebAuthnCredentialRecord =>
@@ -1255,6 +1216,7 @@ export function migrateDatabaseLossless(
           : [{ clubId: safeClubId, role: rawAcc.role as ClubRole }],
         passwordSalt: rawAcc.passwordSalt,
         passwordHash: rawAcc.passwordHash,
+        activated: rawAcc.activated !== false,
         webauthnCredentials: Array.isArray(rawAcc.webauthnCredentials)
           ? rawAcc.webauthnCredentials.filter(
               (c): c is WebAuthnCredentialRecord =>
@@ -1265,9 +1227,16 @@ export function migrateDatabaseLossless(
     }
   }
 
+  const migratedBaskan = migratedAccounts.find((a) => a.memberId === 'm-emre');
+  const bootstrapClaimed =
+    typeof rawParsed.bootstrapClaimed === 'boolean'
+      ? rawParsed.bootstrapClaimed
+      : Boolean(rawAccounts.length > 0 || migratedBaskan?.activated);
+
   return {
     schemaVersion: '5.3.0-hardened',
     updatedAt: new Date().toISOString(),
+    bootstrapClaimed,
     tenants: migratedTenants,
     accounts: migratedAccounts,
     revokedTokenJtis: Array.isArray(rawParsed.revokedTokenJtis)
@@ -1277,8 +1246,8 @@ export function migrateDatabaseLossless(
 }
 
 /**
- * Redacts sensitive club-wide financial data and applies strict KVKK PII masking
- * when a regular 'uye' fetches the club state (#12, #16, #20).
+ * Redacts sensitive club-wide financial, governance, scholarship, and audit data
+ * with strict field-level access controls when a regular 'uye' fetches the club state (#12, #16, #20, #76).
  */
 export function redactStateForRole(
   tenantState: TenantClubDatabaseState,
@@ -1303,6 +1272,7 @@ export function redactStateForRole(
         ? m.email
         : maskEmailForKvkk(m.email, shouldMaskSensitivePii),
       bloodGroup: isSelf || isPrivilegedBoard ? m.bloodGroup : 'KVKK Gizli',
+      birthday: isSelf || isPrivilegedBoard ? m.birthday : 'KVKK Gizli',
       spouseName: isSelf || isPrivilegedBoard ? m.spouseName : undefined,
       weddingAnniversary:
         isSelf || isPrivilegedBoard ? m.weddingAnniversary : undefined,
@@ -1325,12 +1295,38 @@ export function redactStateForRole(
 
   const sanitizedTreasuryLedger = isPrivilegedFinance
     ? tenantState.treasuryLedger
-    : tenantState.treasuryLedger.map((entry) => ({
-        ...entry,
-        counterparty:
-          entry.type === 'Gelir' && entry.counterparty.startsWith('Rtn.')
-            ? 'Rtn. *** (KVKK Maskeli)'
-            : entry.counterparty,
+    : [];
+
+  const sanitizedScholars: ScholarStudent[] = isPrivilegedBoard
+    ? tenantState.scholars
+    : tenantState.scholars.map((s) => {
+        const parts = s.fullName.trim().split(/\s+/);
+        const maskedName =
+          parts.length > 1
+            ? `${parts[0]} ${parts[parts.length - 1].charAt(0)}.`
+            : s.fullName;
+        return {
+          ...s,
+          fullName: maskedName,
+          mentorMember: 'Burs Komitesi Mentörü (KVKK Korumalı)',
+          statusNote: 'Burs Programı Aktif',
+        };
+      });
+
+  const sanitizedBoardResolutions: BoardResolutionItem[] = isPrivilegedBoard
+    ? tenantState.boardResolutions
+    : tenantState.boardResolutions.map((br) => ({
+        ...br,
+        summary:
+          'Yönetim Kurulu Karar Defteri tam metni yalnızca YK üyelerine açıktır.',
+        signedBy: 'Yönetim Kurulu (Yetki Korumalı)',
+      }));
+
+  const sanitizedGuestMakeupCards: GuestRotaryMakeupCard[] = isPrivilegedBoard
+    ? tenantState.guestMakeupCards
+    : tenantState.guestMakeupCards.map((card) => ({
+        ...card,
+        guestEmail: maskEmailForKvkk(card.guestEmail, true),
       }));
 
   const chainVerification = verifyAuditChain(auditLedger, tenantState.clubId);
@@ -1342,7 +1338,11 @@ export function redactStateForRole(
     overdueMembers: sanitizedOverdue,
     treasuryLedger: sanitizedTreasuryLedger,
     bankStatements: isPrivilegedFinance ? tenantState.bankStatements : [],
-    auditLogs: auditLedger,
+    scholars: sanitizedScholars,
+    boardResolutions: sanitizedBoardResolutions,
+    guestMakeupCards: sanitizedGuestMakeupCards,
+    auditLedger: isPrivilegedBoard ? auditLedger : [],
+    auditLogs: isPrivilegedBoard ? auditLedger : [],
     auditVerification: chainVerification,
     redactedForRole: user.role,
     kvkkPhoneProtected: shouldMaskPhones,
@@ -1353,7 +1353,8 @@ export function redactStateForRole(
 
 /**
  * Atomic File Persistence with Write-Ahead Temp File + fsync + rename
- * Enforces mandatory Compare-And-Swap (CAS) revision locking and lossless schema migration (#14, #18, #19, #70).
+ * Enforces mandatory Compare-And-Swap (CAS) revision locking, automatic discovery
+ * of v5.2/v5.1/v5.0/v4 database files, and lossless schema migration (#14, #18, #19, #70).
  */
 export class AtomicMultiTenantStore {
   private dbDir: string;
@@ -1374,12 +1375,72 @@ export class AtomicMultiTenantStore {
     }
   }
 
+  private findLegacyDatabaseFile(): string | null {
+    const baseName = path.basename(this.dbFile);
+    const candidates: string[] = [];
+
+    if (baseName.includes('_v5_3')) {
+      candidates.push(
+        path.join(this.dbDir, baseName.replace('_v5_3', '_v5_2')),
+        path.join(this.dbDir, baseName.replace('_v5_3', '_v5_1')),
+        path.join(this.dbDir, baseName.replace('_v5_3', '_v5')),
+        path.join(this.dbDir, baseName.replace('_v5_3', '_v4'))
+      );
+    }
+
+    candidates.push(
+      path.join(this.dbDir, 'rotaclub_pilot_v5_2_db.json'),
+      path.join(this.dbDir, 'rotaclub_pilot_v5_1_db.json'),
+      path.join(this.dbDir, 'rotaclub_pilot_v5_db.json'),
+      path.join(this.dbDir, 'rotaclub_pilot_v4_db.json')
+    );
+
+    for (const candidate of candidates) {
+      if (candidate !== this.dbFile && fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
   private loadFromDisk(): MultiTenantDatabaseFile {
     if (!fs.existsSync(this.dbDir)) {
       fs.mkdirSync(this.dbDir, { recursive: true });
     }
     if (!fs.existsSync(this.dbFile)) {
-      const initial = createDefaultMultiTenantDb(this.dbDir);
+      const legacyFile = this.findLegacyDatabaseFile();
+      if (legacyFile) {
+        const legacyRaw = fs.readFileSync(legacyFile, 'utf-8');
+        let legacyParsed: Record<string, unknown>;
+        try {
+          legacyParsed = JSON.parse(legacyRaw) as Record<string, unknown>;
+        } catch (err) {
+          const corruptBak = `${legacyFile}.corrupt.${Date.now()}.bak`;
+          fs.copyFileSync(legacyFile, corruptBak);
+          throw new Error(
+            `CORRUPT_DATABASE_FILE: Eski sürüm veritabanı dosyası (${legacyFile}) bozulmuş, yedeklendi (${corruptBak}): ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+        }
+        const oldVer = String(legacyParsed.schemaVersion || 'v5_2').replace(
+          /[^a-zA-Z0-9._-]/g,
+          '_'
+        );
+        fs.copyFileSync(
+          legacyFile,
+          `${legacyFile}.pre-migration-${oldVer}.bak`
+        );
+        fs.copyFileSync(
+          legacyFile,
+          `${this.dbFile}.pre-migration-${oldVer}.bak`
+        );
+        const migrated = migrateDatabaseLossless(legacyParsed);
+        this.atomicWriteToDisk(migrated);
+        return migrated;
+      }
+
+      const initial = createDefaultMultiTenantDb();
       this.atomicWriteToDisk(initial);
       return initial;
     }
@@ -1412,7 +1473,7 @@ export class AtomicMultiTenantStore {
       const bakFile = `${this.dbFile}.pre-migration-${oldVer}.bak`;
       fs.copyFileSync(this.dbFile, bakFile);
 
-      const migrated = migrateDatabaseLossless(parsed, this.dbDir);
+      const migrated = migrateDatabaseLossless(parsed);
       this.atomicWriteToDisk(migrated);
       return migrated;
     }
@@ -1440,6 +1501,155 @@ export class AtomicMultiTenantStore {
 
   public getAccounts(): PilotUserAccount[] {
     return this.state.accounts;
+  }
+
+  public getBootstrapStatus() {
+    const baskanAcc = this.state.accounts.find((a) => a.memberId === 'm-emre');
+    return {
+      bootstrapClaimRequired: !this.state.bootstrapClaimed,
+      targetAccount: {
+        memberId: baskanAcc?.memberId || 'm-emre',
+        rotaryId: baskanAcc?.rotaryId || 'TR-2420-74105',
+        fullName: baskanAcc?.fullName || 'Rtn. Mimar Emre Karaca',
+        email: baskanAcc?.email || 'baskan@galatarotary.org',
+        role: 'baskan' as const,
+        clubId: 'club-galata' as const,
+      },
+    };
+  }
+
+  /**
+   * One-Time Initial Admin Activation Flow (#22, #76):
+   * Allows the club owner to claim and set strong credentials for the initial admin account
+   * (and optional initial club role accounts) ONCE on a fresh installation without needing
+   * environment variables or server file access. Permanently locks after first claim.
+   */
+  public claimInitialAdminBootstrap(params: {
+    newAdminPin: string;
+    rolePins?: Partial<
+      Record<
+        | 'uye'
+        | 'sekreter'
+        | 'sayman'
+        | 'karakoyBaskan'
+        | 'mackaBaskan'
+        | 'districtGov',
+        string
+      >
+    >;
+  }):
+    | { ok: true; account: PilotUserAccount }
+    | { ok: false; error: string; message: string } {
+    if (this.state.bootstrapClaimed) {
+      return {
+        ok: false,
+        error: 'BOOTSTRAP_ALREADY_CLAIMED',
+        message:
+          'İlk yönetici aktivasyonu daha önce tamamlanmış; bu tek kullanımlık kurulum akışı kalıcı olarak kapatılmıştır.',
+      };
+    }
+
+    const strength = validateStrongCredential(params.newAdminPin);
+    if (!strength.valid) {
+      return {
+        ok: false,
+        error: 'WEAK_PIN_REJECTED',
+        message: strength.reason!,
+      };
+    }
+
+    const rolePinMap: Record<string, string> = {
+      uye: 'm-rifat',
+      sekreter: 'm-nazli',
+      sayman: 'm-levent',
+      karakoyBaskan: 'm-club-karakoy-baskan',
+      mackaBaskan: 'm-club-macka-baskan',
+      districtGov: 'm-district-gov',
+    };
+
+    if (params.rolePins && typeof params.rolePins === 'object') {
+      for (const [, pinVal] of Object.entries(params.rolePins)) {
+        if (pinVal && String(pinVal).trim()) {
+          const check = validateStrongCredential(String(pinVal));
+          if (!check.valid) {
+            return {
+              ok: false,
+              error: 'WEAK_PIN_REJECTED',
+              message: check.reason!,
+            };
+          }
+        }
+      }
+    }
+
+    const baskanAcc = this.state.accounts.find((a) => a.memberId === 'm-emre');
+    if (!baskanAcc) {
+      return {
+        ok: false,
+        error: 'ACCOUNT_NOT_FOUND',
+        message: 'Başlangıç yönetici hesabı bulunamadı.',
+      };
+    }
+
+    const adminSalt = crypto.randomBytes(16).toString('hex');
+    baskanAcc.passwordSalt = adminSalt;
+    baskanAcc.passwordHash = hashPinWithSalt(
+      params.newAdminPin.trim(),
+      adminSalt
+    );
+    baskanAcc.activated = true;
+
+    if (params.rolePins && typeof params.rolePins === 'object') {
+      for (const [roleKey, pinVal] of Object.entries(params.rolePins)) {
+        const targetMemberId = rolePinMap[roleKey];
+        if (!targetMemberId || !pinVal || !String(pinVal).trim()) continue;
+        const acc = this.state.accounts.find(
+          (a) => a.memberId === targetMemberId
+        );
+        if (acc) {
+          const s = crypto.randomBytes(16).toString('hex');
+          acc.passwordSalt = s;
+          acc.passwordHash = hashPinWithSalt(String(pinVal).trim(), s);
+          acc.activated = true;
+        }
+      }
+    }
+
+    this.state.bootstrapClaimed = true;
+    this.state.updatedAt = new Date().toISOString();
+    this.atomicWriteToDisk(this.state);
+    return { ok: true, account: baskanAcc };
+  }
+
+  public adminSetAccountPin(
+    targetIdentifier: string,
+    newPin: string
+  ):
+    | { ok: true; account: PilotUserAccount }
+    | { ok: false; error: string; message: string } {
+    const strength = validateStrongCredential(newPin);
+    if (!strength.valid) {
+      return {
+        ok: false,
+        error: 'WEAK_PIN_REJECTED',
+        message: strength.reason!,
+      };
+    }
+    const account = findPilotAccount(targetIdentifier, this.state.accounts);
+    if (!account) {
+      return {
+        ok: false,
+        error: 'ACCOUNT_NOT_FOUND',
+        message: 'Hedef üye hesabı bulunamadı.',
+      };
+    }
+    const salt = crypto.randomBytes(16).toString('hex');
+    account.passwordSalt = salt;
+    account.passwordHash = hashPinWithSalt(newPin.trim(), salt);
+    account.activated = true;
+    this.state.updatedAt = new Date().toISOString();
+    this.atomicWriteToDisk(this.state);
+    return { ok: true, account };
   }
 
   public provisionNewMemberAccount(params: {
@@ -1487,6 +1697,7 @@ export class AtomicMultiTenantStore {
       clubMemberships: [{ clubId: params.clubId, role: params.role }],
       passwordSalt: salt,
       passwordHash: hashPinWithSalt(params.initialPinOrPassword.trim(), salt),
+      activated: true,
       webauthnCredentials: [],
     };
 

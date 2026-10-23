@@ -98,6 +98,7 @@ export interface FinancialLineItem {
   totalAmount: number;
   paidAmount: number;
   dueDate: string;
+  idempotencyKey?: string;
 }
 
 export interface PaymentNotification {

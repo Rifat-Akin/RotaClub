@@ -6,6 +6,7 @@ import {
   KeyRound,
   Lock,
   ShieldCheck,
+  Sparkles,
 } from 'lucide-react';
 import { ClubRole } from '../types/rotary';
 import { RotaryWheelIcon } from './RotaryArtwork';
@@ -19,16 +20,6 @@ interface SplashLockScreenModalProps {
     authenticatedRotaryId?: string
   ) => void;
 }
-
-interface BrowserPasskeyEntry {
-  credentialId: string;
-  mode: 'hardware-webauthn' | 'webcrypto-p256';
-  keyPair?: CryptoKeyPair;
-  signCount: number;
-}
-
-// Registered passkeys for the current browser session
-const registeredBrowserPasskeys = new Map<string, BrowserPasskeyEntry>();
 
 const PILOT_ACCOUNT_PROFILES: {
   role: ClubRole;
@@ -86,21 +77,26 @@ function base64UrlToBytes(b64url: string): ArrayBuffer {
   return out.buffer;
 }
 
-function stringToBase64Url(str: string): string {
-  const bytes = new TextEncoder().encode(str);
-  return bytesToBase64Url(bytes);
-}
-
 /**
- * Registers a passkey on the server for an authenticated session (#12, #22).
- * Attempts standard W3C hardware WebAuthn (`navigator.credentials.create`) first,
- * and falls back to WebCrypto ECDSA P-256 when hardware authenticators are unavailable in iframe/headless environments.
+ * Hardware-Only W3C WebAuthn Passkey Enrollment (#12, #22, #76).
+ * Strictly requires genuine platform/hardware authenticator (`window.PublicKeyCredential` and `navigator.credentials.create`).
+ * Zero software WebCrypto fallback or client-synthesized authenticatorData flags in production!
  */
-async function registerPasskeyWithServer(
-  rotaryId: string,
+async function enrollHardwareWebAuthnPasskey(
   bearerToken: string
-): Promise<BrowserPasskeyEntry | null> {
-  if (typeof window === 'undefined') return null;
+): Promise<{ ok: true; credentialId: string } | { ok: false; message: string }> {
+  if (
+    typeof window === 'undefined' ||
+    typeof window.PublicKeyCredential === 'undefined' ||
+    !navigator.credentials ||
+    typeof navigator.credentials.create !== 'function'
+  ) {
+    return {
+      ok: false,
+      message:
+        'Bu tarayıcı veya ortam donanım tabanlı W3C WebAuthn (Face ID / Touch ID / Windows Hello) açık anahtar kaydını desteklemiyor.',
+    };
+  }
 
   const optionsRes = await fetch('/api/auth/webauthn-register-options', {
     method: 'POST',
@@ -109,108 +105,68 @@ async function registerPasskeyWithServer(
       Authorization: `Bearer ${bearerToken}`,
     },
   });
-  if (!optionsRes.ok) return null;
+  if (!optionsRes.ok) {
+    return {
+      ok: false,
+      message: 'WebAuthn kayıt seçenekleri sunucudan alınamadı.',
+    };
+  }
   const optionsData = await optionsRes.json();
 
-  // 1. Try W3C navigator.credentials.create (Platform/Hardware Authenticator)
-  if (
-    typeof window.PublicKeyCredential !== 'undefined' &&
-    navigator.credentials &&
-    typeof navigator.credentials.create === 'function'
-  ) {
-    try {
-      const createdCred = (await navigator.credentials.create({
-        publicKey: {
-          challenge: base64UrlToBytes(optionsData.challenge),
-          rp: optionsData.rp,
-          user: {
-            id: base64UrlToBytes(optionsData.user.id),
-            name: optionsData.user.name,
-            displayName: optionsData.user.displayName,
-          },
-          pubKeyCredParams: optionsData.pubKeyCredParams,
-          authenticatorSelection: {
-            userVerification: 'required',
-          },
-          timeout: optionsData.timeout || 30000,
-          attestation: 'none',
-        },
-      })) as PublicKeyCredential | null;
+  const createdCred = (await navigator.credentials.create({
+    publicKey: {
+      challenge: base64UrlToBytes(optionsData.challenge),
+      rp: optionsData.rp,
+      user: {
+        id: base64UrlToBytes(optionsData.user.id),
+        name: optionsData.user.name,
+        displayName: optionsData.user.displayName,
+      },
+      pubKeyCredParams: optionsData.pubKeyCredParams,
+      authenticatorSelection: {
+        userVerification: 'required',
+      },
+      timeout: optionsData.timeout || 30000,
+      attestation: 'none',
+    },
+  })) as PublicKeyCredential | null;
 
-      if (createdCred && createdCred.response) {
-        const attestationRes =
-          createdCred.response as AuthenticatorAttestationResponse & {
-            getPublicKey?: () => ArrayBuffer | null;
-          };
-        const spkiBuf =
-          typeof attestationRes.getPublicKey === 'function'
-            ? attestationRes.getPublicKey()
-            : null;
-
-        if (spkiBuf) {
-          const credentialId = bytesToBase64Url(
-            new Uint8Array(createdCred.rawId)
-          );
-          const clientDataJSON = bytesToBase64Url(
-            new Uint8Array(attestationRes.clientDataJSON)
-          );
-          const publicKeySpkiB64 = bytesToBase64Url(new Uint8Array(spkiBuf));
-
-          const verifyRes = await fetch('/api/auth/webauthn-register-verify', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${bearerToken}`,
-            },
-            body: JSON.stringify({
-              challengeId: optionsData.challengeId,
-              credentialId,
-              clientDataJSON,
-              publicKeySpkiB64,
-            }),
-          });
-          if (verifyRes.ok) {
-            const entry: BrowserPasskeyEntry = {
-              credentialId,
-              mode: 'hardware-webauthn',
-              signCount: 0,
-            };
-            registeredBrowserPasskeys.set(rotaryId, entry);
-            return entry;
-          }
-        }
-      }
-    } catch {
-      // If hardware authenticator is blocked by iframe policy or user environment, continue to WebCrypto P-256 fallback
-    }
+  if (!createdCred || !createdCred.response) {
+    return {
+      ok: false,
+      message: 'Donanım doğrulayıcı (Authenticator) yanıt döndürmedi.',
+    };
   }
 
-  // 2. WebCrypto ECDSA P-256 Cryptographic Fallback
-  if (!window.crypto || !window.crypto.subtle) return null;
+  const attestationRes =
+    createdCred.response as AuthenticatorAttestationResponse & {
+      getPublicKey?: () => ArrayBuffer | null;
+      getAuthenticatorData?: () => ArrayBuffer;
+    };
 
-  const keyPair = await window.crypto.subtle.generateKey(
-    { name: 'ECDSA', namedCurve: 'P-256' },
-    false,
-    ['sign', 'verify']
+  const spkiBuf =
+    typeof attestationRes.getPublicKey === 'function'
+      ? attestationRes.getPublicKey()
+      : null;
+  const authDataBuf =
+    typeof attestationRes.getAuthenticatorData === 'function'
+      ? attestationRes.getAuthenticatorData()
+      : null;
+
+  if (!spkiBuf || !authDataBuf) {
+    return {
+      ok: false,
+      message:
+        'Cihaz doğrulayıcısı SPKI açık anahtar veya authenticatorData verisini sağlamadı.',
+    };
+  }
+
+  const credentialId = bytesToBase64Url(new Uint8Array(createdCred.rawId));
+  const clientDataJSON = bytesToBase64Url(
+    new Uint8Array(attestationRes.clientDataJSON)
   );
-
-  const spkiBuffer = await window.crypto.subtle.exportKey(
-    'spki',
-    keyPair.publicKey
-  );
-  const publicKeySpkiB64 = bytesToBase64Url(new Uint8Array(spkiBuffer));
-
-  const randomCredBytes = window.crypto.getRandomValues(new Uint8Array(16));
-  const credentialId = bytesToBase64Url(randomCredBytes);
-
-  const clientDataJSON = stringToBase64Url(
-    JSON.stringify({
-      type: 'webauthn.create',
-      challenge: optionsData.challenge,
-      origin: window.location.origin,
-      crossOrigin: false,
-    })
-  );
+  const authenticatorData = bytesToBase64Url(new Uint8Array(authDataBuf));
+  const publicKeySpkiB64 = bytesToBase64Url(new Uint8Array(spkiBuf));
 
   const verifyRes = await fetch('/api/auth/webauthn-register-verify', {
     method: 'POST',
@@ -222,19 +178,20 @@ async function registerPasskeyWithServer(
       challengeId: optionsData.challengeId,
       credentialId,
       clientDataJSON,
+      authenticatorData,
       publicKeySpkiB64,
     }),
   });
-  if (!verifyRes.ok) return null;
+  const verifyData = await verifyRes.json();
+  if (!verifyRes.ok || !verifyData.ok) {
+    return {
+      ok: false,
+      message:
+        verifyData?.message || 'Donanım Passkey sunucu doğrulaması başarısız oldu.',
+    };
+  }
 
-  const entry: BrowserPasskeyEntry = {
-    credentialId,
-    mode: 'webcrypto-p256',
-    keyPair,
-    signCount: 0,
-  };
-  registeredBrowserPasskeys.set(rotaryId, entry);
-  return entry;
+  return { ok: true, credentialId };
 }
 
 export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
@@ -254,6 +211,11 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [webAuthnStatus, setWebAuthnStatus] = useState<string | null>(null);
 
+  // One-Time Initial Admin Activation State (#22, #76)
+  const [bootstrapRequired, setBootstrapRequired] = useState<boolean>(false);
+  const [newAdminPinInput, setNewAdminPinInput] = useState<string>('');
+  const [newBoardPinInput, setNewBoardPinInput] = useState<string>('');
+
   useEffect(() => {
     const preset =
       PILOT_ACCOUNT_PROFILES.find((a) => a.role === activeRole) ||
@@ -261,6 +223,17 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
     setSelectedRole(activeRole);
     setIdentifierInput(preset.rotaryId);
     setErrorMessage(null);
+
+    if (isOpen) {
+      fetch('/api/auth/bootstrap-status')
+        .then((r) => (r.ok ? r.json() : null))
+        .then((status) => {
+          if (status && typeof status.bootstrapClaimRequired === 'boolean') {
+            setBootstrapRequired(status.bootstrapClaimRequired);
+          }
+        })
+        .catch(() => {});
+    }
   }, [activeRole, isOpen]);
 
   if (!isOpen) return null;
@@ -280,16 +253,65 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
   };
 
   /**
+   * One-Time First-Admin Claim Handler (POST /api/auth/bootstrap-claim) (#22, #76)
+   */
+  const handleBootstrapClaim = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (authenticating || !kvkkAccepted) return;
+    if (!newAdminPinInput.trim()) {
+      setErrorMessage(
+        'Lütfen Dönem Başkanı (TR-2420-74105) için en az 6 karakterli güçlü bir kurumsal parola/PIN belirleyin.'
+      );
+      return;
+    }
+    setAuthenticating(true);
+    setErrorMessage(null);
+
+    try {
+      const cleanBoardPin = newBoardPinInput.trim();
+      const rolePins = cleanBoardPin
+        ? {
+            uye: cleanBoardPin,
+            sekreter: cleanBoardPin,
+            sayman: cleanBoardPin,
+          }
+        : undefined;
+
+      const res = await fetch('/api/auth/bootstrap-claim', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          newAdminPin: newAdminPinInput.trim(),
+          rolePins,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok || !data.token) {
+        setErrorMessage(
+          data?.message || 'İlk yönetici aktivasyonu tamamlanamadı.'
+        );
+        setAuthenticating(false);
+        return;
+      }
+
+      setBootstrapRequired(false);
+      setAuthenticating(false);
+      onUnlock(data.user.role as ClubRole, data.token, data.user.rotaryId);
+    } catch {
+      setErrorMessage('Sunucu kurulum servisine ulaşılamadı.');
+      setAuthenticating(false);
+    }
+  };
+
+  /**
    * Real Server Authentication via POST /api/auth/login (#22, #23)
-   * Validates Scrypt PIN hash on the server and automatically enrolls a
-   * W3C WebAuthn / ECDSA P-256 Passkey for subsequent assertions.
    */
   const handleServerAuthenticate = async (e: React.FormEvent) => {
     e.preventDefault();
     if (authenticating || !kvkkAccepted) return;
     if (!pinInput.trim()) {
       setErrorMessage(
-        'Lütfen kurumsal PIN şifrenizi girin veya kayıtlı WebAuthn Passkey ile doğrulama yapın.'
+        'Lütfen kurumsal PIN şifrenizi girin veya donanım WebAuthn Passkey ile doğrulama yapın.'
       );
       return;
     }
@@ -316,11 +338,8 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
         return;
       }
 
-      if (!registeredBrowserPasskeys.has(data.user.rotaryId)) {
-        await registerPasskeyWithServer(data.user.rotaryId, data.token).catch(
-          () => null
-        );
-      }
+      // Attempt hardware W3C WebAuthn Passkey enrollment if platform authenticator is available
+      await enrollHardwareWebAuthnPasskey(data.token).catch(() => null);
 
       setAuthenticating(false);
       onUnlock(data.user.role as ClubRole, data.token, data.user.rotaryId);
@@ -333,17 +352,28 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
   };
 
   /**
-   * Full End-to-End W3C WebAuthn / ECDSA P-256 Passkey Assertion (#12, #22)
+   * Strict Hardware-Only W3C WebAuthn Assertion (`navigator.credentials.get`) (#12, #22, #76)
+   * Never falls back to software keypairs or client-fabricated authenticatorData flags!
    */
   const handleWebAuthnVerify = async () => {
     if (!kvkkAccepted || authenticating) return;
     setErrorMessage(null);
 
-    const passkeyEntry = registeredBrowserPasskeys.get(identifierInput.trim());
+    if (
+      typeof window === 'undefined' ||
+      typeof window.PublicKeyCredential === 'undefined' ||
+      !navigator.credentials ||
+      typeof navigator.credentials.get !== 'function'
+    ) {
+      setErrorMessage(
+        'Gerçek cihaz doğrulaması zorunludur (#22): Bu tarayıcıda donanım W3C WebAuthn (Face ID / Touch ID / Windows Hello) bulunamadı.'
+      );
+      return;
+    }
 
     setAuthenticating(true);
     setWebAuthnStatus(
-      '1/2 · Sunucudan tek kullanımlık WebAuthn challenge alınıyor...'
+      '1/2 · Sunucudan tek kullanımlık donanım WebAuthn challenge alınıyor...'
     );
 
     try {
@@ -361,113 +391,60 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
           challengeData?.message || 'WebAuthn challenge oluşturulamadı.'
         );
         setAuthenticating(false);
+        setWebAuthnStatus(null);
         return;
       }
 
-      let credentialId = passkeyEntry?.credentialId || '';
-      let clientDataJSON = '';
-      let authenticatorData = '';
-      let signature = '';
-      let nextSignCount = (passkeyEntry?.signCount || 0) + 1;
-
-      // 1. If hardware W3C WebAuthn credential is available, call navigator.credentials.get
       if (
-        (!passkeyEntry || passkeyEntry.mode === 'hardware-webauthn') &&
-        typeof window.PublicKeyCredential !== 'undefined' &&
-        navigator.credentials &&
-        typeof navigator.credentials.get === 'function' &&
-        Array.isArray(challengeData.allowCredentials) &&
-        challengeData.allowCredentials.length > 0
+        !Array.isArray(challengeData.allowCredentials) ||
+        challengeData.allowCredentials.length === 0
       ) {
-        try {
-          const assertion = (await navigator.credentials.get({
-            publicKey: {
-              challenge: base64UrlToBytes(challengeData.challenge),
-              rpId: challengeData.rpId,
-              allowCredentials: challengeData.allowCredentials.map(
-                (c: { id: string; type: PublicKeyCredentialType }) => ({
-                  type: c.type,
-                  id: base64UrlToBytes(c.id),
-                })
-              ),
-              userVerification: 'required',
-              timeout: 30000,
-            },
-          })) as PublicKeyCredential | null;
-
-          if (assertion && assertion.response) {
-            const assertionRes =
-              assertion.response as AuthenticatorAssertionResponse;
-            credentialId = bytesToBase64Url(new Uint8Array(assertion.rawId));
-            clientDataJSON = bytesToBase64Url(
-              new Uint8Array(assertionRes.clientDataJSON)
-            );
-            authenticatorData = bytesToBase64Url(
-              new Uint8Array(assertionRes.authenticatorData)
-            );
-            signature = bytesToBase64Url(new Uint8Array(assertionRes.signature));
-          }
-        } catch {
-          // Fallback to WebCrypto if available
-        }
+        setErrorMessage(
+          'Bu hesap için sunucuda kayıtlı donanım WebAuthn Passkey bulunamadı. Lütfen önce Kurumsal PIN ile giriş yaparak cihazınızı kaydedin.'
+        );
+        setAuthenticating(false);
+        setWebAuthnStatus(null);
+        return;
       }
 
-      // 2. If WebCrypto P-256 keyPair is registered for this session, sign the challenge
-      if (!signature) {
-        if (!passkeyEntry || !passkeyEntry.keyPair) {
-          setErrorMessage(
-            'Bu tarayıcı oturumunda kayıtlı W3C WebAuthn / ECDSA P-256 Passkey bulunamadı. Lütfen önce Kurumsal PIN ile giriş yaparak cihaz açık anahtarını (SPKI) kaydedin.'
-          );
-          setAuthenticating(false);
-          return;
-        }
+      const assertion = (await navigator.credentials.get({
+        publicKey: {
+          challenge: base64UrlToBytes(challengeData.challenge),
+          rpId: challengeData.rpId,
+          allowCredentials: challengeData.allowCredentials.map(
+            (c: { id: string; type: PublicKeyCredentialType }) => ({
+              type: c.type,
+              id: base64UrlToBytes(c.id),
+            })
+          ),
+          userVerification: 'required',
+          timeout: 30000,
+        },
+      })) as PublicKeyCredential | null;
 
-        const clientDataObj = {
-          type: 'webauthn.get',
-          challenge: challengeData.challenge,
-          origin: window.location.origin,
-          crossOrigin: false,
-        };
-        const clientDataBytes = new TextEncoder().encode(
-          JSON.stringify(clientDataObj)
+      if (!assertion || !assertion.response) {
+        setErrorMessage(
+          'Donanım doğrulaması tamamlanamadı. Yazılımsal anahtar yedeklemesi güvenlik politikası gereği devre dışıdır.'
         );
-        clientDataJSON = bytesToBase64Url(clientDataBytes);
-
-        const rpIdBytes = new TextEncoder().encode(
-          challengeData.rpId || window.location.hostname || 'localhost'
-        );
-        const rpIdHashBuffer = await window.crypto.subtle.digest(
-          'SHA-256',
-          rpIdBytes
-        );
-        const authDataBytes = new Uint8Array(37);
-        authDataBytes.set(new Uint8Array(rpIdHashBuffer), 0);
-        authDataBytes[32] = 0x05; // UP (0x01) | UV (0x04)
-
-        nextSignCount = passkeyEntry.signCount + 1;
-        const view = new DataView(authDataBytes.buffer);
-        view.setUint32(33, nextSignCount, false);
-        authenticatorData = bytesToBase64Url(authDataBytes);
-
-        const clientDataHashBuffer = await window.crypto.subtle.digest(
-          'SHA-256',
-          clientDataBytes
-        );
-        const signedData = new Uint8Array(37 + 32);
-        signedData.set(authDataBytes, 0);
-        signedData.set(new Uint8Array(clientDataHashBuffer), 37);
-
-        const rawSignatureBuffer = await window.crypto.subtle.sign(
-          { name: 'ECDSA', hash: 'SHA-256' },
-          passkeyEntry.keyPair.privateKey,
-          signedData
-        );
-        signature = bytesToBase64Url(new Uint8Array(rawSignatureBuffer));
-        credentialId = passkeyEntry.credentialId;
+        setAuthenticating(false);
+        setWebAuthnStatus(null);
+        return;
       }
+
+      const assertionRes = assertion.response as AuthenticatorAssertionResponse;
+      const credentialId = bytesToBase64Url(new Uint8Array(assertion.rawId));
+      const clientDataJSON = bytesToBase64Url(
+        new Uint8Array(assertionRes.clientDataJSON)
+      );
+      const authenticatorData = bytesToBase64Url(
+        new Uint8Array(assertionRes.authenticatorData)
+      );
+      const signature = bytesToBase64Url(
+        new Uint8Array(assertionRes.signature)
+      );
 
       setWebAuthnStatus(
-        `2/2 · W3C WebAuthn P-256 İmzası ve Challenge #${String(
+        `2/2 · Donanım WebAuthn P-256 İmzası ve Challenge #${String(
           challengeData.challengeId
         ).slice(0, 8)} sunucuda doğrulanıyor...`
       );
@@ -490,27 +467,25 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
           verifyData?.message || 'WebAuthn sunucu doğrulaması başarısız oldu.'
         );
         setAuthenticating(false);
+        setWebAuthnStatus(null);
         return;
       }
 
-      if (passkeyEntry) {
-        passkeyEntry.signCount = nextSignCount;
-      }
       setAuthenticating(false);
+      setWebAuthnStatus(null);
       onUnlock(
         verifyData.user.role as ClubRole,
         verifyData.token,
         verifyData.user.rotaryId
       );
     } catch {
-      setErrorMessage('WebAuthn doğrulama servisine ulaşılamadı.');
+      setErrorMessage(
+        'Gerçek cihaz doğrulaması (Face ID / Touch ID / Güvenlik Anahtarı) iptal edildi veya başarısız oldu. Yazılımsal alternatif güvenlik gereği kapalıdır.'
+      );
       setAuthenticating(false);
+      setWebAuthnStatus(null);
     }
   };
-
-  const hasRegisteredPasskey = registeredBrowserPasskeys.has(
-    identifierInput.trim()
-  );
 
   return (
     <div
@@ -526,11 +501,11 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
         </span>
         <div className="flex items-center gap-1.5 text-[#F7A81B]">
           <Lock className="w-3.5 h-3.5" />
-          <span>HMAC-SHA256 + W3C WebAuthn P-256</span>
+          <span>HMAC-SHA256 + Donanım WebAuthn P-256</span>
         </div>
       </div>
 
-      {/* Center Brand & Real Server Login Form */}
+      {/* Center Brand & Real Server Login / First-Run Activation Form */}
       <div className="max-w-md w-full text-center space-y-4 my-auto py-3">
         <div className="relative mx-auto w-20 h-20 flex items-center justify-center">
           <div className="w-16 h-16 rounded-3xl bg-white/10 border border-[#F7A81B]/60 backdrop-blur-md flex items-center justify-center text-[#F7A81B] shadow-2xl">
@@ -549,146 +524,218 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
             RotaClub Kimlik Doğrulama
           </h1>
           <p className="text-xs text-slate-200 font-medium">
-            Gerçek Sunucu Oturumu (CSPRNG Scrypt + W3C WebAuthn Passkey + HMAC-SHA256)
+            Gerçek Sunucu Oturumu (CSPRNG Scrypt + Donanım W3C WebAuthn + HMAC-SHA256)
           </p>
         </div>
 
-        <form
-          onSubmit={handleServerAuthenticate}
-          className="p-5 rounded-3xl bg-white/10 border border-white/15 backdrop-blur-md space-y-3.5 text-left"
-        >
-          {/* Preset Pilot Role Selector */}
-          <div className="space-y-1">
-            <label
-              htmlFor="splash-account-select"
-              className="block text-[11px] font-semibold text-slate-300 flex items-center gap-1"
-            >
-              <KeyRound className="w-3.5 h-3.5 text-[#F7A81B]" />
-              <span>Yetkili Kulüp Hesabını Seçin:</span>
-            </label>
-            <select
-              id="splash-account-select"
-              value={selectedRole}
-              onChange={(e) =>
-                handleSelectPresetAccount(e.target.value as ClubRole)
-              }
-              className="w-full text-xs bg-[#09152B]/90 border border-white/20 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-[#F7A81B]"
-            >
-              {PILOT_ACCOUNT_PROFILES.map((acc) => (
-                <option key={acc.role} value={acc.role}>
-                  {acc.name} — {acc.title} ({acc.rotaryId})
-                </option>
-              ))}
-            </select>
-          </div>
+        {bootstrapRequired ? (
+          <form
+            onSubmit={handleBootstrapClaim}
+            className="p-5 rounded-3xl bg-white/10 border border-[#F7A81B]/50 backdrop-blur-md space-y-3.5 text-left"
+          >
+            <div className="flex items-center gap-2 text-xs font-bold text-[#F7A81B]">
+              <Sparkles className="w-4 h-4 shrink-0" />
+              <span>Tek Kullanımlık İlk Yönetici Aktivasyonu (İlk Kurulum)</span>
+            </div>
+            <p className="text-[11px] text-slate-200 leading-relaxed">
+              Hiçbir ortam değişkeni (environment variable) girmenize gerek olmadan, Dönem Başkanı (<strong>Rtn. Mimar Emre Karaca · TR-2420-74105</strong>) hesabını kendi belirleyeceğiniz güçlü parola/PIN ile etkinleştirin. Bu adım tamamlandığında kurulum uç noktası kalıcı olarak kilitlenir.
+            </p>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-            <div>
-              <label
-                htmlFor="login-rotary-id"
-                className="block text-[11px] font-semibold text-slate-300 mb-1"
+            <div className="space-y-2.5">
+              <div>
+                <label
+                  htmlFor="bootstrap-admin-pin"
+                  className="block text-[11px] font-semibold text-slate-200 mb-1"
+                >
+                  Dönem Başkanı Yeni Parola / PIN (Zorunlu)
+                </label>
+                <input
+                  id="bootstrap-admin-pin"
+                  type="password"
+                  value={newAdminPinInput}
+                  onChange={(e) => setNewAdminPinInput(e.target.value)}
+                  placeholder="Örn: GalataBsk#2026"
+                  className="w-full text-xs font-mono-num bg-[#09152B]/90 border border-white/20 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-[#F7A81B]"
+                />
+              </div>
+
+              <div>
+                <label
+                  htmlFor="bootstrap-board-pin"
+                  className="block text-[11px] font-semibold text-slate-300 mb-1"
+                >
+                  YK & Üye Başlangıç Parolası (İsteğe Bağlı — Sekreter/Sayman/Üye)
+                </label>
+                <input
+                  id="bootstrap-board-pin"
+                  type="password"
+                  value={newBoardPinInput}
+                  onChange={(e) => setNewBoardPinInput(e.target.value)}
+                  placeholder="Örn: GalataUye#2026"
+                  className="w-full text-xs font-mono-num bg-[#09152B]/90 border border-white/20 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-[#F7A81B]"
+                />
+              </div>
+            </div>
+
+            {errorMessage && (
+              <div
+                role="alert"
+                className="p-2.5 rounded-xl bg-rose-500/20 border border-rose-400/40 text-xs text-rose-200 flex items-center gap-2"
               >
-                Rotary Sicil No / E-Posta
-              </label>
-              <input
-                id="login-rotary-id"
-                type="text"
-                value={identifierInput}
-                onChange={(e) => setIdentifierInput(e.target.value)}
-                className="w-full text-xs font-mono-num bg-[#09152B]/90 border border-white/20 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-[#F7A81B]"
-              />
-            </div>
-            <div>
-              <label
-                htmlFor="login-pin-code"
-                className="block text-[11px] font-semibold text-slate-300 mb-1"
-              >
-                Kurumsal PIN / Parola
-              </label>
-              <input
-                id="login-pin-code"
-                type="password"
-                value={pinInput}
-                onChange={(e) => setPinInput(e.target.value)}
-                placeholder="Kurumsal PIN"
-                autoComplete="current-password"
-                className="w-full text-xs font-mono-num bg-[#09152B]/90 border border-white/20 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-[#F7A81B]"
-              />
-            </div>
-          </div>
+                <AlertCircle className="w-4 h-4 text-rose-300 shrink-0" />
+                <span>{errorMessage}</span>
+              </div>
+            )}
 
-          <div className="text-[11px] text-slate-300 bg-[#09152B]/60 rounded-xl p-2.5 border border-white/10">
-            <div>
-              Seçili Hesap:{' '}
-              <strong className="text-white">{activeAccount.name}</strong>
-            </div>
-            <div className="font-mono-num text-[#F7A81B]">
-              Sicil: {activeAccount.rotaryId} · E-Posta: {activeAccount.email}
-            </div>
-          </div>
-
-          {errorMessage && (
-            <div
-              role="alert"
-              className="p-2.5 rounded-xl bg-rose-500/20 border border-rose-400/40 text-xs text-rose-200 flex items-center gap-2"
-            >
-              <AlertCircle className="w-4 h-4 text-rose-300 shrink-0" />
-              <span>{errorMessage}</span>
-            </div>
-          )}
-
-          {webAuthnStatus && (
-            <div className="p-2.5 rounded-xl bg-white/10 border border-white/15 text-[11px] text-slate-200">
-              {webAuthnStatus}
-            </div>
-          )}
-
-          {/* KVKK Explicit Consent Checkbox */}
-          <label className="flex items-start gap-2 text-[11px] text-slate-200 cursor-pointer pt-1">
-            <input
-              type="checkbox"
-              checked={kvkkAccepted}
-              onChange={(e) => setKvkkAccepted(e.target.checked)}
-              className="mt-0.5 rounded border-white/30 text-[#F7A81B]"
-            />
-            <span>
-              6698 sayılı KVKK Aydınlatma Metni’ni okudum; kulüp içi LCV, kuver ve saymanlık verilerimin yetkilendirilmiş kulüp sunucusunda işlenmesini onaylıyorum.
-            </span>
-          </label>
-
-          <div className="space-y-2 pt-1">
             <button
               type="submit"
               disabled={!kvkkAccepted || authenticating}
-              className={`w-full min-h-[46px] py-2.5 px-4 rounded-2xl font-bold text-xs flex items-center justify-center gap-2 transition-all cursor-pointer shadow-lg ${
-                kvkkAccepted
-                  ? 'bg-[#F7A81B] hover:bg-[#f9b53b] text-[#0F172A]'
-                  : 'bg-white/10 text-slate-400 cursor-not-allowed'
-              }`}
+              className="w-full min-h-[46px] py-2.5 px-4 rounded-2xl font-bold text-xs flex items-center justify-center gap-2 bg-[#F7A81B] hover:bg-[#f9b53b] text-[#0F172A] cursor-pointer shadow-lg"
             >
               <CheckCircle2 className="w-4 h-4" />
               <span>
                 {authenticating
-                  ? 'Sunucuda Kriptografik Oturum Doğrulanıyor...'
-                  : 'Kurumsal PIN ile Sunucu Oturumu Aç (/api/auth/login)'}
+                  ? 'Yönetici Hesabı Etkinleştiriliyor...'
+                  : 'İlk Yönetici Hesabını Etkinleştir ve Oturum Aç'}
               </span>
             </button>
+          </form>
+        ) : (
+          <form
+            onSubmit={handleServerAuthenticate}
+            className="p-5 rounded-3xl bg-white/10 border border-white/15 backdrop-blur-md space-y-3.5 text-left"
+          >
+            {/* Preset Pilot Role Selector */}
+            <div className="space-y-1">
+              <label
+                htmlFor="splash-account-select"
+                className="block text-[11px] font-semibold text-slate-300 flex items-center gap-1"
+              >
+                <KeyRound className="w-3.5 h-3.5 text-[#F7A81B]" />
+                <span>Yetkili Kulüp Hesabını Seçin:</span>
+              </label>
+              <select
+                id="splash-account-select"
+                value={selectedRole}
+                onChange={(e) =>
+                  handleSelectPresetAccount(e.target.value as ClubRole)
+                }
+                className="w-full text-xs bg-[#09152B]/90 border border-white/20 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-[#F7A81B]"
+              >
+                {PILOT_ACCOUNT_PROFILES.map((acc) => (
+                  <option key={acc.role} value={acc.role}>
+                    {acc.name} — {acc.title} ({acc.rotaryId})
+                  </option>
+                ))}
+              </select>
+            </div>
 
-            <button
-              type="button"
-              onClick={handleWebAuthnVerify}
-              disabled={!kvkkAccepted || authenticating}
-              className="w-full min-h-[38px] py-2 px-3 rounded-xl bg-white/10 hover:bg-white/15 border border-white/15 text-[11px] font-semibold text-slate-200 flex items-center justify-center gap-1.5 cursor-pointer"
-            >
-              <Fingerprint className="w-4 h-4 text-[#F7A81B]" />
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              <div>
+                <label
+                  htmlFor="login-rotary-id"
+                  className="block text-[11px] font-semibold text-slate-300 mb-1"
+                >
+                  Rotary Sicil No / E-Posta
+                </label>
+                <input
+                  id="login-rotary-id"
+                  type="text"
+                  value={identifierInput}
+                  onChange={(e) => setIdentifierInput(e.target.value)}
+                  className="w-full text-xs font-mono-num bg-[#09152B]/90 border border-white/20 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-[#F7A81B]"
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="login-pin-code"
+                  className="block text-[11px] font-semibold text-slate-300 mb-1"
+                >
+                  Kurumsal PIN / Parola
+                </label>
+                <input
+                  id="login-pin-code"
+                  type="password"
+                  value={pinInput}
+                  onChange={(e) => setPinInput(e.target.value)}
+                  placeholder="Kurumsal PIN"
+                  autoComplete="current-password"
+                  className="w-full text-xs font-mono-num bg-[#09152B]/90 border border-white/20 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-[#F7A81B]"
+                />
+              </div>
+            </div>
+
+            <div className="text-[11px] text-slate-300 bg-[#09152B]/60 rounded-xl p-2.5 border border-white/10">
+              <div>
+                Seçili Hesap:{' '}
+                <strong className="text-white">{activeAccount.name}</strong>
+              </div>
+              <div className="font-mono-num text-[#F7A81B]">
+                Sicil: {activeAccount.rotaryId} · E-Posta: {activeAccount.email}
+              </div>
+            </div>
+
+            {errorMessage && (
+              <div
+                role="alert"
+                className="p-2.5 rounded-xl bg-rose-500/20 border border-rose-400/40 text-xs text-rose-200 flex items-center gap-2"
+              >
+                <AlertCircle className="w-4 h-4 text-rose-300 shrink-0" />
+                <span>{errorMessage}</span>
+              </div>
+            )}
+
+            {webAuthnStatus && (
+              <div className="p-2.5 rounded-xl bg-white/10 border border-white/15 text-[11px] text-slate-200">
+                {webAuthnStatus}
+              </div>
+            )}
+
+            {/* KVKK Explicit Consent Checkbox */}
+            <label className="flex items-start gap-2 text-[11px] text-slate-200 cursor-pointer pt-1">
+              <input
+                type="checkbox"
+                checked={kvkkAccepted}
+                onChange={(e) => setKvkkAccepted(e.target.checked)}
+                className="mt-0.5 rounded border-white/30 text-[#F7A81B]"
+              />
               <span>
-                {hasRegisteredPasskey
-                  ? 'Kayıtlı W3C WebAuthn Passkey ile Oturum Aç (/api/auth/webauthn-verify)'
-                  : 'W3C WebAuthn P-256 Passkey ile Doğrula (/api/auth/webauthn-verify)'}
+                6698 sayılı KVKK Aydınlatma Metni’ni okudum; kulüp içi LCV, kuver ve saymanlık verilerimin yetkilendirilmiş kulüp sunucusunda işlenmesini onaylıyorum.
               </span>
-            </button>
-          </div>
-        </form>
+            </label>
+
+            <div className="space-y-2 pt-1">
+              <button
+                type="submit"
+                disabled={!kvkkAccepted || authenticating}
+                className={`w-full min-h-[46px] py-2.5 px-4 rounded-2xl font-bold text-xs flex items-center justify-center gap-2 transition-all cursor-pointer shadow-lg ${
+                  kvkkAccepted
+                    ? 'bg-[#F7A81B] hover:bg-[#f9b53b] text-[#0F172A]'
+                    : 'bg-white/10 text-slate-400 cursor-not-allowed'
+                }`}
+              >
+                <CheckCircle2 className="w-4 h-4" />
+                <span>
+                  {authenticating
+                    ? 'Sunucuda Kriptografik Oturum Doğrulanıyor...'
+                    : 'Kurumsal PIN ile Sunucu Oturumu Aç (/api/auth/login)'}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleWebAuthnVerify}
+                disabled={!kvkkAccepted || authenticating}
+                className="w-full min-h-[38px] py-2 px-3 rounded-xl bg-white/10 hover:bg-white/15 border border-white/15 text-[11px] font-semibold text-slate-200 flex items-center justify-center gap-1.5 cursor-pointer"
+              >
+                <Fingerprint className="w-4 h-4 text-[#F7A81B]" />
+                <span>
+                  Donanım W3C WebAuthn Passkey ile Doğrula (/api/auth/webauthn-verify)
+                </span>
+              </button>
+            </div>
+          </form>
+        )}
       </div>
 
       {/* Bottom Multi-Tenant SaaS Footer */}

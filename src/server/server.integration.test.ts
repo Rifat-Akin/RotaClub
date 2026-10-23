@@ -304,6 +304,14 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, st
       'utf8'
     ).toString('base64url');
 
+    const badOriginRegRpIdHash = crypto
+      .createHash('sha256')
+      .update(regOpt.rp.id, 'utf8')
+      .digest();
+    const badOriginAuthData = Buffer.alloc(37);
+    badOriginRegRpIdHash.copy(badOriginAuthData, 0);
+    badOriginAuthData[32] = 0x05;
+
     const badOriginRegRes = await fetch(
       `${baseUrl}/api/auth/webauthn-register-verify`,
       {
@@ -316,6 +324,7 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, st
           challengeId: regOpt.challengeId,
           credentialId,
           clientDataJSON: badOriginClientData,
+          authenticatorData: badOriginAuthData.toString('base64url'),
           publicKeySpkiB64,
         }),
       }
@@ -346,6 +355,15 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, st
       'utf8'
     ).toString('base64url');
 
+    const regRpIdHash = crypto
+      .createHash('sha256')
+      .update(regOpt2.rpId, 'utf8')
+      .digest();
+    const regAuthDataBuf = Buffer.alloc(37);
+    regRpIdHash.copy(regAuthDataBuf, 0);
+    regAuthDataBuf[32] = 0x05; // UP + UV hardware verification flags
+    regAuthDataBuf.writeUInt32BE(0, 33); // initial signCount = 0
+
     const regVerifyRes = await fetch(
       `${baseUrl}/api/auth/webauthn-register-verify`,
       {
@@ -358,6 +376,7 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, st
           challengeId: regOpt2.challengeId,
           credentialId,
           clientDataJSON: regClientDataJSON,
+          authenticatorData: regAuthDataBuf.toString('base64url'),
           publicKeySpkiB64,
         }),
       }
@@ -552,6 +571,29 @@ test('Issue #76 / #14 / #16 / #20: KVKK redaction for uye and prevention of reda
     assert.equal(otherMember.duesBalance, 0);
     assert.equal(otherMember.bloodGroup, 'KVKK Gizli');
     assert.equal(otherMember.phone.includes('***'), true);
+
+    // v5.3 P1 Audit: Verify field-level access control for 'uye' on scholars, boardResolutions, auditLogs, treasuryLedger
+    assert.equal(Array.isArray(stateData.auditLogs), true);
+    assert.equal(stateData.auditLogs.length, 0);
+    assert.equal(stateData.auditLedger.length, 0);
+    assert.equal(stateData.treasuryLedger.length, 0);
+    assert.equal(stateData.overdueMembers.length, 0);
+    assert.equal(stateData.bankStatements.length, 0);
+
+    for (const scholar of stateData.scholars) {
+      assert.equal(
+        scholar.mentorMember,
+        'Burs Komitesi Mentörü (KVKK Korumalı)'
+      );
+      assert.equal(scholar.statusNote, 'Burs Programı Aktif');
+    }
+    for (const resItem of stateData.boardResolutions) {
+      assert.equal(
+        resItem.summary,
+        'Yönetim Kurulu Karar Defteri tam metni yalnızca YK üyelerine açıktır.'
+      );
+      assert.equal(resItem.signedBy, 'Yönetim Kurulu (Yetki Korumalı)');
+    }
 
     // Issue #14 Fix: Sekreter fetches state (where other members' duesBalance is 0) and syncs members back.
     // Server MUST NOT overwrite members' actual duesBalance or unmasked phones with redacted values!
@@ -854,19 +896,10 @@ test('Issue #76 / #39 / #6: Server-managed accounting ledger blocks direct sync 
         clubId: 'club-galata',
         expectedRevision: currentState.revision,
         state: {
-          paymentNotifications: [
-            {
-              id: 'pay-901',
-              memberId: 'm-kerem',
-              memberName: 'Rtn. Kerem Soylu',
-              category: 'Dönem Aidatı',
-              amount: 9000,
-              description: 'Bypass Onay Denemesi',
-              submittedAt: '22 Ekim 2026',
-              receiptRef: 'GAR-2026-88341',
-              status: 'Onaylandı',
-            },
-          ],
+          paymentNotifications: currentState.paymentNotifications.map(
+            (p: { id: string }) =>
+              p.id === 'pay-901' ? { ...p, status: 'Onaylandı' } : p
+          ),
         },
       }),
     });
@@ -886,6 +919,7 @@ test('Issue #76 / #39 / #6: Server-managed accounting ledger blocks direct sync 
         expectedRevision: currentState.revision,
         state: {
           paymentNotifications: [
+            ...currentState.paymentNotifications,
             {
               id: 'pay-theft-1',
               memberId: 'm-rifat',
@@ -920,6 +954,95 @@ test('Issue #76 / #39 / #6: Server-managed accounting ledger blocks direct sync 
     });
     assert.equal(validRefRes.status, 200);
 
+    // 6b. v5.3 P0 Audit: Attempting to mutate an approved payment record's amount, description, or status is blocked with 422 IMMUTABLE_PAYMENT_RECORD_VIOLATION
+    const afterApproveStateRes = await fetch(`${baseUrl}/api/pilot/state`, {
+      headers: { Authorization: `Bearer ${saymanSession.token}` },
+    });
+    const afterApproveState = await afterApproveStateRes.json();
+
+    const mutateApprovedPaymentRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${saymanSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: afterApproveState.revision,
+        state: {
+          paymentNotifications: afterApproveState.paymentNotifications.map(
+            (p: { id: string; amount: number }) =>
+              p.id === 'pay-901' ? { ...p, amount: 1500 } : p
+          ),
+        },
+      }),
+    });
+    assert.equal(mutateApprovedPaymentRes.status, 422);
+    const mutateApprovedBody = await mutateApprovedPaymentRes.json();
+    assert.equal(
+      mutateApprovedBody.error,
+      'IMMUTABLE_PAYMENT_RECORD_VIOLATION'
+    );
+
+    // 6c. v5.3 P0 Audit: Attempting to delete an existing payment record via sync is also blocked with 422 IMMUTABLE_PAYMENT_RECORD_VIOLATION
+    const deletePaymentRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${saymanSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: afterApproveState.revision,
+        state: {
+          paymentNotifications: afterApproveState.paymentNotifications.filter(
+            (p: { id: string }) => p.id !== 'pay-901'
+          ),
+        },
+      }),
+    });
+    assert.equal(deletePaymentRes.status, 422);
+    const deletePaymentBody = await deletePaymentRes.json();
+    assert.equal(deletePaymentBody.error, 'IMMUTABLE_PAYMENT_RECORD_VIOLATION');
+
+    // 6d. v5.3 P0 Audit: Bulk dues accrual is idempotent; repeating the same accrual period/description is rejected with 409 DUPLICATE_ACCRUAL_IDEMPOTENCY
+    const firstAccrualRes = await fetch(`${baseUrl}/api/pilot/accrue-dues`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${saymanSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        amountPerMember: 9000,
+        period: '2026-2027 2. Yarıyıl',
+        description: '2026-2027 2. Yarıyıl Kulüp Aidatı Tahakkuku',
+        idempotencyKey: 'accrual-galata-2026-h2',
+      }),
+    });
+    assert.equal(firstAccrualRes.status, 200);
+
+    const duplicateAccrualRes = await fetch(
+      `${baseUrl}/api/pilot/accrue-dues`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${saymanSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          amountPerMember: 9000,
+          period: '2026-2027 2. Yarıyıl',
+          description: '2026-2027 2. Yarıyıl Kulüp Aidatı Tahakkuku',
+          idempotencyKey: 'accrual-galata-2026-h2',
+        }),
+      }
+    );
+    assert.equal(duplicateAccrualRes.status, 409);
+    const duplicateAccrualBody = await duplicateAccrualRes.json();
+    assert.equal(duplicateAccrualBody.error, 'DUPLICATE_ACCRUAL_IDEMPOTENCY');
+
     // 7. Member submits a valid project contribution (GAR-2026-99501 for 5000 TL)
     const stateBeforeRes = await fetch(`${baseUrl}/api/pilot/state`, {
       headers: { Authorization: `Bearer ${saymanSession.token}` },
@@ -939,6 +1062,7 @@ test('Issue #76 / #39 / #6: Server-managed accounting ledger blocks direct sync 
         expectedRevision: stateBefore.revision,
         state: {
           paymentNotifications: [
+            ...stateBefore.paymentNotifications,
             {
               id: 'pay-proj-5000',
               memberId: 'm-rifat',
@@ -992,6 +1116,7 @@ test('Issue #76 / #39 / #6: Server-managed accounting ledger blocks direct sync 
         expectedRevision: reconcileProjBody.state.revision,
         state: {
           paymentNotifications: [
+            ...reconcileProjBody.state.paymentNotifications,
             {
               id: 'pay-reuse-attempt',
               memberId: 'm-rifat',
@@ -1115,3 +1240,160 @@ test('Issue #76 / #70: Authentic per-club role bindings — Galata President (m-
     assert.equal(govResetKarakoy.status, 403);
   });
 });
+
+test('Issue #76 v5.3 Audit: Zero-env one-time initial admin activation flow, hardware-only WebAuthn client enforcement, and automatic discovery of v5.2 database files', async () => {
+  // 1. Verify SplashLockScreenModal.tsx has zero software WebCrypto keypair fallback (no subtle.generateKey or subtle.sign)
+  const splashModalSource = fs.readFileSync(
+    path.resolve(process.cwd(), 'src/components/SplashLockScreenModal.tsx'),
+    'utf8'
+  );
+  assert.equal(
+    splashModalSource.includes('subtle.generateKey'),
+    false,
+    'Client must not synthesize software WebAuthn keys via crypto.subtle.generateKey'
+  );
+  assert.equal(
+    splashModalSource.includes('subtle.sign'),
+    false,
+    'Client must not sign WebAuthn assertions in software via crypto.subtle.sign'
+  );
+
+  // 2. Test zero-env initial admin bootstrap activation flow (without ROTACLUB_PIN_* env vars)
+  const savedEnv: Record<string, string | undefined> = {};
+  const envKeys = [
+    'ROTACLUB_PIN_UYE',
+    'ROTACLUB_PIN_SEKRETER',
+    'ROTACLUB_PIN_SAYMAN',
+    'ROTACLUB_PIN_BASKAN',
+    'ROTACLUB_PIN_KARAKOY_BASKAN',
+    'ROTACLUB_PIN_MACKA_BASKAN',
+    'ROTACLUB_PIN_DISTRICT_GOV',
+  ];
+  for (const k of envKeys) {
+    savedEnv[k] = process.env[k];
+    delete process.env[k];
+  }
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rotaclub-bootstrap-'));
+  try {
+    const freshDbPath = path.join(tmpDir, 'rotaclub_pilot_v5_3_db.json');
+    const { app } = createPilotExpressApp(freshDbPath);
+    const server: Server = await new Promise((resolve) => {
+      const s = app.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    try {
+      // Check bootstrap-status on fresh zero-env database -> bootstrapClaimRequired === true
+      const statusRes1 = await fetch(`${baseUrl}/api/auth/bootstrap-status`);
+      const statusBody1 = await statusRes1.json();
+      assert.equal(statusBody1.bootstrapClaimRequired, true);
+
+      // Attempting login before activation returns 403 ACCOUNT_ACTIVATION_REQUIRED
+      const unactivatedLogin = await fetch(`${baseUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          identifier: 'TR-2420-74105',
+          pinCode: 'AnyPassword#2026',
+        }),
+      });
+      assert.equal(unactivatedLogin.status, 403);
+      const unactivatedBody = await unactivatedLogin.json();
+      assert.equal(unactivatedBody.error, 'ACCOUNT_ACTIVATION_REQUIRED');
+
+      // Claim initial admin bootstrap once
+      const claimRes = await fetch(`${baseUrl}/api/auth/bootstrap-claim`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          baskanPin: 'GalataFirstAdmin#2026',
+          sekreterPin: 'GalataFirstSek#2026',
+          saymanPin: 'GalataFirstSay#2026',
+          uyePin: 'GalataFirstUye#2026',
+        }),
+      });
+      assert.equal(claimRes.status, 201);
+      const claimBody = await claimRes.json();
+      assert.equal(claimBody.ok, true);
+      assert.ok(claimBody.token);
+      assert.equal(claimBody.user.role, 'baskan');
+
+      // Attempting to claim bootstrap a second time is permanently rejected with 409 BOOTSTRAP_ALREADY_CLAIMED
+      const secondClaimRes = await fetch(
+        `${baseUrl}/api/auth/bootstrap-claim`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            baskanPin: 'AttackerHijack#2026',
+          }),
+        }
+      );
+      assert.equal(secondClaimRes.status, 409);
+      const secondClaimBody = await secondClaimRes.json();
+      assert.equal(secondClaimBody.error, 'BOOTSTRAP_ALREADY_CLAIMED');
+
+      // Activated President can also provision/activate another account via /api/auth/admin-provision-pin
+      const provRes = await fetch(`${baseUrl}/api/auth/admin-provision-pin`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${claimBody.token}`,
+        },
+        body: JSON.stringify({
+          identifier: 'TR-2420-88412',
+          newPin: 'RifatAdminSet#2026',
+        }),
+      });
+      assert.equal(provRes.status, 200);
+
+      const rifatLogin = await loginRole(
+        baseUrl,
+        'TR-2420-88412',
+        'RifatAdminSet#2026'
+      );
+      assert.equal(rifatLogin.user.role, 'uye');
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+
+    // 3. Test automatic discovery & lossless migration of legacy v5.2 database filename ('rotaclub_pilot_v5_2_db.json') when 'rotaclub_pilot_v5_3_db.json' does not exist
+    const migDir = path.join(tmpDir, 'migration-test');
+    fs.mkdirSync(migDir, { recursive: true });
+    const legacyV52File = path.join(migDir, 'rotaclub_pilot_v5_2_db.json');
+    const targetV53File = path.join(migDir, 'rotaclub_pilot_v5_3_db.json');
+
+    // Copy the claimed DB as a simulated v5.2 file with custom state
+    const v52Payload = JSON.parse(fs.readFileSync(freshDbPath, 'utf8'));
+    v52Payload.schemaVersion = '5.2.0-hardened';
+    v52Payload.tenants['club-galata'].guestNameInput =
+      'Auto-Discovered v5.2 Legacy Club Data';
+    fs.writeFileSync(
+      legacyV52File,
+      JSON.stringify(v52Payload, null, 2),
+      'utf8'
+    );
+
+    const { store: autoMigratedStore } = createPilotExpressApp(targetV53File);
+    assert.equal(fs.existsSync(targetV53File), true);
+    assert.equal(
+      autoMigratedStore.getTenantState('club-galata').guestNameInput,
+      'Auto-Discovered v5.2 Legacy Club Data'
+    );
+    assert.equal(
+      fs.existsSync(`${legacyV52File}.pre-migration-5.2.0-hardened.bak`),
+      true
+    );
+  } finally {
+    for (const k of envKeys) {
+      if (savedEnv[k] !== undefined) {
+        process.env[k] = savedEnv[k];
+      }
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
