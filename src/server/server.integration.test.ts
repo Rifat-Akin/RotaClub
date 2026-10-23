@@ -7,9 +7,259 @@ import path from 'path';
 import type { Server } from 'http';
 import { createPilotExpressApp } from '../../server';
 import {
-  buildHardwareWebAuthnRegistrationPayload,
   encodeCborAttestationObject,
+  encodeCborCoseEc2P256Key,
+  extractP256CoordinatesFromSpkiDer,
 } from './pilotEngine';
+
+function asn1Len(len: number): Buffer {
+  if (len < 0x80) return Buffer.from([len]);
+  if (len <= 0xff) return Buffer.from([0x81, len]);
+  const b = Buffer.alloc(3);
+  b[0] = 0x82;
+  b.writeUInt16BE(len, 1);
+  return b;
+}
+
+function asn1Tag(tag: number, content: Buffer): Buffer {
+  return Buffer.concat([Buffer.from([tag]), asn1Len(content.length), content]);
+}
+
+function asn1Seq(items: Buffer[]): Buffer {
+  return asn1Tag(0x30, Buffer.concat(items));
+}
+
+function asn1NameCn(cn: string): Buffer {
+  const oidCn = Buffer.from('0603550403', 'hex');
+  const utf8Cn = asn1Tag(0x0c, Buffer.from(cn, 'utf8'));
+  return asn1Seq([asn1Tag(0x31, asn1Seq([oidCn, utf8Cn]))]);
+}
+
+function buildX509v3CertificateDer(params: {
+  subjectCn: string;
+  issuerCn: string;
+  subjectPublicKeySpkiDer: Buffer;
+  issuerPrivateKey: crypto.KeyObject;
+  isCa: boolean;
+  fidoAaguidHex?: string;
+  appleNonce?: Buffer;
+}): { der: Buffer; pem: string } {
+  const version = asn1Tag(0xa0, Buffer.from('020102', 'hex'));
+  const serial = asn1Tag(0x02, Buffer.concat([Buffer.from([0x01]), crypto.randomBytes(7)]));
+  const sigAlg = Buffer.from('300a06082a8648ce3d040302', 'hex'); // ecdsa-with-SHA256
+  const issuer = asn1NameCn(params.issuerCn);
+  const validity = asn1Seq([
+    asn1Tag(0x17, Buffer.from('240101000000Z', 'ascii')),
+    asn1Tag(0x17, Buffer.from('350101000000Z', 'ascii')),
+  ]);
+  const subject = asn1NameCn(params.subjectCn);
+
+  const basicConstraintsOid = Buffer.from('0603551d13', 'hex');
+  const basicConstraintsCritical = Buffer.from('0101ff', 'hex');
+  const basicConstraintsVal = params.isCa
+    ? asn1Tag(0x04, Buffer.from('30030101ff', 'hex'))
+    : asn1Tag(0x04, Buffer.from('3000', 'hex'));
+  const exts: Buffer[] = [
+    asn1Seq([basicConstraintsOid, basicConstraintsCritical, basicConstraintsVal]),
+  ];
+
+  if (params.fidoAaguidHex) {
+    const aaguidBytes = Buffer.from(
+      params.fidoAaguidHex.replace(/-/g, ''),
+      'hex'
+    );
+    const fidoOid = Buffer.from('060b2b0601040182e51c010104', 'hex');
+    const fidoVal = asn1Tag(0x04, asn1Tag(0x04, aaguidBytes));
+    exts.push(asn1Seq([fidoOid, fidoVal]));
+  }
+
+  if (params.appleNonce) {
+    const appleOid = Buffer.from('06092a864886f763640802', 'hex');
+    const appleInner = asn1Seq([asn1Tag(0xa1, asn1Tag(0x04, params.appleNonce))]);
+    exts.push(asn1Seq([appleOid, asn1Tag(0x04, appleInner)]));
+  }
+
+  const extensionsWrapper = asn1Tag(0xa3, asn1Seq(exts));
+  const tbs = asn1Seq([
+    version,
+    serial,
+    sigAlg,
+    issuer,
+    validity,
+    subject,
+    params.subjectPublicKeySpkiDer,
+    extensionsWrapper,
+  ]);
+
+  const sigDer = crypto.sign('sha256', tbs, params.issuerPrivateKey);
+  const bitStringSig = asn1Tag(
+    0x03,
+    Buffer.concat([Buffer.from([0x00]), sigDer])
+  );
+  const certDer = asn1Seq([tbs, sigAlg, bitStringSig]);
+  const b64 = certDer.toString('base64');
+  const lines = b64.match(/.{1,64}/g) || [b64];
+  const pem = `-----BEGIN CERTIFICATE-----\n${lines.join('\n')}\n-----END CERTIFICATE-----`;
+  return { der: certDer, pem };
+}
+
+function createHardwareTestRootCa(cn = 'RotaClub Test Hardware FIDO2 Root CA') {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
+    namedCurve: 'prime256v1',
+  });
+  const spkiDer = publicKey.export({ format: 'der', type: 'spki' }) as Buffer;
+  const cert = buildX509v3CertificateDer({
+    subjectCn: cn,
+    issuerCn: cn,
+    subjectPublicKeySpkiDer: spkiDer,
+    issuerPrivateKey: privateKey,
+    isCa: true,
+  });
+  return { publicKey, privateKey, spkiDer, der: cert.der, pem: cert.pem, cn };
+}
+
+const TRUSTED_TEST_ROOT_CA = createHardwareTestRootCa(
+  'Trusted FIDO2 & Apple Hardware Attestation Root CA'
+);
+
+function buildTestWebAuthnRegistrationPayload(params: {
+  rpId: string;
+  challenge: string;
+  origin: string;
+  credentialIdB64Url: string;
+  publicKeySpkiDer: Buffer;
+  privateKey: crypto.KeyObject;
+  aaguidHex?: string;
+  signCount?: number;
+  flags?: number;
+  fmt?: 'packed' | 'apple' | 'none';
+  rootCa?: ReturnType<typeof createHardwareTestRootCa>;
+  certAaguidHex?: string;
+  omitX5c?: boolean;
+  selfSignedLeaf?: boolean;
+}) {
+  const clientDataBytes = Buffer.from(
+    JSON.stringify({
+      type: 'webauthn.create',
+      challenge: params.challenge,
+      origin: params.origin,
+      crossOrigin: false,
+    }),
+    'utf8'
+  );
+  const clientDataJSON = clientDataBytes.toString('base64url');
+  const clientDataHash = crypto
+    .createHash('sha256')
+    .update(clientDataBytes)
+    .digest();
+
+  const rpIdHash = crypto
+    .createHash('sha256')
+    .update(params.rpId, 'utf8')
+    .digest();
+
+  const effectiveAaguidHex =
+    params.aaguidHex || 'fbfc3007-154e-4ecc-8c0b-6e020557d7bd';
+  const aaguidBuf = Buffer.from(effectiveAaguidHex.replace(/-/g, ''), 'hex');
+
+  const credIdBuf = Buffer.from(params.credentialIdB64Url, 'base64url');
+  const credIdLenBuf = Buffer.alloc(2);
+  credIdLenBuf.writeUInt16BE(credIdBuf.length, 0);
+
+  const { x, y } = extractP256CoordinatesFromSpkiDer(params.publicKeySpkiDer);
+  const coseKeyBuf = encodeCborCoseEc2P256Key(x, y);
+
+  const headerBuf = Buffer.alloc(37);
+  rpIdHash.copy(headerBuf, 0);
+  headerBuf[32] = typeof params.flags === 'number' ? params.flags : 0x5d;
+  headerBuf.writeUInt32BE(params.signCount ?? 0, 33);
+
+  const authData = Buffer.concat([
+    headerBuf,
+    aaguidBuf,
+    credIdLenBuf,
+    credIdBuf,
+    coseKeyBuf,
+  ]);
+
+  const fmt = params.fmt || 'packed';
+  const signedBytes = Buffer.concat([authData, clientDataHash]);
+  const ca = params.rootCa || TRUSTED_TEST_ROOT_CA;
+
+  let sig: Buffer | undefined;
+  let x5c: Buffer[] | undefined;
+
+  if (fmt === 'packed') {
+    if (params.omitX5c) {
+      // Self-attestation (no x5c)
+      sig = crypto.sign('sha256', signedBytes, params.privateKey);
+    } else if (params.selfSignedLeaf) {
+      const leafKey = crypto.generateKeyPairSync('ec', {
+        namedCurve: 'prime256v1',
+      });
+      const leafSpki = leafKey.publicKey.export({
+        format: 'der',
+        type: 'spki',
+      }) as Buffer;
+      const selfCert = buildX509v3CertificateDer({
+        subjectCn: 'Self-Signed Attacker Authenticator',
+        issuerCn: 'Self-Signed Attacker Authenticator',
+        subjectPublicKeySpkiDer: leafSpki,
+        issuerPrivateKey: leafKey.privateKey,
+        isCa: false,
+        fidoAaguidHex: params.certAaguidHex || effectiveAaguidHex,
+      });
+      sig = crypto.sign('sha256', signedBytes, leafKey.privateKey);
+      x5c = [selfCert.der];
+    } else {
+      const attKey = crypto.generateKeyPairSync('ec', {
+        namedCurve: 'prime256v1',
+      });
+      const attSpki = attKey.publicKey.export({
+        format: 'der',
+        type: 'spki',
+      }) as Buffer;
+      const leafCert = buildX509v3CertificateDer({
+        subjectCn: 'FIDO2 Hardware Authenticator Attestation',
+        issuerCn: ca.cn,
+        subjectPublicKeySpkiDer: attSpki,
+        issuerPrivateKey: ca.privateKey,
+        isCa: false,
+        fidoAaguidHex: params.certAaguidHex || effectiveAaguidHex,
+      });
+      sig = crypto.sign('sha256', signedBytes, attKey.privateKey);
+      x5c = [leafCert.der, ca.der];
+    }
+  } else if (fmt === 'apple' && !params.omitX5c) {
+    const nonce = crypto.createHash('sha256').update(signedBytes).digest();
+    const leafCert = buildX509v3CertificateDer({
+      subjectCn: 'Apple iPhone Passkey Anonymous Attestation',
+      issuerCn: ca.cn,
+      subjectPublicKeySpkiDer: params.publicKeySpkiDer,
+      issuerPrivateKey: ca.privateKey,
+      isCa: false,
+      appleNonce: nonce,
+    });
+    x5c = [leafCert.der, ca.der];
+  }
+
+  const attestationObjectBuf = encodeCborAttestationObject({
+    fmt,
+    authData,
+    alg: fmt === 'packed' ? -7 : undefined,
+    sig,
+    x5c,
+  });
+
+  return {
+    credentialId: params.credentialIdB64Url,
+    clientDataJSON,
+    attestationObject: attestationObjectBuf.toString('base64url'),
+    authenticatorData: authData.toString('base64url'),
+    publicKeySpkiB64: params.publicKeySpkiDer.toString('base64url'),
+    authenticatorAttachment: 'platform' as const,
+  };
+}
 
 // Configure test environment credentials via environment variables (no hardcoded PINs in production source code)
 process.env.ROTACLUB_PIN_UYE = 'GalataUye#2026';
@@ -35,7 +285,9 @@ async function withTestServer(
 ) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rotaclub-test-'));
   const tmpDbFile = path.join(tmpDir, 'test_db.json');
-  const { app } = createPilotExpressApp(tmpDbFile);
+  const { app } = createPilotExpressApp(tmpDbFile, {
+    trustedWebAuthnRootPems: [TRUSTED_TEST_ROOT_CA.pem],
+  });
 
   const server: Server = await new Promise((resolve) => {
     const s = app.listen(0, '127.0.0.1', () => resolve(s));
@@ -435,7 +687,7 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, st
       'ATTESTED_CREDENTIAL_DATA_REQUIRED'
     );
 
-    // 2e. Attempting CBOR attestationObject with all-zero software AAGUID (00000000-0000-0000-0000-000000000000) and unattested fmt:'none' MUST be rejected with 401 SOFTWARE_AUTHENTICATOR_REJECTED (#22, #76)
+    // 2e. Attempting CBOR attestationObject with all-zero software AAGUID (00000000-0000-0000-0000-000000000000) MUST be rejected with 401 SOFTWARE_AUTHENTICATOR_REJECTED (#22, #17, #76)
     const regOptZeroAaguidRes = await fetch(
       `${baseUrl}/api/auth/webauthn-register-options`,
       {
@@ -447,7 +699,7 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, st
       }
     );
     const regOptZeroAaguid = await regOptZeroAaguidRes.json();
-    const zeroAaguidPayload = buildHardwareWebAuthnRegistrationPayload({
+    const zeroAaguidPayload = buildTestWebAuthnRegistrationPayload({
       rpId: regOptZeroAaguid.rpId,
       challenge: regOptZeroAaguid.challenge,
       origin: baseUrl,
@@ -478,7 +730,222 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, st
       'SOFTWARE_AUTHENTICATOR_REJECTED'
     );
 
-    // 2f. Request fresh registration options and register with genuine W3C CBOR attestationObject + COSE_Key P-256 (iPhone Passkey / FIDO2 packed hardware format)
+    // 2f. Negative Test (#22, #17): Unattested (fmt: 'none') payload spoofing Apple's AAGUID (fbfc3007-154e-4ecc-8c0b-6e020557d7bd) MUST be rejected with 401 UNATTESTED_REGISTRATION_REJECTED
+    const regOptUnattestedRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-options`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+      }
+    );
+    const regOptUnattested = await regOptUnattestedRes.json();
+    const unattestedSpoofPayload = buildTestWebAuthnRegistrationPayload({
+      rpId: regOptUnattested.rpId,
+      challenge: regOptUnattested.challenge,
+      origin: baseUrl,
+      credentialIdB64Url: credentialId,
+      publicKeySpkiDer,
+      privateKey,
+      aaguidHex: 'fbfc3007-154e-4ecc-8c0b-6e020557d7bd',
+      fmt: 'none',
+    });
+    const unattestedSpoofRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-verify`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+        body: JSON.stringify({
+          challengeId: regOptUnattested.challengeId,
+          ...unattestedSpoofPayload,
+        }),
+      }
+    );
+    assert.equal(unattestedSpoofRes.status, 401);
+    const unattestedSpoofBody = await unattestedSpoofRes.json();
+    assert.equal(
+      unattestedSpoofBody.error,
+      'UNATTESTED_REGISTRATION_REJECTED'
+    );
+
+    // 2g. Negative Test (#22, #17): Self-attested (fmt: 'packed' without x5c, signed by software credential key) spoofing Apple's AAGUID MUST be rejected with 401 SELF_ATTESTATION_REJECTED
+    const regOptSelfAttRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-options`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+      }
+    );
+    const regOptSelfAtt = await regOptSelfAttRes.json();
+    const selfAttSpoofPayload = buildTestWebAuthnRegistrationPayload({
+      rpId: regOptSelfAtt.rpId,
+      challenge: regOptSelfAtt.challenge,
+      origin: baseUrl,
+      credentialIdB64Url: credentialId,
+      publicKeySpkiDer,
+      privateKey,
+      aaguidHex: 'fbfc3007-154e-4ecc-8c0b-6e020557d7bd',
+      fmt: 'packed',
+      omitX5c: true,
+    });
+    const selfAttSpoofRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-verify`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+        body: JSON.stringify({
+          challengeId: regOptSelfAtt.challengeId,
+          ...selfAttSpoofPayload,
+        }),
+      }
+    );
+    assert.equal(selfAttSpoofRes.status, 401);
+    const selfAttSpoofBody = await selfAttSpoofRes.json();
+    assert.equal(selfAttSpoofBody.error, 'SELF_ATTESTATION_REJECTED');
+
+    // 2h. Negative Test (#22, #17): Rogue / Untrusted Root CA or Self-Signed x5c certificate chain spoofing hardware AAGUID MUST be rejected with 401 UNTRUSTED_ATTESTATION_ROOT
+    const rogueRootCa = createHardwareTestRootCa('Rogue Attacker Root CA');
+    const regOptRogueCaRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-options`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+      }
+    );
+    const regOptRogueCa = await regOptRogueCaRes.json();
+    const rogueCaPayload = buildTestWebAuthnRegistrationPayload({
+      rpId: regOptRogueCa.rpId,
+      challenge: regOptRogueCa.challenge,
+      origin: baseUrl,
+      credentialIdB64Url: credentialId,
+      publicKeySpkiDer,
+      privateKey,
+      aaguidHex: 'fbfc3007-154e-4ecc-8c0b-6e020557d7bd',
+      fmt: 'packed',
+      rootCa: rogueRootCa,
+    });
+    const rogueCaRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-verify`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+        body: JSON.stringify({
+          challengeId: regOptRogueCa.challengeId,
+          ...rogueCaPayload,
+        }),
+      }
+    );
+    assert.equal(rogueCaRes.status, 401);
+    const rogueCaBody = await rogueCaRes.json();
+    assert.equal(rogueCaBody.error, 'UNTRUSTED_ATTESTATION_ROOT');
+
+    // 2i. Negative Test (#22, #17): Valid trusted x5c certificate for AAGUID A, but authData spoofs AAGUID B -> rejected with 401 ATTESTATION_AAGUID_MISMATCH
+    const regOptAaguidMismatchRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-options`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+      }
+    );
+    const regOptAaguidMismatch = await regOptAaguidMismatchRes.json();
+    const mismatchedAaguidPayload = buildTestWebAuthnRegistrationPayload({
+      rpId: regOptAaguidMismatch.rpId,
+      challenge: regOptAaguidMismatch.challenge,
+      origin: baseUrl,
+      credentialIdB64Url: credentialId,
+      publicKeySpkiDer,
+      privateKey,
+      aaguidHex: 'fbfc3007-154e-4ecc-8c0b-6e020557d7bd',
+      certAaguidHex: 'ee882879-721c-4913-9775-3dfcce97072a',
+      fmt: 'packed',
+    });
+    const mismatchedAaguidRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-verify`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+        body: JSON.stringify({
+          challengeId: regOptAaguidMismatch.challengeId,
+          ...mismatchedAaguidPayload,
+        }),
+      }
+    );
+    assert.equal(mismatchedAaguidRes.status, 401);
+    const mismatchedAaguidBody = await mismatchedAaguidRes.json();
+    assert.equal(mismatchedAaguidBody.error, 'ATTESTATION_AAGUID_MISMATCH');
+
+    // 2j. Negative Test (#22, #17): Spoofed Host header on verify OR insecure http:// origin on non-localhost domain MUST be rejected with 401 WEBAUTHN_ORIGIN_MISMATCH
+    const regOptHostSpoofRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-options`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+          'X-Forwarded-Host': 'galata.rotary2420.org',
+          'X-Forwarded-Proto': 'https',
+        },
+      }
+    );
+    const regOptHostSpoof = await regOptHostSpoofRes.json();
+    assert.equal(regOptHostSpoof.rpId, 'galata.rotary2420.org');
+    assert.equal(
+      regOptHostSpoof.expectedOrigin,
+      'https://galata.rotary2420.org'
+    );
+
+    const insecureHttpOriginPayload = buildTestWebAuthnRegistrationPayload({
+      rpId: 'galata.rotary2420.org',
+      challenge: regOptHostSpoof.challenge,
+      origin: 'http://galata.rotary2420.org', // Plain HTTP on non-localhost domain!
+      credentialIdB64Url: credentialId,
+      publicKeySpkiDer,
+      privateKey,
+      fmt: 'packed',
+    });
+    const insecureHttpVerifyRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-verify`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+          'X-Forwarded-Host': 'galata.rotary2420.org',
+        },
+        body: JSON.stringify({
+          challengeId: regOptHostSpoof.challengeId,
+          ...insecureHttpOriginPayload,
+        }),
+      }
+    );
+    assert.equal(insecureHttpVerifyRes.status, 401);
+    const insecureHttpVerifyBody = await insecureHttpVerifyRes.json();
+    assert.equal(insecureHttpVerifyBody.error, 'WEBAUTHN_ORIGIN_MISMATCH');
+
+    // 2k. Positive Test (#22): Genuine W3C CBOR attestationObject + X.509 Hardware PKI Trust Chain (x5c + OID 1.3.6.1.4.1.45724.1.1.4 AAGUID + COSE_Key P-256) succeeds!
     const regOptRes2 = await fetch(
       `${baseUrl}/api/auth/webauthn-register-options`,
       {
@@ -491,14 +958,13 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, st
     );
     const regOpt2 = await regOptRes2.json();
 
-    const validHwRegPayload = buildHardwareWebAuthnRegistrationPayload({
+    const validHwRegPayload = buildTestWebAuthnRegistrationPayload({
       rpId: regOpt2.rpId,
       challenge: regOpt2.challenge,
       origin: baseUrl,
       credentialIdB64Url: credentialId,
       publicKeySpkiDer,
       privateKey,
-      // Apple iCloud Keychain Passkey AAGUID (iOS 16/17/18 Face ID / Touch ID)
       aaguidHex: 'fbfc3007-154e-4ecc-8c0b-6e020557d7bd',
       fmt: 'packed',
     });
@@ -518,6 +984,57 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, st
       }
     );
     assert.equal(regVerifyRes.status, 200);
+
+    // 2l. Positive Test (#22): Genuine Apple Anonymous Attestation (fmt: 'apple' with x5c + OID 1.2.840.113635.100.8.2 nonce over HTTPS origin) succeeds on iPhone Safari!
+    const iphoneKeyPair = crypto.generateKeyPairSync('ec', {
+      namedCurve: 'prime256v1',
+    });
+    const iphoneSpkiDer = iphoneKeyPair.publicKey.export({
+      format: 'der',
+      type: 'spki',
+    }) as Buffer;
+    const iphoneCredId = crypto.randomBytes(20).toString('base64url');
+
+    const iphoneOptRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-options`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+          'X-Forwarded-Host': 'galata.rotary2420.org',
+          'X-Forwarded-Proto': 'https',
+        },
+      }
+    );
+    const iphoneOpt = await iphoneOptRes.json();
+    const iphoneApplePayload = buildTestWebAuthnRegistrationPayload({
+      rpId: 'galata.rotary2420.org',
+      challenge: iphoneOpt.challenge,
+      origin: 'https://galata.rotary2420.org',
+      credentialIdB64Url: iphoneCredId,
+      publicKeySpkiDer: iphoneSpkiDer,
+      privateKey: iphoneKeyPair.privateKey,
+      aaguidHex: 'fbfc3007-154e-4ecc-8c0b-6e020557d7bd',
+      fmt: 'apple',
+    });
+    const iphoneVerifyRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-verify`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+        body: JSON.stringify({
+          challengeId: iphoneOpt.challengeId,
+          ...iphoneApplePayload,
+        }),
+      }
+    );
+    assert.equal(iphoneVerifyRes.status, 200);
+    const iphoneVerifyBody = await iphoneVerifyRes.json();
+    assert.equal(iphoneVerifyBody.fmt, 'apple');
 
     // 3. Request assertion challenge and verify that a forged signature is rejected with 401 INVALID_WEBAUTHN_SIGNATURE
     const challengeRes1 = await fetch(
@@ -1495,7 +2012,49 @@ test('Issue #76 v5.3 Audit: Zero-env one-time initial admin activation flow, har
         'INVALID_BOOTSTRAP_OWNERSHIP_TOKEN'
       );
 
-      // Claim initial admin bootstrap once with verified one-time ownership token
+      // Issue #70 & #17 Negative Test: Attempting to claim initial bootstrap for another club (club-karakoy) or activate Karaköy/Maçka/District accounts via rolePins MUST be rejected with 403 CROSS_TENANT_BOOTSTRAP_FORBIDDEN
+      const crossClubBootstrapRes1 = await fetch(
+        `${baseUrl}/api/auth/bootstrap-claim`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            bootstrapToken: ownerBootstrapToken,
+            clubId: 'club-karakoy',
+            baskanPin: 'GalataFirstAdmin#2026',
+          }),
+        }
+      );
+      assert.equal(crossClubBootstrapRes1.status, 403);
+      const crossClubBootstrapBody1 = await crossClubBootstrapRes1.json();
+      assert.equal(
+        crossClubBootstrapBody1.error,
+        'CROSS_TENANT_BOOTSTRAP_FORBIDDEN'
+      );
+
+      const crossClubBootstrapRes2 = await fetch(
+        `${baseUrl}/api/auth/bootstrap-claim`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            bootstrapToken: ownerBootstrapToken,
+            rotaryId: 'TR-2420-74105',
+            baskanPin: 'GalataFirstAdmin#2026',
+            rolePins: {
+              karakoyBaskan: 'KarakoyHijack#2026',
+            },
+          }),
+        }
+      );
+      assert.equal(crossClubBootstrapRes2.status, 403);
+      const crossClubBootstrapBody2 = await crossClubBootstrapRes2.json();
+      assert.equal(
+        crossClubBootstrapBody2.error,
+        'CROSS_TENANT_BOOTSTRAP_FORBIDDEN'
+      );
+
+      // Claim initial admin bootstrap once with verified one-time ownership token (strictly club-galata accounts only)
       const claimRes = await fetch(`${baseUrl}/api/auth/bootstrap-claim`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1514,6 +2073,41 @@ test('Issue #76 v5.3 Audit: Zero-env one-time initial admin activation flow, har
       assert.equal(claimBody.ok, true);
       assert.ok(claimBody.token);
       assert.equal(claimBody.user.role, 'baskan');
+
+      // Verify other clubs' accounts (Karaköy, Maçka, District) were NOT activated by Galata's initial bootstrap (#70)
+      const karakoyAccAfterBootstrap = bootstrapStore
+        .getAccounts()
+        .find((a) => a.rotaryId === 'TR-2420-KRK-01');
+      const mackaAccAfterBootstrap = bootstrapStore
+        .getAccounts()
+        .find((a) => a.rotaryId === 'TR-2420-MCK-01');
+      assert.equal(karakoyAccAfterBootstrap?.activated, false);
+      assert.equal(mackaAccAfterBootstrap?.activated, false);
+
+      // Issue #70 & #17 Negative Test: Galata President attempting to activate/set PIN on Karaköy President via /api/auth/admin-provision-pin is rejected with 403 CLUB_MEMBERSHIP_FORBIDDEN
+      const crossClubProvRes = await fetch(
+        `${baseUrl}/api/auth/admin-provision-pin`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${claimBody.token}`,
+          },
+          body: JSON.stringify({
+            identifier: 'TR-2420-KRK-01',
+            newPin: 'KarakoyHijack#2026',
+          }),
+        }
+      );
+      assert.equal(crossClubProvRes.status, 403);
+      const crossClubProvBody = await crossClubProvRes.json();
+      assert.equal(crossClubProvBody.error, 'CLUB_MEMBERSHIP_FORBIDDEN');
+      assert.equal(
+        bootstrapStore
+          .getAccounts()
+          .find((a) => a.rotaryId === 'TR-2420-KRK-01')?.activated,
+        false
+      );
 
       // One-time bootstrap token file must be deleted and runtime token cleared after claim
       assert.equal(fs.existsSync(bootstrapTokenFile), false);
@@ -1535,7 +2129,7 @@ test('Issue #76 v5.3 Audit: Zero-env one-time initial admin activation flow, har
       const secondClaimBody = await secondClaimRes.json();
       assert.equal(secondClaimBody.error, 'BOOTSTRAP_ALREADY_CLAIMED');
 
-      // Activated President can also provision/activate another account via /api/auth/admin-provision-pin
+      // Activated President can also provision/activate another account in their OWN club via /api/auth/admin-provision-pin
       const provRes = await fetch(`${baseUrl}/api/auth/admin-provision-pin`, {
         method: 'POST',
         headers: {

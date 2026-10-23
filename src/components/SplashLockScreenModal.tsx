@@ -99,6 +99,14 @@ async function enrollHardwareWebAuthnPasskey(
     };
   }
 
+  if (!window.isSecureContext) {
+    return {
+      ok: false,
+      message:
+        'Donanım WebAuthn Passkey kaydı yalnızca güvenilir HTTPS origin (https://) üzerinde gerçekleştirilebilir (#22).',
+    };
+  }
+
   const optionsRes = await fetch('/api/auth/webauthn-register-options', {
     method: 'POST',
     headers: {
@@ -371,9 +379,6 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
         return;
       }
 
-      // Attempt hardware W3C WebAuthn Passkey enrollment if platform authenticator is available
-      await enrollHardwareWebAuthnPasskey(data.token).catch(() => null);
-
       setAuthenticating(false);
       onUnlock(data.user.role as ClubRole, data.token, data.user.rotaryId);
     } catch {
@@ -385,8 +390,8 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
   };
 
   /**
-   * Strict Hardware-Only W3C WebAuthn Assertion (`navigator.credentials.get`) (#12, #22, #76)
-   * Never falls back to software keypairs or client-fabricated authenticatorData flags!
+   * Strict Hardware-Only W3C WebAuthn Passkey Enrollment & Assertion (`navigator.credentials.create` / `navigator.credentials.get`) (#12, #22, #76)
+   * Enforces trusted HTTPS SecureContext and never falls back to software keypairs!
    */
   const handleWebAuthnVerify = async () => {
     if (!kvkkAccepted || authenticating) return;
@@ -394,12 +399,13 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
 
     if (
       typeof window === 'undefined' ||
+      !window.isSecureContext ||
       typeof window.PublicKeyCredential === 'undefined' ||
       !navigator.credentials ||
       typeof navigator.credentials.get !== 'function'
     ) {
       setErrorMessage(
-        'Gerçek cihaz doğrulaması zorunludur (#22): Bu tarayıcıda donanım W3C WebAuthn (Face ID / Touch ID / Windows Hello) bulunamadı.'
+        'Gerçek cihaz doğrulaması ve güvenilir HTTPS origin zorunludur (#22): Bu tarayıcıda donanım W3C WebAuthn (iPhone Face ID / Touch ID / FIDO2) bulunamadı.'
       );
       return;
     }
@@ -432,12 +438,54 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
         !Array.isArray(challengeData.allowCredentials) ||
         challengeData.allowCredentials.length === 0
       ) {
-        setErrorMessage(
-          'Bu hesap için sunucuda kayıtlı donanım WebAuthn Passkey bulunamadı. Lütfen önce Kurumsal PIN ile giriş yaparak cihazınızı kaydedin.'
-        );
-        setAuthenticating(false);
-        setWebAuthnStatus(null);
-        return;
+        if (pinInput.trim()) {
+          setWebAuthnStatus(
+            '1/2 · Kurumsal PIN doğrulanıyor ve iPhone / Donanım Passkey kaydı başlatılıyor...'
+          );
+          const loginRes = await fetch('/api/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              identifier: identifierInput.trim(),
+              pinCode: pinInput.trim(),
+              clubId: 'club-galata',
+            }),
+          });
+          const loginData = await loginRes.json();
+          if (!loginRes.ok || !loginData.ok || !loginData.token) {
+            setErrorMessage(
+              loginData?.message ||
+                'İlk Passkey cihaz kaydı için Kurumsal PIN doğrulaması başarısız oldu.'
+            );
+            setAuthenticating(false);
+            setWebAuthnStatus(null);
+            return;
+          }
+          const enrollResult = await enrollHardwareWebAuthnPasskey(
+            loginData.token
+          );
+          if (!enrollResult.ok) {
+            setErrorMessage(enrollResult.message);
+            setAuthenticating(false);
+            setWebAuthnStatus(null);
+            return;
+          }
+          setAuthenticating(false);
+          setWebAuthnStatus(null);
+          onUnlock(
+            loginData.user.role as ClubRole,
+            loginData.token,
+            loginData.user.rotaryId
+          );
+          return;
+        } else {
+          setErrorMessage(
+            'Bu hesap için sunucuda kayıtlı donanım WebAuthn Passkey bulunamadı. Cihazınızı kaydetmek için Kurumsal PIN alanını doldurup tekrar bu butona dokunun.'
+          );
+          setAuthenticating(false);
+          setWebAuthnStatus(null);
+          return;
+        }
       }
 
       const assertion = (await navigator.credentials.get({

@@ -164,25 +164,115 @@ function verifyTenantBoundary(
   return effectiveClubId;
 }
 
-function buildExpectedOriginsForHost(
-  req: Request,
-  rpId: string,
-  storedOrigin: string
-): Set<string> {
-  const hostHeader = req.get('host') || rpId || 'localhost';
-  return new Set([
-    storedOrigin,
-    `http://${hostHeader}`,
-    `https://${hostHeader}`,
-    `http://${rpId}`,
-    `https://${rpId}`,
-    `http://${rpId}:3000`,
-    `https://${rpId}:3000`,
-  ]);
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1']);
+
+function resolveTrustedWebAuthnRpAndOrigin(req: Request): {
+  rpId: string;
+  expectedOrigin: string;
+} {
+  const configuredOrigin = process.env.ROTACLUB_WEBAUTHN_ORIGIN?.trim();
+  if (configuredOrigin) {
+    try {
+      const parsed = new URL(configuredOrigin);
+      const rpId = parsed.hostname.toLowerCase();
+      const isLoopback = LOOPBACK_HOSTS.has(rpId);
+      const expectedOrigin = isLoopback
+        ? parsed.origin
+        : `https://${parsed.host.toLowerCase()}`;
+      return { rpId, expectedOrigin };
+    } catch {
+      // Fall through to request host resolution
+    }
+  }
+
+  const forwardedHost = String(req.get('x-forwarded-host') || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  const rawHost = (
+    forwardedHost ||
+    req.get('host') ||
+    req.hostname ||
+    'localhost'
+  )
+    .trim()
+    .toLowerCase();
+  const safeHost = /^[a-z0-9.-]+(?::\d{1,5})?$/.test(rawHost)
+    ? rawHost
+    : 'localhost';
+  const rpId = safeHost.split(':')[0] || 'localhost';
+  const isLoopback = LOOPBACK_HOSTS.has(rpId);
+
+  const forwardedProto = String(req.get('x-forwarded-proto') || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  const scheme = !isLoopback
+    ? 'https'
+    : forwardedProto === 'https' || req.protocol === 'https'
+    ? 'https'
+    : 'http';
+
+  return {
+    rpId,
+    expectedOrigin: `${scheme}://${safeHost}`,
+  };
 }
 
-export function createPilotExpressApp(customDbFile?: string) {
+/**
+ * Strict W3C WebAuthn Trusted HTTPS Origin Verifier (#22, #17):
+ * - Rejects crossOrigin: true iframes.
+ * - Rejects plaintext http:// origins on all non-loopback domains (only localhost / 127.0.0.1 may use http:// in local dev/CI).
+ * - Never trusts the incoming verify request's Host header, blocking Host-header origin spoofing.
+ */
+function isTrustedWebAuthnOrigin(
+  clientOrigin: string | undefined,
+  crossOrigin: boolean | undefined,
+  storedRpId: string,
+  storedExpectedOrigin: string
+): boolean {
+  if (crossOrigin === true || !clientOrigin || typeof clientOrigin !== 'string') {
+    return false;
+  }
+  let parsedClient: URL;
+  let parsedExpected: URL;
+  try {
+    parsedClient = new URL(clientOrigin);
+    parsedExpected = new URL(storedExpectedOrigin);
+  } catch {
+    return false;
+  }
+
+  const normalizedRpId = storedRpId.toLowerCase();
+  const isLoopback = LOOPBACK_HOSTS.has(normalizedRpId);
+
+  if (parsedClient.hostname.toLowerCase() !== normalizedRpId) {
+    return false;
+  }
+
+  if (!isLoopback) {
+    if (parsedClient.protocol !== 'https:') {
+      return false;
+    }
+    return (
+      parsedClient.origin.toLowerCase() ===
+        parsedExpected.origin.toLowerCase() ||
+      parsedClient.origin.toLowerCase() === `https://${normalizedRpId}`
+    );
+  }
+
+  if (parsedClient.protocol !== 'http:' && parsedClient.protocol !== 'https:') {
+    return false;
+  }
+  return parsedClient.port === parsedExpected.port;
+}
+
+export function createPilotExpressApp(
+  customDbFile?: string,
+  options?: { trustedWebAuthnRootPems?: string[] }
+) {
   const app = express();
+  app.set('trust proxy', 1);
   app.use(express.json({ limit: '2mb' }));
 
   // Prevent browser/proxy caching of sensitive club & financial API responses
@@ -276,6 +366,7 @@ export function createPilotExpressApp(customDbFile?: string) {
     const {
       bootstrapToken,
       ownershipToken,
+      clubId,
       rotaryId,
       email,
       newAdminPin,
@@ -284,6 +375,9 @@ export function createPilotExpressApp(customDbFile?: string) {
       sekreterPin,
       saymanPin,
       uyePin,
+      karakoyBaskanPin,
+      mackaBaskanPin,
+      districtGovPin,
     } = req.body || {};
 
     const headerBootstrapToken = req.headers['x-rotaclub-bootstrap-token'];
@@ -304,17 +398,21 @@ export function createPilotExpressApp(customDbFile?: string) {
       return;
     }
 
-    const mergedRolePins = {
+    const mergedRolePins: Record<string, string> = {
       ...(rolePins && typeof rolePins === 'object' ? rolePins : {}),
       ...(sekreterPin ? { sekreter: String(sekreterPin) } : {}),
       ...(saymanPin ? { sayman: String(saymanPin) } : {}),
       ...(uyePin ? { uye: String(uyePin) } : {}),
+      ...(karakoyBaskanPin ? { karakoyBaskan: String(karakoyBaskanPin) } : {}),
+      ...(mackaBaskanPin ? { mackaBaskan: String(mackaBaskanPin) } : {}),
+      ...(districtGovPin ? { districtGov: String(districtGovPin) } : {}),
     };
 
     const claimResult = store.claimInitialAdminBootstrap({
       bootstrapToken: effectiveBootstrapToken
         ? String(effectiveBootstrapToken)
         : undefined,
+      clubId: clubId ? String(clubId) : undefined,
       rotaryId: rotaryId ? String(rotaryId) : undefined,
       email: email ? String(email) : undefined,
       newAdminPin: String(effectiveAdminPin),
@@ -325,7 +423,8 @@ export function createPilotExpressApp(customDbFile?: string) {
     if (!claimResult.ok) {
       if (
         claimResult.error === 'INVALID_BOOTSTRAP_OWNERSHIP_TOKEN' ||
-        claimResult.error === 'BOOTSTRAP_IDENTITY_MISMATCH'
+        claimResult.error === 'BOOTSTRAP_IDENTITY_MISMATCH' ||
+        claimResult.error === 'CROSS_TENANT_BOOTSTRAP_FORBIDDEN'
       ) {
         const prevCount =
           record && now - record.windowStartMs < 5 * 60 * 1000
@@ -425,10 +524,11 @@ export function createPilotExpressApp(customDbFile?: string) {
 
       const provisioned = store.adminSetAccountPin(
         targetAcc.memberId,
-        String(newPin)
+        String(newPin),
+        authorizedClubId
       );
       if (!provisioned.ok) {
-        res.status(400).json({
+        res.status(provisioned.status || 400).json({
           error: provisioned.error,
           message: provisioned.message,
         });
@@ -661,10 +761,7 @@ export function createPilotExpressApp(customDbFile?: string) {
 
       const challenge = crypto.randomBytes(32).toString('base64url');
       const challengeId = crypto.randomUUID();
-      const rpId = req.hostname || 'localhost';
-      const expectedOrigin = `${req.protocol || 'http'}://${
-        req.get('host') || rpId
-      }`;
+      const { rpId, expectedOrigin } = resolveTrustedWebAuthnRpAndOrigin(req);
 
       activeChallenges.set(challengeId, {
         challenge,
@@ -681,6 +778,7 @@ export function createPilotExpressApp(customDbFile?: string) {
         challengeId,
         challenge,
         rpId,
+        expectedOrigin,
         rp: { name: 'RotaClub UR 2420. Bölge', id: rpId },
         user: {
           id: Buffer.from(account.memberId, 'utf8').toString('base64url'),
@@ -707,9 +805,8 @@ export function createPilotExpressApp(customDbFile?: string) {
   );
 
   // 3b. Authenticated WebAuthn Passkey Registration Verification (#12, #22, #76)
-  // Requires an authenticated session matching the challenge's memberId, strict origin check,
-  // and full W3C CBOR attestationObject + Attested Credential Data (AT=0x40, AAGUID, Credential ID, COSE_Key P-256) verification.
-  // Rejects software-synthesized 37-byte authenticatorData or fake registrations!
+  // Requires an authenticated session matching the challenge's memberId, strict HTTPS origin check,
+  // and full W3C CBOR attestationObject + X.509 Hardware PKI Trust Chain + Attested Credential Data verification.
   app.post(
     '/api/auth/webauthn-register-verify',
     requireAuth,
@@ -750,7 +847,12 @@ export function createPilotExpressApp(customDbFile?: string) {
         return;
       }
 
-      let parsedClientData: { type?: string; challenge?: string; origin?: string };
+      let parsedClientData: {
+        type?: string;
+        challenge?: string;
+        origin?: string;
+        crossOrigin?: boolean;
+      };
       try {
         const jsonStr = Buffer.from(
           String(clientDataJSON),
@@ -777,18 +879,17 @@ export function createPilotExpressApp(customDbFile?: string) {
         return;
       }
 
-      const allowedOrigins = buildExpectedOriginsForHost(
-        req,
-        stored.rpId,
-        stored.expectedOrigin
-      );
       if (
-        !parsedClientData.origin ||
-        !allowedOrigins.has(parsedClientData.origin)
+        !isTrustedWebAuthnOrigin(
+          parsedClientData.origin,
+          parsedClientData.crossOrigin,
+          stored.rpId,
+          stored.expectedOrigin
+        )
       ) {
         res.status(401).json({
           error: 'WEBAUTHN_ORIGIN_MISMATCH',
-          message: `WebAuthn origin doğrulaması reddedildi (#22): "${parsedClientData.origin}" beklenen sunucu origin değeri (${stored.expectedOrigin}) ile eşleşmiyor.`,
+          message: `WebAuthn güvenilir HTTPS origin doğrulaması reddedildi (#22): "${parsedClientData.origin}" beklenen sunucu origin değeri (${stored.expectedOrigin}) ile eşleşmiyor.`,
         });
         return;
       }
@@ -807,6 +908,7 @@ export function createPilotExpressApp(customDbFile?: string) {
           typeof authenticatorAttachment === 'string'
             ? authenticatorAttachment
             : undefined,
+        trustedRootPems: options?.trustedWebAuthnRootPems,
       });
 
       if (!verifiedReg.ok) {
@@ -900,10 +1002,7 @@ export function createPilotExpressApp(customDbFile?: string) {
 
     const challenge = crypto.randomBytes(32).toString('base64url');
     const challengeId = crypto.randomUUID();
-    const rpId = req.hostname || 'localhost';
-    const expectedOrigin = `${req.protocol || 'http'}://${
-      req.get('host') || rpId
-    }`;
+    const { rpId, expectedOrigin } = resolveTrustedWebAuthnRpAndOrigin(req);
 
     activeChallenges.set(challengeId, {
       challenge,
@@ -920,6 +1019,7 @@ export function createPilotExpressApp(customDbFile?: string) {
       challengeId,
       challenge,
       rpId,
+      expectedOrigin,
       userIdentifier: account.rotaryId,
       allowCredentials: account.webauthnCredentials.map((c) => ({
         type: 'public-key',
@@ -970,7 +1070,12 @@ export function createPilotExpressApp(customDbFile?: string) {
       return;
     }
 
-    let parsedClientData: { type?: string; challenge?: string; origin?: string };
+    let parsedClientData: {
+      type?: string;
+      challenge?: string;
+      origin?: string;
+      crossOrigin?: boolean;
+    };
     const rawClientDataBytes = Buffer.from(String(clientDataJSON), 'base64url');
     try {
       parsedClientData = JSON.parse(rawClientDataBytes.toString('utf8'));
@@ -994,18 +1099,17 @@ export function createPilotExpressApp(customDbFile?: string) {
       return;
     }
 
-    const allowedOrigins = buildExpectedOriginsForHost(
-      req,
-      stored.rpId,
-      stored.expectedOrigin
-    );
     if (
-      !parsedClientData.origin ||
-      !allowedOrigins.has(parsedClientData.origin)
+      !isTrustedWebAuthnOrigin(
+        parsedClientData.origin,
+        parsedClientData.crossOrigin,
+        stored.rpId,
+        stored.expectedOrigin
+      )
     ) {
       res.status(401).json({
         error: 'WEBAUTHN_ORIGIN_MISMATCH',
-        message: `WebAuthn origin doğrulaması reddedildi (#22): "${parsedClientData.origin}" sunucu origin değeri (${stored.expectedOrigin}) ile eşleşmiyor.`,
+        message: `WebAuthn güvenilir HTTPS origin doğrulaması reddedildi (#22): "${parsedClientData.origin}" sunucu origin değeri (${stored.expectedOrigin}) ile eşleşmiyor.`,
       });
       return;
     }

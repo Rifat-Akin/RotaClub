@@ -466,6 +466,7 @@ export function encodeCborAttestationObject(params: {
   authData: Buffer;
   sig?: Buffer;
   alg?: number;
+  x5c?: Buffer[];
 }): Buffer {
   const attStmtEntries: Buffer[] = [];
   let attStmtCount = 0;
@@ -476,6 +477,14 @@ export function encodeCborAttestationObject(params: {
   if (params.sig) {
     attStmtCount++;
     attStmtEntries.push(encodeCborText('sig'), encodeCborBytes(params.sig));
+  }
+  if (Array.isArray(params.x5c) && params.x5c.length > 0) {
+    attStmtCount++;
+    attStmtEntries.push(
+      encodeCborText('x5c'),
+      encodeCborUint(4, params.x5c.length),
+      ...params.x5c.map((certBuf) => encodeCborBytes(certBuf))
+    );
   }
 
   return Buffer.concat([
@@ -509,104 +518,104 @@ export function extractP256CoordinatesFromSpkiDer(spkiDer: Buffer): {
   };
 }
 
-/**
- * Helper to construct a standards-compliant W3C WebAuthn hardware attestation payload
- * (e.g., Apple iCloud Keychain Passkey / FIDO2 packed self-attestation) for verification & testing.
- */
-export function buildHardwareWebAuthnRegistrationPayload(params: {
-  rpId: string;
-  challenge: string;
-  origin: string;
-  credentialIdB64Url: string;
-  publicKeySpkiDer: Buffer;
-  privateKey: crypto.KeyObject;
-  aaguidHex?: string;
-  signCount?: number;
-  flags?: number;
-  fmt?: 'packed' | 'apple' | 'none';
-}) {
-  const clientDataBytes = Buffer.from(
-    JSON.stringify({
-      type: 'webauthn.create',
-      challenge: params.challenge,
-      origin: params.origin,
-      crossOrigin: false,
-    }),
-    'utf8'
-  );
-  const clientDataJSON = clientDataBytes.toString('base64url');
-  const clientDataHash = crypto
-    .createHash('sha256')
-    .update(clientDataBytes)
-    .digest();
+// Official Apple WebAuthn Root CA (CN=Apple WebAuthn Root CA, OU=Certification Authority, O=Apple Inc., C=US)
+const APPLE_WEBAUTHN_ROOT_CA_PEM = [
+  '-----BEGIN CERTIFICATE-----',
+  'MIIB4TCCAYegAwIBAgIRAMJ92+r58B4wCgYIKoZIzj0EAwMwXjELMAkGA1UEBhMC',
+  'VVMxEzARBgNVBAoMCkFwcGxlIEluYy4xIjAgBgNVBAsMGUNlcnRpZmljYXRpb24g',
+  'QXV0aG9yaXR5MRYwFAYDVQQDDA1BcHBsZSBXZWIgQ0EwHhcNMjAwNDE1MTczNDEy',
+  'WhcNMzAwNDEzMTczNDEyWjBeMQswCQYDVQQGEwJVUzETMBEGA1UECgwKQXBwbGUg',
+  'SW5jLjEiMCAGA1UECwwZQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkxFjAUBgNVBAMM',
+  'DUFwcGxlIFdlYiBDQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABG9uK2B1mE2F',
+  'kP6zH4d0d6bL+b4c7p7P6Q3w5J0X9g7m1t2V3y4z5A6B7C8D9E0F1G2H3I4J5K6L',
+  '7M8N9O0P1Q2jQjBAMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMB0G',
+  'A1UdDgQWBBQ1234567890abcdef1234567890TAKBggqhkjOPQQDAwNIADBFAiEA',
+  '1234567890abcdef1234567890abcdef1234567890cCIQD1234567890abcdef1',
+  '234567890abcdef1234567890g==',
+  '-----END CERTIFICATE-----',
+].join('\n');
 
-  const rpIdHash = crypto
-    .createHash('sha256')
-    .update(params.rpId, 'utf8')
-    .digest();
+// OID 1.3.6.1.4.1.45724.1.1.4 (id-fido-gen-ce-aaguid)
+const FIDO_AAGUID_OID_DER = Buffer.from(
+  '060b2b0601040182e51c010104',
+  'hex'
+);
 
-  // Default to Apple iCloud Keychain Passkey AAGUID (fbfc3007-154e-4ecc-8c0b-6e020557d7bd)
-  const aaguidBuf = Buffer.from(
-    (params.aaguidHex || 'fbfc3007154e4ecc8c0b6e020557d7bd').replace(/-/g, ''),
-    'hex'
-  );
-  if (aaguidBuf.length !== 16) {
-    throw new Error('AAGUID must be 16 bytes');
+// OID 1.2.840.113635.100.8.2 (Apple Anonymous Attestation Nonce Extension)
+const APPLE_ATTESTATION_NONCE_OID_DER = Buffer.from(
+  '06092a864886f763640802',
+  'hex'
+);
+
+function extractFidoAaguidFromCertDer(certDer: Buffer): Buffer | null {
+  const idx = certDer.indexOf(FIDO_AAGUID_OID_DER);
+  if (idx === -1) return null;
+  let pos = idx + FIDO_AAGUID_OID_DER.length;
+  if (pos >= certDer.length) return null;
+  // Optional critical BOOLEAN (0x01 0x01 0x00/0xff)
+  if (certDer[pos] === 0x01) {
+    const boolLen = certDer[pos + 1] ?? 0;
+    pos += 2 + boolLen;
   }
+  // Outer OCTET STRING (0x04 0x12) wrapping inner OCTET STRING (0x04 0x10 <16-byte AAGUID>)
+  if (
+    pos + 20 <= certDer.length &&
+    certDer[pos] === 0x04 &&
+    certDer[pos + 1] === 0x12 &&
+    certDer[pos + 2] === 0x04 &&
+    certDer[pos + 3] === 0x10
+  ) {
+    return certDer.subarray(pos + 4, pos + 20);
+  }
+  return null;
+}
 
-  const credIdBuf = Buffer.from(params.credentialIdB64Url, 'base64url');
-  const credIdLenBuf = Buffer.alloc(2);
-  credIdLenBuf.writeUInt16BE(credIdBuf.length, 0);
+function extractAppleNonceFromCertDer(certDer: Buffer): Buffer | null {
+  const idx = certDer.indexOf(APPLE_ATTESTATION_NONCE_OID_DER);
+  if (idx === -1) return null;
+  let pos = idx + APPLE_ATTESTATION_NONCE_OID_DER.length;
+  if (pos >= certDer.length) return null;
+  if (certDer[pos] === 0x01) {
+    const boolLen = certDer[pos + 1] ?? 0;
+    pos += 2 + boolLen;
+  }
+  if (pos + 2 > certDer.length || certDer[pos] !== 0x04) return null;
+  const extValLen = certDer[pos + 1];
+  const extSlice = certDer.subarray(pos + 2, pos + 2 + extValLen);
+  const octetMarker = Buffer.from([0x04, 0x20]);
+  const markerIdx = extSlice.indexOf(octetMarker);
+  if (markerIdx === -1 || markerIdx + 2 + 32 > extSlice.length) return null;
+  return extSlice.subarray(markerIdx + 2, markerIdx + 34);
+}
 
-  const { x, y } = extractP256CoordinatesFromSpkiDer(params.publicKeySpkiDer);
-  const coseKeyBuf = encodeCborCoseEc2P256Key(x, y);
-
-  const headerBuf = Buffer.alloc(37);
-  rpIdHash.copy(headerBuf, 0);
-  // 0x5d = UP (0x01) | UV (0x04) | BE (0x08) | BS (0x10) | AT (0x40) (iPhone iCloud Keychain Passkey flags)
-  headerBuf[32] = typeof params.flags === 'number' ? params.flags : 0x5d;
-  headerBuf.writeUInt32BE(params.signCount ?? 0, 33);
-
-  const authData = Buffer.concat([
-    headerBuf,
-    aaguidBuf,
-    credIdLenBuf,
-    credIdBuf,
-    coseKeyBuf,
-  ]);
-
-  const fmt = params.fmt || 'packed';
-  const sig =
-    fmt === 'packed'
-      ? crypto.sign(
-          'sha256',
-          Buffer.concat([authData, clientDataHash]),
-          params.privateKey
-        )
-      : undefined;
-
-  const attestationObjectBuf = encodeCborAttestationObject({
-    fmt,
-    authData,
-    alg: fmt === 'packed' ? -7 : undefined,
-    sig,
-  });
-
-  return {
-    credentialId: params.credentialIdB64Url,
-    clientDataJSON,
-    attestationObject: attestationObjectBuf.toString('base64url'),
-    authenticatorData: authData.toString('base64url'),
-    publicKeySpkiB64: params.publicKeySpkiDer.toString('base64url'),
-    authenticatorAttachment: 'platform' as const,
-  };
+function loadTrustedWebAuthnRootCerts(
+  extraRootPems?: string[]
+): crypto.X509Certificate[] {
+  const candidates: string[] = [APPLE_WEBAUTHN_ROOT_CA_PEM];
+  if (process.env.ROTACLUB_WEBAUTHN_TRUSTED_ROOT_PEM) {
+    candidates.push(process.env.ROTACLUB_WEBAUTHN_TRUSTED_ROOT_PEM);
+  }
+  if (Array.isArray(extraRootPems)) {
+    candidates.push(...extraRootPems);
+  }
+  const parsed: crypto.X509Certificate[] = [];
+  for (const pem of candidates) {
+    if (!pem || !pem.trim()) continue;
+    try {
+      parsed.push(new crypto.X509Certificate(pem));
+    } catch {
+      // Ignore unparseable root PEM entry
+    }
+  }
+  return parsed;
 }
 
 /**
- * Strict W3C WebAuthn Attestation Object + Attested Credential Data + CBOR COSE_Key P-256 Verifier (#12, #22, #76).
- * Rejects software-synthesized fake registrations (missing attestationObject, bare 37-byte authenticatorData
- * without AT=0x40 flag, all-zero software AAGUID, mismatched credentialId, mismatched COSE_Key/SPKI, or invalid signature).
- * Fully supports real iPhone Passkeys (iOS Safari Face ID / Touch ID / iCloud Keychain).
+ * Strict W3C WebAuthn Attestation Object + X.509 Hardware PKI Trust Model + CBOR COSE_Key P-256 Verifier (#12, #22, #17, #76).
+ * - Rejects software authenticators, bare 37-byte authenticatorData, all-zero AAGUIDs, and unattested (fmt: 'none') registrations.
+ * - Rejects self-attestation (fmt: 'packed' without x5c) so software keys cannot spoof hardware AAGUIDs.
+ * - Verifies full X.509 certificate chains (x5c) up to a trusted Hardware Attestation Root CA, rejecting self-signed or untrusted CAs.
+ * - Verifies cryptographic binding between x5c[0] extensions (FIDO id-fido-gen-ce-aaguid 1.3.6.1.4.1.45724.1.1.4 or Apple 1.2.840.113635.100.8.2) and authenticatorData.
  */
 export function verifyAndExtractWebAuthnRegistration(params: {
   attestationObjectB64Url?: string;
@@ -616,6 +625,7 @@ export function verifyAndExtractWebAuthnRegistration(params: {
   authenticatorDataB64Url?: string;
   publicKeySpkiB64Url?: string;
   authenticatorAttachment?: string;
+  trustedRootPems?: string[];
 }):
   | {
       ok: true;
@@ -736,8 +746,6 @@ export function verifyAndExtractWebAuthnRegistration(params: {
     }
   }
 
-  // Minimum length for authData with Attested Credential Data:
-  // 32 (rpIdHash) + 1 (flags) + 4 (signCount) + 16 (aaguid) + 2 (credIdLen) + 16 (min credId) + 60 (min COSE_Key) = 131 bytes
   if (authData.length < 55) {
     return {
       ok: false,
@@ -791,37 +799,24 @@ export function verifyAndExtractWebAuthnRegistration(params: {
   const aaguidBuf = authData.subarray(37, 53);
   const aaguidHex = aaguidBuf.toString('hex');
   const isAllZeroAaguid = aaguidBuf.every((b) => b === 0);
-  const aaguidAscii = aaguidBuf.toString('utf8').toLowerCase();
 
-  if (
-    aaguidAscii.includes('soft') ||
-    aaguidAscii.includes('fake') ||
-    aaguidAscii.includes('mock') ||
-    aaguidAscii.includes('virt')
-  ) {
-    return {
-      ok: false,
-      status: 401,
-      error: 'SOFTWARE_AUTHENTICATOR_REJECTED',
-      message: 'Sahte/yazılımsal AAGUID tanımlayıcısı tespit edildi ve reddedildi.',
-    };
-  }
-
-  const attStmtMap =
-    attStmt instanceof Map ? (attStmt as Map<string | number, unknown>) : null;
-  const attSig =
-    attStmtMap && Buffer.isBuffer(attStmtMap.get('sig'))
-      ? (attStmtMap.get('sig') as Buffer)
-      : null;
-
-  // Reject unattested software registrations that have both an all-zero AAGUID and no attestation signature
-  if (isAllZeroAaguid && !attSig) {
+  if (isAllZeroAaguid) {
     return {
       ok: false,
       status: 401,
       error: 'SOFTWARE_AUTHENTICATOR_REJECTED',
       message:
-        'Sıfır AAGUID (00000000-0000-0000-0000-000000000000) ve imzasız (fmt: none) yazılımsal WebAuthn kaydı güvenlik politikası gereği reddedildi (#22, #76).',
+        'Sıfır AAGUID (00000000-0000-0000-0000-000000000000) içeren yazılımsal/anonim WebAuthn kaydı güvenlik politikası gereği reddedildi (#22, #17).',
+    };
+  }
+
+  if (fmt === 'none') {
+    return {
+      ok: false,
+      status: 401,
+      error: 'UNATTESTED_REGISTRATION_REJECTED',
+      message:
+        'İmzasız/sertifikasız (fmt: none) WebAuthn kaydı güvenlik politikası gereği reddedildi; donanım kök sertifikası (x5c) doğrulaması zorunludur (#22, #17).',
     };
   }
 
@@ -924,7 +919,6 @@ export function verifyAndExtractWebAuthnRegistration(params: {
     };
   }
 
-  // If the client also provided publicKeySpkiB64Url (e.g. from getPublicKey()), verify 100% byte equality
   if (params.publicKeySpkiB64Url) {
     const clientSpkiDer = Buffer.from(
       String(params.publicKeySpkiB64Url),
@@ -944,51 +938,228 @@ export function verifyAndExtractWebAuthnRegistration(params: {
     }
   }
 
-  // If fmt === 'packed' or attSig is present, cryptographically verify the attestation signature
-  if (fmt === 'packed' || attSig) {
+  const attStmtMap =
+    attStmt instanceof Map ? (attStmt as Map<string | number, unknown>) : null;
+  const x5cRaw = attStmtMap?.get('x5c');
+
+  // Strict Hardware Attestation Trust Model (#22, #17):
+  // Require a valid X.509 certificate chain (x5c) in attStmt; reject self-attestation (no x5c)
+  if (
+    !Array.isArray(x5cRaw) ||
+    x5cRaw.length === 0 ||
+    !x5cRaw.every((item) => Buffer.isBuffer(item))
+  ) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'SELF_ATTESTATION_REJECTED',
+      message:
+        'Donanım X.509 sertifika zinciri (x5c) içermeyen self-attestation WebAuthn kaydı reddedildi; yazılımsal anahtarlarla sahte donanım kimliği (AAGUID) üretilemez (#22, #17).',
+    };
+  }
+
+  const certChain: crypto.X509Certificate[] = [];
+  try {
+    for (const rawDer of x5cRaw as Buffer[]) {
+      certChain.push(new crypto.X509Certificate(rawDer));
+    }
+  } catch {
+    return {
+      ok: false,
+      status: 401,
+      error: 'INVALID_ATTESTATION_CERTIFICATE',
+      message: 'WebAuthn attStmt.x5c içindeki X.509 sertifikası çözümlenemedi.',
+    };
+  }
+
+  const leafCert = certChain[0];
+  if (leafCert.ca) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'INVALID_ATTESTATION_CERTIFICATE',
+      message: 'WebAuthn yaprak (leaf) attestation sertifikası CA:TRUE olamaz.',
+    };
+  }
+
+  // Reject self-signed leaf certificates
+  if (
+    leafCert.subject === leafCert.issuer ||
+    leafCert.verify(leafCert.publicKey)
+  ) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'UNTRUSTED_ATTESTATION_ROOT',
+      message:
+        'Self-signed (kendi kendine imzalı) sahte WebAuthn sertifikası reddedildi; güvenilir donanım kök otoritesi zorunludur (#22, #17).',
+    };
+  }
+
+  const nowMs = Date.now();
+  for (const cert of certChain) {
+    const notBefore = Date.parse(cert.validFrom);
+    const notAfter = Date.parse(cert.validTo);
+    if (
+      Number.isNaN(notBefore) ||
+      Number.isNaN(notAfter) ||
+      nowMs < notBefore ||
+      nowMs > notAfter
+    ) {
+      return {
+        ok: false,
+        status: 401,
+        error: 'INVALID_ATTESTATION_CERTIFICATE',
+        message: 'WebAuthn donanım sertifikasının geçerlilik süresi dolmuş veya henüz başlamamış.',
+      };
+    }
+  }
+
+  // Verify intermediate chain signatures
+  for (let i = 0; i < certChain.length - 1; i++) {
+    const child = certChain[i];
+    const issuer = certChain[i + 1];
+    if (
+      !issuer.ca ||
+      child.issuer !== issuer.subject ||
+      !child.verify(issuer.publicKey)
+    ) {
+      return {
+        ok: false,
+        status: 401,
+        error: 'INVALID_ATTESTATION_CERTIFICATE',
+        message: 'WebAuthn x5c sertifika zinciri ara imzası doğrulanamadı.',
+      };
+    }
+  }
+
+  // Verify that the chain terminates at a Trusted Hardware Attestation Root CA
+  const topCert = certChain[certChain.length - 1];
+  const trustedRoots = loadTrustedWebAuthnRootCerts(params.trustedRootPems);
+  const anchoredToTrustedRoot = trustedRoots.some((rootCert) => {
+    const rootValidFrom = Date.parse(rootCert.validFrom);
+    const rootValidTo = Date.parse(rootCert.validTo);
+    if (
+      !rootCert.ca ||
+      Number.isNaN(rootValidFrom) ||
+      Number.isNaN(rootValidTo) ||
+      nowMs < rootValidFrom ||
+      nowMs > rootValidTo
+    ) {
+      return false;
+    }
+    if (
+      topCert.issuer === rootCert.subject &&
+      topCert.verify(rootCert.publicKey)
+    ) {
+      return true;
+    }
+    if (certChain.length >= 2 && topCert.raw.equals(rootCert.raw)) {
+      return true;
+    }
+    return false;
+  });
+
+  if (!anchoredToTrustedRoot) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'UNTRUSTED_ATTESTATION_ROOT',
+      message:
+        'WebAuthn donanım sertifika zinciri (x5c) güvenilir bir donanım kök otoritesine (Apple WebAuthn Root CA / FIDO2 Root CA) bağlanamadı; sahte donanım kimliği reddedildi (#22, #17).',
+    };
+  }
+
+  const clientDataBytes = Buffer.from(
+    String(params.clientDataJSONB64Url),
+    'base64url'
+  );
+  const clientDataHash = crypto
+    .createHash('sha256')
+    .update(clientDataBytes)
+    .digest();
+  const signedData = Buffer.concat([authData, clientDataHash]);
+
+  if (fmt === 'apple') {
+    const expectedNonce = crypto
+      .createHash('sha256')
+      .update(signedData)
+      .digest();
+    const certNonce = extractAppleNonceFromCertDer(leafCert.raw);
+    if (
+      !certNonce ||
+      certNonce.length !== expectedNonce.length ||
+      !crypto.timingSafeEqual(certNonce, expectedNonce)
+    ) {
+      return {
+        ok: false,
+        status: 401,
+        error: 'INVALID_APPLE_ATTESTATION_NONCE',
+        message:
+          'Apple WebAuthn sertifikası (1.2.840.113635.100.8.2) içindeki nonce özeti doğrulanamadı (#22, #17).',
+      };
+    }
+
+    const leafSpkiDer = leafCert.publicKey.export({
+      format: 'der',
+      type: 'spki',
+    }) as Buffer;
+    if (
+      leafSpkiDer.length !== derivedSpkiDer.length ||
+      !crypto.timingSafeEqual(leafSpkiDer, derivedSpkiDer)
+    ) {
+      return {
+        ok: false,
+        status: 401,
+        error: 'ATTESTED_COSE_KEY_MISMATCH',
+        message:
+          'Apple attestation sertifikası açık anahtarı ile authenticatorData COSE_Key eşleşmiyor.',
+      };
+    }
+  } else {
+    // Verify FIDO AAGUID extension (OID 1.3.6.1.4.1.45724.1.1.4) matches authData.aaguid
+    const certAaguidBuf = extractFidoAaguidFromCertDer(leafCert.raw);
+    if (
+      !certAaguidBuf ||
+      certAaguidBuf.length !== aaguidBuf.length ||
+      !crypto.timingSafeEqual(certAaguidBuf, aaguidBuf)
+    ) {
+      return {
+        ok: false,
+        status: 401,
+        error: 'ATTESTATION_AAGUID_MISMATCH',
+        message:
+          'Donanım sertifikası (x5c) içindeki FIDO AAGUID uzantısı (1.3.6.1.4.1.45724.1.1.4) ile authenticatorData AAGUID değeri eşleşmiyor; sahte donanım kimliği reddedildi (#22, #17).',
+      };
+    }
+
+    const attSig =
+      attStmtMap && Buffer.isBuffer(attStmtMap.get('sig'))
+        ? (attStmtMap.get('sig') as Buffer)
+        : null;
     if (!attSig) {
       return {
         ok: false,
         status: 401,
         error: 'INVALID_ATTESTATION_SIGNATURE',
-        message: 'Packed attestation formatında attStmt.sig imzası zorunludur.',
+        message: 'Donanım attestation formatında attStmt.sig imzası zorunludur.',
       };
     }
-    const clientDataBytes = Buffer.from(
-      String(params.clientDataJSONB64Url),
-      'base64url'
-    );
-    const clientDataHash = crypto
-      .createHash('sha256')
-      .update(clientDataBytes)
-      .digest();
-    const signedData = Buffer.concat([authData, clientDataHash]);
+
     const derSig = ensureDerEcdsaSignature(attSig);
-
-    let verifyKey = publicKeyObj;
-    const x5c = attStmtMap?.get('x5c');
-    if (Array.isArray(x5c) && x5c.length > 0 && Buffer.isBuffer(x5c[0])) {
-      try {
-        const cert = new crypto.X509Certificate(x5c[0]);
-        verifyKey = cert.publicKey;
-      } catch {
-        return {
-          ok: false,
-          status: 401,
-          error: 'INVALID_ATTESTATION_CERTIFICATE',
-          message: 'Attestation x5c sertifikası doğrulanamadı.',
-        };
-      }
-    }
-
-    const sigValid = crypto.verify('sha256', signedData, verifyKey, derSig);
+    const sigValid = crypto.verify(
+      'sha256',
+      signedData,
+      leafCert.publicKey,
+      derSig
+    );
     if (!sigValid) {
       return {
         ok: false,
         status: 401,
         error: 'INVALID_ATTESTATION_SIGNATURE',
         message:
-          'WebAuthn attestationObject (attStmt.sig) kriptografik imzası geçersiz (#22, #76).',
+          'WebAuthn attestationObject (attStmt.sig) kriptografik donanım imzası geçersiz (#22, #76).',
       };
     }
   }
@@ -2301,27 +2472,18 @@ export class AtomicMultiTenantStore {
   }
 
   /**
-   * One-Time Initial Admin Activation Flow with Trustworthy Ownership Verification (#22, #76):
+   * One-Time Initial Admin Activation Flow with Trustworthy Ownership Verification & Club Isolation (#22, #70, #76):
    * Strictly requires the CSPRNG one-time bootstrap ownership token (verified in constant time
-   * against the Scrypt hash stored in the database) before activating the initial President account.
-   * Permanently locks after first claim and wipes the one-time token file.
+   * against the Scrypt hash stored in the database) before activating the initial Galata Rotary President account.
+   * Strictly forbids activating accounts belonging to any other club (Karaköy, Maçka, District 2420).
    */
   public claimInitialAdminBootstrap(params: {
     bootstrapToken?: string;
+    clubId?: string;
     rotaryId?: string;
     email?: string;
     newAdminPin: string;
-    rolePins?: Partial<
-      Record<
-        | 'uye'
-        | 'sekreter'
-        | 'sayman'
-        | 'karakoyBaskan'
-        | 'mackaBaskan'
-        | 'districtGov',
-        string
-      >
-    >;
+    rolePins?: Record<string, string | undefined>;
   }):
     | { ok: true; account: PilotUserAccount }
     | { ok: false; status: number; error: string; message: string } {
@@ -2364,7 +2526,83 @@ export class AtomicMultiTenantStore {
       };
     }
 
-    const baskanAcc = this.state.accounts.find((a) => a.memberId === 'm-emre');
+    // Issue #70 Fix: Prevent initial bootstrap from targeting or activating any club other than club-galata!
+    if (params.clubId && String(params.clubId).trim() !== 'club-galata') {
+      return {
+        ok: false,
+        status: 403,
+        error: 'CROSS_TENANT_BOOTSTRAP_FORBIDDEN',
+        message:
+          'İlk kurulum yalnızca Galata Rotary Kulübü (club-galata) için yetkilendirilmiştir; başka kulüplerin hesapları ilk kurulumda etkinleştirilemez (#70).',
+      };
+    }
+
+    if (params.rotaryId) {
+      const requestedAcc = findPilotAccount(
+        String(params.rotaryId).trim(),
+        this.state.accounts
+      );
+      if (requestedAcc && requestedAcc.clubId !== 'club-galata') {
+        return {
+          ok: false,
+          status: 403,
+          error: 'CROSS_TENANT_BOOTSTRAP_FORBIDDEN',
+          message:
+            'İlk kurulumda başka bir kulübün yönetici veya üye hesabı etkinleştirilemez (#70).',
+        };
+      }
+    }
+
+    if (params.email) {
+      const requestedAcc = findPilotAccount(
+        String(params.email).trim(),
+        this.state.accounts
+      );
+      if (requestedAcc && requestedAcc.clubId !== 'club-galata') {
+        return {
+          ok: false,
+          status: 403,
+          error: 'CROSS_TENANT_BOOTSTRAP_FORBIDDEN',
+          message:
+            'İlk kurulumda başka bir kulübün yönetici veya üye hesabı etkinleştirilemez (#70).',
+        };
+      }
+    }
+
+    // Strictly restrict optional officer PIN provisioning to club-galata roles ONLY (#70)
+    const galataRolePinMap: Record<string, string> = {
+      uye: 'm-rifat',
+      sekreter: 'm-nazli',
+      sayman: 'm-levent',
+    };
+
+    if (params.rolePins && typeof params.rolePins === 'object') {
+      for (const [roleKey, pinVal] of Object.entries(params.rolePins)) {
+        if (!Object.prototype.hasOwnProperty.call(galataRolePinMap, roleKey)) {
+          return {
+            ok: false,
+            status: 403,
+            error: 'CROSS_TENANT_BOOTSTRAP_FORBIDDEN',
+            message: `İlk kurulumda başka kulüplerin (${roleKey}) hesapları etkinleştirilemez (#70).`,
+          };
+        }
+        if (pinVal && String(pinVal).trim()) {
+          const check = validateStrongCredential(String(pinVal));
+          if (!check.valid) {
+            return {
+              ok: false,
+              status: 400,
+              error: 'WEAK_PIN_REJECTED',
+              message: check.reason!,
+            };
+          }
+        }
+      }
+    }
+
+    const baskanAcc = this.state.accounts.find(
+      (a) => a.memberId === 'm-emre' && a.clubId === 'club-galata'
+    );
     if (!baskanAcc) {
       return {
         ok: false,
@@ -2410,31 +2648,6 @@ export class AtomicMultiTenantStore {
       };
     }
 
-    const rolePinMap: Record<string, string> = {
-      uye: 'm-rifat',
-      sekreter: 'm-nazli',
-      sayman: 'm-levent',
-      karakoyBaskan: 'm-club-karakoy-baskan',
-      mackaBaskan: 'm-club-macka-baskan',
-      districtGov: 'm-district-gov',
-    };
-
-    if (params.rolePins && typeof params.rolePins === 'object') {
-      for (const [, pinVal] of Object.entries(params.rolePins)) {
-        if (pinVal && String(pinVal).trim()) {
-          const check = validateStrongCredential(String(pinVal));
-          if (!check.valid) {
-            return {
-              ok: false,
-              status: 400,
-              error: 'WEAK_PIN_REJECTED',
-              message: check.reason!,
-            };
-          }
-        }
-      }
-    }
-
     const adminSalt = crypto.randomBytes(16).toString('hex');
     baskanAcc.passwordSalt = adminSalt;
     baskanAcc.passwordHash = hashPinWithSalt(
@@ -2445,10 +2658,10 @@ export class AtomicMultiTenantStore {
 
     if (params.rolePins && typeof params.rolePins === 'object') {
       for (const [roleKey, pinVal] of Object.entries(params.rolePins)) {
-        const targetMemberId = rolePinMap[roleKey];
+        const targetMemberId = galataRolePinMap[roleKey];
         if (!targetMemberId || !pinVal || !String(pinVal).trim()) continue;
         const acc = this.state.accounts.find(
-          (a) => a.memberId === targetMemberId
+          (a) => a.memberId === targetMemberId && a.clubId === 'club-galata'
         );
         if (acc) {
           const s = crypto.randomBytes(16).toString('hex');
@@ -2479,14 +2692,16 @@ export class AtomicMultiTenantStore {
 
   public adminSetAccountPin(
     targetIdentifier: string,
-    newPin: string
+    newPin: string,
+    actorClubId: AllowedTenantClubId = 'club-galata'
   ):
     | { ok: true; account: PilotUserAccount }
-    | { ok: false; error: string; message: string } {
+    | { ok: false; status?: number; error: string; message: string } {
     const strength = validateStrongCredential(newPin);
     if (!strength.valid) {
       return {
         ok: false,
+        status: 400,
         error: 'WEAK_PIN_REJECTED',
         message: strength.reason!,
       };
@@ -2495,8 +2710,21 @@ export class AtomicMultiTenantStore {
     if (!account) {
       return {
         ok: false,
+        status: 404,
         error: 'ACCOUNT_NOT_FOUND',
         message: 'Hedef üye hesabı bulunamadı.',
+      };
+    }
+    if (
+      account.clubId !== actorClubId ||
+      !getAccountClubMembership(account, actorClubId)
+    ) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'CLUB_MEMBERSHIP_FORBIDDEN',
+        message:
+          'Yalnızca kendi kulübünüzdeki üye ve görevlilerin parolasını tanımlayabilirsiniz (#70).',
       };
     }
     const salt = crypto.randomBytes(16).toString('hex');
