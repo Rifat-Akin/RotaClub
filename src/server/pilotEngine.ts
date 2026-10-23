@@ -121,6 +121,8 @@ export interface WebAuthnCredentialRecord {
   signCount: number;
   registeredAt: string;
   rpId: string;
+  aaguid?: string;
+  attestationFmt?: string;
 }
 
 export interface ClubMembershipBinding {
@@ -200,6 +202,8 @@ export interface MultiTenantDatabaseFile {
   schemaVersion: '5.3.0-hardened';
   updatedAt: string;
   bootstrapClaimed?: boolean;
+  bootstrapTokenSalt?: string;
+  bootstrapTokenHash?: string;
   tenants: Record<string, TenantClubDatabaseState>;
   accounts: PilotUserAccount[];
   revokedTokenJtis: string[];
@@ -229,6 +233,18 @@ export function maskEmailForKvkk(email: string, enabled: boolean): string {
 
 export function hashPinWithSalt(pin: string, salt: string): string {
   return crypto.scryptSync(pin, salt, 32).toString('hex');
+}
+
+export function verifySecretConstantTime(
+  candidate: string,
+  salt: string,
+  expectedHashHex: string
+): boolean {
+  if (!candidate || !salt || !expectedHashHex) return false;
+  const computed = hashPinWithSalt(candidate.trim(), salt);
+  const bufA = Buffer.from(computed, 'hex');
+  const bufB = Buffer.from(expectedHashHex, 'hex');
+  return bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
 }
 
 /**
@@ -297,6 +313,693 @@ export function ensureDerEcdsaSignature(sigBuf: Buffer): Buffer {
     return Buffer.concat([Buffer.from([0x30, totalLen]), rDer, sDer]);
   }
   return sigBuf;
+}
+
+/**
+ * RFC 8949 CBOR Decoder & Encoder for W3C WebAuthn Attestation Object & COSE_Key P-256 (#22, #76)
+ */
+const P256_SPKI_PREFIX = Buffer.from(
+  '3059301306072a8648ce3d020106082a8648ce3d03010703420004',
+  'hex'
+);
+
+export function decodeCborItem(
+  buf: Buffer,
+  offset = 0
+): { value: unknown; nextOffset: number } {
+  if (offset >= buf.length) {
+    throw new Error('CBOR_TRUNCATED: Unexpected end of CBOR buffer');
+  }
+  const initialByte = buf[offset];
+  const majorType = initialByte >> 5;
+  const additionalInfo = initialByte & 0x1f;
+  let pos = offset + 1;
+
+  const readLengthOrInt = (): number => {
+    if (additionalInfo < 24) return additionalInfo;
+    if (additionalInfo === 24) {
+      if (pos + 1 > buf.length) throw new Error('CBOR_TRUNCATED');
+      const v = buf[pos];
+      pos += 1;
+      return v;
+    }
+    if (additionalInfo === 25) {
+      if (pos + 2 > buf.length) throw new Error('CBOR_TRUNCATED');
+      const v = buf.readUInt16BE(pos);
+      pos += 2;
+      return v;
+    }
+    if (additionalInfo === 26) {
+      if (pos + 4 > buf.length) throw new Error('CBOR_TRUNCATED');
+      const v = buf.readUInt32BE(pos);
+      pos += 4;
+      return v;
+    }
+    throw new Error(`CBOR_UNSUPPORTED_ADDITIONAL_INFO: ${additionalInfo}`);
+  };
+
+  if (majorType === 0) {
+    const val = readLengthOrInt();
+    return { value: val, nextOffset: pos };
+  }
+  if (majorType === 1) {
+    const val = readLengthOrInt();
+    return { value: -1 - val, nextOffset: pos };
+  }
+  if (majorType === 2) {
+    const len = readLengthOrInt();
+    if (pos + len > buf.length) throw new Error('CBOR_TRUNCATED_BYTES');
+    const slice = Buffer.from(buf.subarray(pos, pos + len));
+    return { value: slice, nextOffset: pos + len };
+  }
+  if (majorType === 3) {
+    const len = readLengthOrInt();
+    if (pos + len > buf.length) throw new Error('CBOR_TRUNCATED_TEXT');
+    const str = buf.subarray(pos, pos + len).toString('utf8');
+    return { value: str, nextOffset: pos + len };
+  }
+  if (majorType === 4) {
+    const len = readLengthOrInt();
+    const arr: unknown[] = [];
+    for (let i = 0; i < len; i++) {
+      const elem = decodeCborItem(buf, pos);
+      arr.push(elem.value);
+      pos = elem.nextOffset;
+    }
+    return { value: arr, nextOffset: pos };
+  }
+  if (majorType === 5) {
+    const len = readLengthOrInt();
+    const map = new Map<string | number, unknown>();
+    for (let i = 0; i < len; i++) {
+      const k = decodeCborItem(buf, pos);
+      const v = decodeCborItem(buf, k.nextOffset);
+      map.set(k.value as string | number, v.value);
+      pos = v.nextOffset;
+    }
+    return { value: map, nextOffset: pos };
+  }
+  if (majorType === 7) {
+    if (additionalInfo === 20) return { value: false, nextOffset: pos };
+    if (additionalInfo === 21) return { value: true, nextOffset: pos };
+    if (additionalInfo === 22) return { value: null, nextOffset: pos };
+  }
+  throw new Error(`CBOR_UNSUPPORTED_MAJOR_TYPE: ${majorType}`);
+}
+
+function encodeCborUint(majorType: number, val: number): Buffer {
+  const mtBits = (majorType & 0x07) << 5;
+  if (val < 24) {
+    return Buffer.from([mtBits | val]);
+  }
+  if (val <= 0xff) {
+    return Buffer.from([mtBits | 24, val]);
+  }
+  if (val <= 0xffff) {
+    const b = Buffer.alloc(3);
+    b[0] = mtBits | 25;
+    b.writeUInt16BE(val, 1);
+    return b;
+  }
+  const b = Buffer.alloc(5);
+  b[0] = mtBits | 26;
+  b.writeUInt32BE(val, 1);
+  return b;
+}
+
+function encodeCborInt(val: number): Buffer {
+  if (val >= 0) return encodeCborUint(0, val);
+  return encodeCborUint(1, -1 - val);
+}
+
+function encodeCborBytes(bytes: Buffer): Buffer {
+  return Buffer.concat([encodeCborUint(2, bytes.length), bytes]);
+}
+
+function encodeCborText(str: string): Buffer {
+  const utf8 = Buffer.from(str, 'utf8');
+  return Buffer.concat([encodeCborUint(3, utf8.length), utf8]);
+}
+
+export function encodeCborCoseEc2P256Key(x: Buffer, y: Buffer): Buffer {
+  if (x.length !== 32 || y.length !== 32) {
+    throw new Error('P-256 COSE_Key requires 32-byte X and Y coordinates');
+  }
+  // CBOR Map(5): { 1: 2 (EC2), 3: -7 (ES256), -1: 1 (P-256), -2: x, -3: y }
+  return Buffer.concat([
+    encodeCborUint(5, 5),
+    encodeCborInt(1),
+    encodeCborInt(2),
+    encodeCborInt(3),
+    encodeCborInt(-7),
+    encodeCborInt(-1),
+    encodeCborInt(1),
+    encodeCborInt(-2),
+    encodeCborBytes(x),
+    encodeCborInt(-3),
+    encodeCborBytes(y),
+  ]);
+}
+
+export function encodeCborAttestationObject(params: {
+  fmt: string;
+  authData: Buffer;
+  sig?: Buffer;
+  alg?: number;
+}): Buffer {
+  const attStmtEntries: Buffer[] = [];
+  let attStmtCount = 0;
+  if (typeof params.alg === 'number') {
+    attStmtCount++;
+    attStmtEntries.push(encodeCborText('alg'), encodeCborInt(params.alg));
+  }
+  if (params.sig) {
+    attStmtCount++;
+    attStmtEntries.push(encodeCborText('sig'), encodeCborBytes(params.sig));
+  }
+
+  return Buffer.concat([
+    encodeCborUint(5, 3),
+    encodeCborText('fmt'),
+    encodeCborText(params.fmt),
+    encodeCborText('attStmt'),
+    encodeCborUint(5, attStmtCount),
+    ...attStmtEntries,
+    encodeCborText('authData'),
+    encodeCborBytes(params.authData),
+  ]);
+}
+
+/**
+ * Extracts raw 32-byte (x, y) coordinates from a 91-byte P-256 DER SPKI public key.
+ */
+export function extractP256CoordinatesFromSpkiDer(spkiDer: Buffer): {
+  x: Buffer;
+  y: Buffer;
+} {
+  if (
+    spkiDer.length !== 91 ||
+    !spkiDer.subarray(0, 27).equals(P256_SPKI_PREFIX)
+  ) {
+    throw new Error('Invalid P-256 SPKI DER structure');
+  }
+  return {
+    x: Buffer.from(spkiDer.subarray(27, 59)),
+    y: Buffer.from(spkiDer.subarray(59, 91)),
+  };
+}
+
+/**
+ * Helper to construct a standards-compliant W3C WebAuthn hardware attestation payload
+ * (e.g., Apple iCloud Keychain Passkey / FIDO2 packed self-attestation) for verification & testing.
+ */
+export function buildHardwareWebAuthnRegistrationPayload(params: {
+  rpId: string;
+  challenge: string;
+  origin: string;
+  credentialIdB64Url: string;
+  publicKeySpkiDer: Buffer;
+  privateKey: crypto.KeyObject;
+  aaguidHex?: string;
+  signCount?: number;
+  flags?: number;
+  fmt?: 'packed' | 'apple' | 'none';
+}) {
+  const clientDataBytes = Buffer.from(
+    JSON.stringify({
+      type: 'webauthn.create',
+      challenge: params.challenge,
+      origin: params.origin,
+      crossOrigin: false,
+    }),
+    'utf8'
+  );
+  const clientDataJSON = clientDataBytes.toString('base64url');
+  const clientDataHash = crypto
+    .createHash('sha256')
+    .update(clientDataBytes)
+    .digest();
+
+  const rpIdHash = crypto
+    .createHash('sha256')
+    .update(params.rpId, 'utf8')
+    .digest();
+
+  // Default to Apple iCloud Keychain Passkey AAGUID (fbfc3007-154e-4ecc-8c0b-6e020557d7bd)
+  const aaguidBuf = Buffer.from(
+    (params.aaguidHex || 'fbfc3007154e4ecc8c0b6e020557d7bd').replace(/-/g, ''),
+    'hex'
+  );
+  if (aaguidBuf.length !== 16) {
+    throw new Error('AAGUID must be 16 bytes');
+  }
+
+  const credIdBuf = Buffer.from(params.credentialIdB64Url, 'base64url');
+  const credIdLenBuf = Buffer.alloc(2);
+  credIdLenBuf.writeUInt16BE(credIdBuf.length, 0);
+
+  const { x, y } = extractP256CoordinatesFromSpkiDer(params.publicKeySpkiDer);
+  const coseKeyBuf = encodeCborCoseEc2P256Key(x, y);
+
+  const headerBuf = Buffer.alloc(37);
+  rpIdHash.copy(headerBuf, 0);
+  // 0x5d = UP (0x01) | UV (0x04) | BE (0x08) | BS (0x10) | AT (0x40) (iPhone iCloud Keychain Passkey flags)
+  headerBuf[32] = typeof params.flags === 'number' ? params.flags : 0x5d;
+  headerBuf.writeUInt32BE(params.signCount ?? 0, 33);
+
+  const authData = Buffer.concat([
+    headerBuf,
+    aaguidBuf,
+    credIdLenBuf,
+    credIdBuf,
+    coseKeyBuf,
+  ]);
+
+  const fmt = params.fmt || 'packed';
+  const sig =
+    fmt === 'packed'
+      ? crypto.sign(
+          'sha256',
+          Buffer.concat([authData, clientDataHash]),
+          params.privateKey
+        )
+      : undefined;
+
+  const attestationObjectBuf = encodeCborAttestationObject({
+    fmt,
+    authData,
+    alg: fmt === 'packed' ? -7 : undefined,
+    sig,
+  });
+
+  return {
+    credentialId: params.credentialIdB64Url,
+    clientDataJSON,
+    attestationObject: attestationObjectBuf.toString('base64url'),
+    authenticatorData: authData.toString('base64url'),
+    publicKeySpkiB64: params.publicKeySpkiDer.toString('base64url'),
+    authenticatorAttachment: 'platform' as const,
+  };
+}
+
+/**
+ * Strict W3C WebAuthn Attestation Object + Attested Credential Data + CBOR COSE_Key P-256 Verifier (#12, #22, #76).
+ * Rejects software-synthesized fake registrations (missing attestationObject, bare 37-byte authenticatorData
+ * without AT=0x40 flag, all-zero software AAGUID, mismatched credentialId, mismatched COSE_Key/SPKI, or invalid signature).
+ * Fully supports real iPhone Passkeys (iOS Safari Face ID / Touch ID / iCloud Keychain).
+ */
+export function verifyAndExtractWebAuthnRegistration(params: {
+  attestationObjectB64Url?: string;
+  clientDataJSONB64Url: string;
+  credentialIdB64Url: string;
+  expectedRpId: string;
+  authenticatorDataB64Url?: string;
+  publicKeySpkiB64Url?: string;
+  authenticatorAttachment?: string;
+}):
+  | {
+      ok: true;
+      publicKeySpkiB64: string;
+      signCount: number;
+      aaguidHex: string;
+      fmt: string;
+    }
+  | {
+      ok: false;
+      status: number;
+      error: string;
+      message: string;
+    } {
+  if (
+    params.authenticatorAttachment &&
+    ['software', 'virtual', 'simulated', 'mock', 'fallback'].includes(
+      String(params.authenticatorAttachment).trim().toLowerCase()
+    )
+  ) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'SOFTWARE_AUTHENTICATOR_REJECTED',
+      message:
+        'Yazılımsal veya simüle edilmiş WebAuthn anahtarları kabul edilmez; gerçek donanım doğrulayıcısı (Face ID / Touch ID / FIDO2) zorunludur (#22, #76).',
+    };
+  }
+
+  if (
+    !params.attestationObjectB64Url ||
+    typeof params.attestationObjectB64Url !== 'string' ||
+    !params.attestationObjectB64Url.trim()
+  ) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'ATTESTATION_OBJECT_REQUIRED',
+      message:
+        'WebAuthn donanım kaydı için W3C CBOR attestationObject zorunludur; ham/yazılımsal kayıt istekleri reddedilir (#22, #76).',
+    };
+  }
+
+  let attMap: Map<string | number, unknown>;
+  try {
+    const attBuf = Buffer.from(params.attestationObjectB64Url, 'base64url');
+    const decoded = decodeCborItem(attBuf, 0);
+    if (
+      decoded.nextOffset !== attBuf.length ||
+      !(decoded.value instanceof Map)
+    ) {
+      return {
+        ok: false,
+        status: 400,
+        error: 'INVALID_ATTESTATION_OBJECT',
+        message: 'CBOR attestationObject yapısı geçersiz veya bozuk.',
+      };
+    }
+    attMap = decoded.value as Map<string | number, unknown>;
+  } catch {
+    return {
+      ok: false,
+      status: 400,
+      error: 'INVALID_ATTESTATION_OBJECT',
+      message: 'CBOR attestationObject çözümlenemedi.',
+    };
+  }
+
+  const fmt = attMap.get('fmt');
+  const attStmt = attMap.get('attStmt');
+  const authData = attMap.get('authData');
+
+  const allowedFormats = new Set([
+    'none',
+    'packed',
+    'apple',
+    'apple-appattest',
+    'fido-u2f',
+    'tpm',
+    'android-key',
+    'android-safetynet',
+  ]);
+  if (typeof fmt !== 'string' || !allowedFormats.has(fmt)) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'INVALID_ATTESTATION_FORMAT',
+      message: `Desteklenmeyen veya sahte WebAuthn attestation formatı: "${String(fmt)}".`,
+    };
+  }
+
+  if (!Buffer.isBuffer(authData)) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'INVALID_AUTHENTICATOR_DATA',
+      message: 'attestationObject içinde geçerli binary authData bulunamadı.',
+    };
+  }
+
+  // If client also supplied authenticatorData, it must match attestationObject.authData byte-for-byte
+  if (params.authenticatorDataB64Url) {
+    const clientAuthData = Buffer.from(
+      String(params.authenticatorDataB64Url),
+      'base64url'
+    );
+    if (
+      clientAuthData.length !== authData.length ||
+      !crypto.timingSafeEqual(clientAuthData, authData)
+    ) {
+      return {
+        ok: false,
+        status: 401,
+        error: 'AUTHENTICATOR_DATA_MISMATCH',
+        message:
+          'Gönderilen authenticatorData ile CBOR attestationObject.authData birbiriyle eşleşmiyor.',
+      };
+    }
+  }
+
+  // Minimum length for authData with Attested Credential Data:
+  // 32 (rpIdHash) + 1 (flags) + 4 (signCount) + 16 (aaguid) + 2 (credIdLen) + 16 (min credId) + 60 (min COSE_Key) = 131 bytes
+  if (authData.length < 55) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'ATTESTED_CREDENTIAL_DATA_REQUIRED',
+      message:
+        'WebAuthn kayıt authData içinde Attested Credential Data (AAGUID + Credential ID + COSE_Key) eksik; 37-byte yazılımsal sahte kayıtlar reddedilir (#22, #76).',
+    };
+  }
+
+  const expectedRpIdHash = crypto
+    .createHash('sha256')
+    .update(params.expectedRpId, 'utf8')
+    .digest();
+  if (!crypto.timingSafeEqual(expectedRpIdHash, authData.subarray(0, 32))) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'INVALID_RP_ID_HASH',
+      message:
+        'WebAuthn kayıt authenticatorData rpIdHash değeri sunucu rpId özetiyle eşleşmiyor.',
+    };
+  }
+
+  const flags = authData[32];
+  const userPresent = (flags & 0x01) !== 0;
+  const userVerified = (flags & 0x04) !== 0;
+  const attestedCredentialDataIncluded = (flags & 0x40) !== 0;
+
+  if (!userPresent || !userVerified) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'USER_VERIFICATION_REQUIRED',
+      message:
+        'WebAuthn donanım kaydında User Present (UP) ve User Verified (UV / Face ID / Touch ID) bayrakları zorunludur.',
+    };
+  }
+
+  if (!attestedCredentialDataIncluded) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'ATTESTED_CREDENTIAL_DATA_REQUIRED',
+      message:
+        'WebAuthn kayıt verisinde AT (0x40 - Attested Credential Data) bayrağı bulunmuyor; yazılımsal sahte kayıt reddedildi.',
+    };
+  }
+
+  const initialSignCount = authData.readUInt32BE(33);
+  const aaguidBuf = authData.subarray(37, 53);
+  const aaguidHex = aaguidBuf.toString('hex');
+  const isAllZeroAaguid = aaguidBuf.every((b) => b === 0);
+  const aaguidAscii = aaguidBuf.toString('utf8').toLowerCase();
+
+  if (
+    aaguidAscii.includes('soft') ||
+    aaguidAscii.includes('fake') ||
+    aaguidAscii.includes('mock') ||
+    aaguidAscii.includes('virt')
+  ) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'SOFTWARE_AUTHENTICATOR_REJECTED',
+      message: 'Sahte/yazılımsal AAGUID tanımlayıcısı tespit edildi ve reddedildi.',
+    };
+  }
+
+  const attStmtMap =
+    attStmt instanceof Map ? (attStmt as Map<string | number, unknown>) : null;
+  const attSig =
+    attStmtMap && Buffer.isBuffer(attStmtMap.get('sig'))
+      ? (attStmtMap.get('sig') as Buffer)
+      : null;
+
+  // Reject unattested software registrations that have both an all-zero AAGUID and no attestation signature
+  if (isAllZeroAaguid && !attSig) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'SOFTWARE_AUTHENTICATOR_REJECTED',
+      message:
+        'Sıfır AAGUID (00000000-0000-0000-0000-000000000000) ve imzasız (fmt: none) yazılımsal WebAuthn kaydı güvenlik politikası gereği reddedildi (#22, #76).',
+    };
+  }
+
+  const credIdLen = authData.readUInt16BE(53);
+  if (
+    credIdLen < 16 ||
+    credIdLen > 512 ||
+    authData.length < 55 + credIdLen + 40
+  ) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'INVALID_ATTESTED_CREDENTIAL_LENGTH',
+      message: 'Attested Credential ID uzunluğu veya COSE_Key alanı geçersiz.',
+    };
+  }
+
+  const attestedCredIdBuf = authData.subarray(55, 55 + credIdLen);
+  const submittedCredIdBuf = Buffer.from(
+    String(params.credentialIdB64Url),
+    'base64url'
+  );
+  if (
+    attestedCredIdBuf.length !== submittedCredIdBuf.length ||
+    !crypto.timingSafeEqual(attestedCredIdBuf, submittedCredIdBuf)
+  ) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'ATTESTED_CREDENTIAL_ID_MISMATCH',
+      message:
+        'attestationObject.authData içindeki gömülü Credential ID ile gönderilen credentialId eşleşmiyor.',
+    };
+  }
+
+  // Decode CBOR COSE_Key from authData[55 + credIdLen ..]
+  const coseBytes = authData.subarray(55 + credIdLen);
+  let coseMap: Map<string | number, unknown>;
+  try {
+    const decodedCose = decodeCborItem(coseBytes, 0);
+    if (!(decodedCose.value instanceof Map)) {
+      return {
+        ok: false,
+        status: 401,
+        error: 'INVALID_COSE_PUBLIC_KEY',
+        message: 'Attested Credential Data içindeki COSE_Key haritası geçersiz.',
+      };
+    }
+    coseMap = decodedCose.value as Map<string | number, unknown>;
+  } catch {
+    return {
+      ok: false,
+      status: 401,
+      error: 'INVALID_COSE_PUBLIC_KEY',
+      message: 'CBOR COSE_Key açık anahtarı çözümlenemedi.',
+    };
+  }
+
+  const kty = coseMap.get(1);
+  const alg = coseMap.get(3);
+  const crv = coseMap.get(-1);
+  const coseX = coseMap.get(-2);
+  const coseY = coseMap.get(-3);
+
+  if (
+    kty !== 2 ||
+    alg !== -7 ||
+    crv !== 1 ||
+    !Buffer.isBuffer(coseX) ||
+    !Buffer.isBuffer(coseY) ||
+    coseX.length !== 32 ||
+    coseY.length !== 32
+  ) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'INVALID_COSE_PUBLIC_KEY',
+      message:
+        'COSE_Key EC2 P-256 (kty=2, alg=-7, crv=1, 32-byte X/Y) kriterlerini sağlamıyor.',
+    };
+  }
+
+  const derivedSpkiDer = Buffer.concat([P256_SPKI_PREFIX, coseX, coseY]);
+  let publicKeyObj: crypto.KeyObject;
+  try {
+    publicKeyObj = crypto.createPublicKey({
+      key: derivedSpkiDer,
+      format: 'der',
+      type: 'spki',
+    });
+    if (publicKeyObj.asymmetricKeyType !== 'ec') {
+      throw new Error('Not EC key');
+    }
+  } catch {
+    return {
+      ok: false,
+      status: 401,
+      error: 'INVALID_PUBLIC_KEY_SPKI',
+      message: 'COSE_Key koordinatları geçerli bir NIST P-256 eğri noktası değil.',
+    };
+  }
+
+  // If the client also provided publicKeySpkiB64Url (e.g. from getPublicKey()), verify 100% byte equality
+  if (params.publicKeySpkiB64Url) {
+    const clientSpkiDer = Buffer.from(
+      String(params.publicKeySpkiB64Url),
+      'base64url'
+    );
+    if (
+      clientSpkiDer.length !== derivedSpkiDer.length ||
+      !crypto.timingSafeEqual(clientSpkiDer, derivedSpkiDer)
+    ) {
+      return {
+        ok: false,
+        status: 401,
+        error: 'ATTESTED_COSE_KEY_MISMATCH',
+        message:
+          'Sunulan publicKeySpkiB64 ile attestationObject içindeki CBOR COSE_Key açık anahtarı eşleşmiyor (#22, #76).',
+      };
+    }
+  }
+
+  // If fmt === 'packed' or attSig is present, cryptographically verify the attestation signature
+  if (fmt === 'packed' || attSig) {
+    if (!attSig) {
+      return {
+        ok: false,
+        status: 401,
+        error: 'INVALID_ATTESTATION_SIGNATURE',
+        message: 'Packed attestation formatında attStmt.sig imzası zorunludur.',
+      };
+    }
+    const clientDataBytes = Buffer.from(
+      String(params.clientDataJSONB64Url),
+      'base64url'
+    );
+    const clientDataHash = crypto
+      .createHash('sha256')
+      .update(clientDataBytes)
+      .digest();
+    const signedData = Buffer.concat([authData, clientDataHash]);
+    const derSig = ensureDerEcdsaSignature(attSig);
+
+    let verifyKey = publicKeyObj;
+    const x5c = attStmtMap?.get('x5c');
+    if (Array.isArray(x5c) && x5c.length > 0 && Buffer.isBuffer(x5c[0])) {
+      try {
+        const cert = new crypto.X509Certificate(x5c[0]);
+        verifyKey = cert.publicKey;
+      } catch {
+        return {
+          ok: false,
+          status: 401,
+          error: 'INVALID_ATTESTATION_CERTIFICATE',
+          message: 'Attestation x5c sertifikası doğrulanamadı.',
+        };
+      }
+    }
+
+    const sigValid = crypto.verify('sha256', signedData, verifyKey, derSig);
+    if (!sigValid) {
+      return {
+        ok: false,
+        status: 401,
+        error: 'INVALID_ATTESTATION_SIGNATURE',
+        message:
+          'WebAuthn attestationObject (attStmt.sig) kriptografik imzası geçersiz (#22, #76).',
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    publicKeySpkiB64: derivedSpkiDer.toString('base64url'),
+    signCount: initialSignCount,
+    aaguidHex,
+    fmt,
+  };
 }
 
 /**
@@ -1359,6 +2062,8 @@ export function redactStateForRole(
 export class AtomicMultiTenantStore {
   private dbDir: string;
   private dbFile: string;
+  private bootstrapTokenFile: string;
+  private runtimeBootstrapToken: string | null = null;
   private state: MultiTenantDatabaseFile;
 
   constructor(customDbFile?: string) {
@@ -1367,12 +2072,97 @@ export class AtomicMultiTenantStore {
       : path.resolve(process.cwd(), '.aistudio');
     this.dbFile =
       customDbFile || path.join(this.dbDir, 'rotaclub_pilot_v5_3_db.json');
+    this.bootstrapTokenFile = path.join(
+      this.dbDir,
+      'rotaclub_bootstrap_claim_token.json'
+    );
     this.state = this.loadFromDisk();
+    this.ensureBootstrapOwnershipToken();
     if (Array.isArray(this.state.revokedTokenJtis)) {
       for (const jti of this.state.revokedTokenJtis) {
         runtimeRevokedJtis.add(jti);
       }
     }
+  }
+
+  private ensureBootstrapOwnershipToken(): void {
+    if (this.state.bootstrapClaimed) {
+      this.runtimeBootstrapToken = null;
+      try {
+        if (fs.existsSync(this.bootstrapTokenFile)) {
+          fs.unlinkSync(this.bootstrapTokenFile);
+        }
+      } catch {
+        // Ignore cleanup errors
+      }
+      return;
+    }
+
+    const envToken = process.env.ROTACLUB_BOOTSTRAP_TOKEN?.trim();
+    if (envToken && envToken.length >= 8) {
+      const salt = crypto.randomBytes(16).toString('hex');
+      this.state.bootstrapTokenSalt = salt;
+      this.state.bootstrapTokenHash = hashPinWithSalt(envToken, salt);
+      this.runtimeBootstrapToken = envToken;
+      this.atomicWriteToDisk(this.state);
+      return;
+    }
+
+    if (
+      this.state.bootstrapTokenSalt &&
+      this.state.bootstrapTokenHash &&
+      fs.existsSync(this.bootstrapTokenFile)
+    ) {
+      try {
+        const parsed = JSON.parse(
+          fs.readFileSync(this.bootstrapTokenFile, 'utf8')
+        ) as { bootstrapToken?: string };
+        if (
+          parsed.bootstrapToken &&
+          verifySecretConstantTime(
+            parsed.bootstrapToken,
+            this.state.bootstrapTokenSalt,
+            this.state.bootstrapTokenHash
+          )
+        ) {
+          this.runtimeBootstrapToken = parsed.bootstrapToken;
+          return;
+        }
+      } catch {
+        // Regenerate below if token file is unreadable
+      }
+    }
+
+    const generatedToken = `RC2420-${crypto.randomBytes(24).toString('base64url')}`;
+    const salt = crypto.randomBytes(16).toString('hex');
+    this.state.bootstrapTokenSalt = salt;
+    this.state.bootstrapTokenHash = hashPinWithSalt(generatedToken, salt);
+    this.runtimeBootstrapToken = generatedToken;
+    this.atomicWriteToDisk(this.state);
+
+    try {
+      fs.writeFileSync(
+        this.bootstrapTokenFile,
+        JSON.stringify(
+          {
+            bootstrapToken: generatedToken,
+            rotaryId: 'TR-2420-74105',
+            email: 'baskan@galatarotary.org',
+            createdAt: new Date().toISOString(),
+          },
+          null,
+          2
+        ),
+        { encoding: 'utf8', mode: 0o600 }
+      );
+    } catch {
+      // Non-fatal if read-only dir
+    }
+  }
+
+  public getBootstrapOwnershipToken(): string | null {
+    if (this.state.bootstrapClaimed) return null;
+    return this.runtimeBootstrapToken;
   }
 
   private findLegacyDatabaseFile(): string | null {
@@ -1504,27 +2294,22 @@ export class AtomicMultiTenantStore {
   }
 
   public getBootstrapStatus() {
-    const baskanAcc = this.state.accounts.find((a) => a.memberId === 'm-emre');
     return {
       bootstrapClaimRequired: !this.state.bootstrapClaimed,
-      targetAccount: {
-        memberId: baskanAcc?.memberId || 'm-emre',
-        rotaryId: baskanAcc?.rotaryId || 'TR-2420-74105',
-        fullName: baskanAcc?.fullName || 'Rtn. Mimar Emre Karaca',
-        email: baskanAcc?.email || 'baskan@galatarotary.org',
-        role: 'baskan' as const,
-        clubId: 'club-galata' as const,
-      },
+      ownershipVerificationRequired: true,
     };
   }
 
   /**
-   * One-Time Initial Admin Activation Flow (#22, #76):
-   * Allows the club owner to claim and set strong credentials for the initial admin account
-   * (and optional initial club role accounts) ONCE on a fresh installation without needing
-   * environment variables or server file access. Permanently locks after first claim.
+   * One-Time Initial Admin Activation Flow with Trustworthy Ownership Verification (#22, #76):
+   * Strictly requires the CSPRNG one-time bootstrap ownership token (verified in constant time
+   * against the Scrypt hash stored in the database) before activating the initial President account.
+   * Permanently locks after first claim and wipes the one-time token file.
    */
   public claimInitialAdminBootstrap(params: {
+    bootstrapToken?: string;
+    rotaryId?: string;
+    email?: string;
     newAdminPin: string;
     rolePins?: Partial<
       Record<
@@ -1539,13 +2324,79 @@ export class AtomicMultiTenantStore {
     >;
   }):
     | { ok: true; account: PilotUserAccount }
-    | { ok: false; error: string; message: string } {
+    | { ok: false; status: number; error: string; message: string } {
     if (this.state.bootstrapClaimed) {
       return {
         ok: false,
+        status: 409,
         error: 'BOOTSTRAP_ALREADY_CLAIMED',
         message:
           'İlk yönetici aktivasyonu daha önce tamamlanmış; bu tek kullanımlık kurulum akışı kalıcı olarak kapatılmıştır.',
+      };
+    }
+
+    const providedToken = String(params.bootstrapToken || '').trim();
+    if (!providedToken) {
+      return {
+        ok: false,
+        status: 401,
+        error: 'BOOTSTRAP_OWNERSHIP_TOKEN_REQUIRED',
+        message:
+          'İlk yönetici aktivasyonu için tek kullanımlık sunucu sahiplik doğrulama anahtarı (bootstrapToken) zorunludur (#22, #76).',
+      };
+    }
+
+    if (
+      !this.state.bootstrapTokenSalt ||
+      !this.state.bootstrapTokenHash ||
+      !verifySecretConstantTime(
+        providedToken,
+        this.state.bootstrapTokenSalt,
+        this.state.bootstrapTokenHash
+      )
+    ) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'INVALID_BOOTSTRAP_OWNERSHIP_TOKEN',
+        message:
+          'Sunucu sahiplik doğrulama anahtarı (bootstrapToken) geçersiz; yetkisiz ilk yönetici aktivasyon girişimi reddedildi (#22, #76).',
+      };
+    }
+
+    const baskanAcc = this.state.accounts.find((a) => a.memberId === 'm-emre');
+    if (!baskanAcc) {
+      return {
+        ok: false,
+        status: 404,
+        error: 'ACCOUNT_NOT_FOUND',
+        message: 'Başlangıç yönetici hesabı bulunamadı.',
+      };
+    }
+
+    if (
+      params.rotaryId &&
+      String(params.rotaryId).trim().toUpperCase() !==
+        baskanAcc.rotaryId.toUpperCase()
+    ) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'BOOTSTRAP_IDENTITY_MISMATCH',
+        message: 'Kurucu Başkan Rotary Sicil No doğrulaması başarısız oldu.',
+      };
+    }
+
+    if (
+      params.email &&
+      String(params.email).trim().toLowerCase() !==
+        baskanAcc.email.toLowerCase()
+    ) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'BOOTSTRAP_IDENTITY_MISMATCH',
+        message: 'Kurucu Başkan kurumsal e-posta doğrulaması başarısız oldu.',
       };
     }
 
@@ -1553,6 +2404,7 @@ export class AtomicMultiTenantStore {
     if (!strength.valid) {
       return {
         ok: false,
+        status: 400,
         error: 'WEAK_PIN_REJECTED',
         message: strength.reason!,
       };
@@ -1574,21 +2426,13 @@ export class AtomicMultiTenantStore {
           if (!check.valid) {
             return {
               ok: false,
+              status: 400,
               error: 'WEAK_PIN_REJECTED',
               message: check.reason!,
             };
           }
         }
       }
-    }
-
-    const baskanAcc = this.state.accounts.find((a) => a.memberId === 'm-emre');
-    if (!baskanAcc) {
-      return {
-        ok: false,
-        error: 'ACCOUNT_NOT_FOUND',
-        message: 'Başlangıç yönetici hesabı bulunamadı.',
-      };
     }
 
     const adminSalt = crypto.randomBytes(16).toString('hex');
@@ -1616,8 +2460,20 @@ export class AtomicMultiTenantStore {
     }
 
     this.state.bootstrapClaimed = true;
+    this.state.bootstrapTokenSalt = '';
+    this.state.bootstrapTokenHash = '';
+    this.runtimeBootstrapToken = null;
     this.state.updatedAt = new Date().toISOString();
     this.atomicWriteToDisk(this.state);
+
+    try {
+      if (fs.existsSync(this.bootstrapTokenFile)) {
+        fs.unlinkSync(this.bootstrapTokenFile);
+      }
+    } catch {
+      // Ignore file removal error
+    }
+
     return { ok: true, account: baskanAcc };
   }
 

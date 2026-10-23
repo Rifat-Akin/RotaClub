@@ -17,6 +17,7 @@ import {
   normalizePersonName,
   redactStateForRole,
   revokeTokenJti,
+  verifyAndExtractWebAuthnRegistration,
   verifyAuditChain,
   verifySignedToken,
 } from './src/server/pilotEngine';
@@ -242,16 +243,41 @@ export function createPilotExpressApp(customDbFile?: string) {
     });
   });
 
+  // Brute-force bootstrap ownership verification rate limiter (#22, #76)
+  const bootstrapAttempts = new Map<
+    string,
+    { failedCount: number; windowStartMs: number }
+  >();
+
   // 1b. One-Time Initial Admin Activation Status (#22, #76)
   app.get('/api/auth/bootstrap-status', (_req, res) => {
     res.json(store.getBootstrapStatus());
   });
 
-  // 1c. One-Time Initial Admin Claim & Activation Endpoint (#22, #76)
-  // Allows the club owner to securely activate the initial President account on first run
-  // without needing environment variables or plaintext files. Permanently locks after first use!
+  // 1c. One-Time Initial Admin Claim & Activation Endpoint with Ownership Verification (#22, #76)
+  // Strictly verifies the one-time CSPRNG bootstrap ownership token in constant time and permanently locks after first use!
   app.post('/api/auth/bootstrap-claim', (req, res) => {
+    const rateKey = String(req.ip || 'bootstrap-global');
+    const now = Date.now();
+    const record = bootstrapAttempts.get(rateKey);
+    if (
+      record &&
+      now - record.windowStartMs < 5 * 60 * 1000 &&
+      record.failedCount >= 5
+    ) {
+      res.status(429).json({
+        error: 'TOO_MANY_BOOTSTRAP_ATTEMPTS',
+        message:
+          'Çok fazla başarısız kurulum sahiplik doğrulama denemesi tespit edildi. Lütfen 5 dakika sonra tekrar deneyin.',
+      });
+      return;
+    }
+
     const {
+      bootstrapToken,
+      ownershipToken,
+      rotaryId,
+      email,
       newAdminPin,
       baskanPin,
       rolePins,
@@ -259,11 +285,21 @@ export function createPilotExpressApp(customDbFile?: string) {
       saymanPin,
       uyePin,
     } = req.body || {};
+
+    const headerBootstrapToken = req.headers['x-rotaclub-bootstrap-token'];
+    const effectiveBootstrapToken =
+      bootstrapToken ||
+      ownershipToken ||
+      (typeof headerBootstrapToken === 'string'
+        ? headerBootstrapToken
+        : undefined);
+
     const effectiveAdminPin = newAdminPin || baskanPin;
     if (!effectiveAdminPin) {
       res.status(400).json({
         error: 'MISSING_ADMIN_PIN',
-        message: 'İlk yönetici aktivasyonu için güçlü bir parola/PIN (newAdminPin) zorunludur.',
+        message:
+          'İlk yönetici aktivasyonu için güçlü bir parola/PIN (newAdminPin) zorunludur.',
       });
       return;
     }
@@ -276,20 +312,38 @@ export function createPilotExpressApp(customDbFile?: string) {
     };
 
     const claimResult = store.claimInitialAdminBootstrap({
+      bootstrapToken: effectiveBootstrapToken
+        ? String(effectiveBootstrapToken)
+        : undefined,
+      rotaryId: rotaryId ? String(rotaryId) : undefined,
+      email: email ? String(email) : undefined,
       newAdminPin: String(effectiveAdminPin),
       rolePins:
         Object.keys(mergedRolePins).length > 0 ? mergedRolePins : undefined,
     });
 
     if (!claimResult.ok) {
-      const status =
-        claimResult.error === 'BOOTSTRAP_ALREADY_CLAIMED' ? 409 : 400;
-      res.status(status).json({
+      if (
+        claimResult.error === 'INVALID_BOOTSTRAP_OWNERSHIP_TOKEN' ||
+        claimResult.error === 'BOOTSTRAP_IDENTITY_MISMATCH'
+      ) {
+        const prevCount =
+          record && now - record.windowStartMs < 5 * 60 * 1000
+            ? record.failedCount
+            : 0;
+        bootstrapAttempts.set(rateKey, {
+          failedCount: prevCount + 1,
+          windowStartMs: record ? record.windowStartMs : now,
+        });
+      }
+      res.status(claimResult.status).json({
         error: claimResult.error,
         message: claimResult.message,
       });
       return;
     }
+
+    bootstrapAttempts.delete(rateKey);
 
     const account = claimResult.account;
     const token = issueSignedToken({
@@ -309,8 +363,8 @@ export function createPilotExpressApp(customDbFile?: string) {
       actorRole: account.role,
       module: 'Yönetim & Güvenlik',
       action:
-        'Tek Kullanımlık İlk Yönetici Aktivasyonu Tamamlandı (Bootstrap Claimed)',
-      detail: `${account.fullName} ilk kurulum yönetici hesabını CSPRNG salt + Scrypt ile etkinleştirdi; kurulum uç noktası kalıcı olarak kilitlendi.`,
+        'Tek Kullanımlık İlk Yönetici Aktivasyonu Tamamlandı (Sahiplik Doğrulandı)',
+      detail: `${account.fullName} sunucu sahiplik doğrulama anahtarı (bootstrapToken) ve CSPRNG Scrypt ile ilk kurulum yönetici hesabını etkinleştirdi; kurulum uç noktası kalıcı olarak kilitlendi.`,
       timestamp: formatNowTR(),
     });
 
@@ -589,7 +643,7 @@ export function createPilotExpressApp(customDbFile?: string) {
     }
   );
 
-  // 3a. Authenticated WebAuthn Passkey Registration Options (#12, #22)
+  // 3a. Authenticated WebAuthn Passkey Registration Options (#12, #22, #76)
   // Requires an authenticated session so an unauthenticated caller can NEVER register a passkey on someone else's account!
   app.post(
     '/api/auth/webauthn-register-options',
@@ -637,14 +691,25 @@ export function createPilotExpressApp(customDbFile?: string) {
           { type: 'public-key', alg: -7 }, // ES256 (ECDSA P-256 with SHA-256)
           { type: 'public-key', alg: -257 }, // RS256
         ],
-        timeout: 30000,
-        attestation: 'none',
+        authenticatorSelection: {
+          authenticatorAttachment: 'platform',
+          residentKey: 'preferred',
+          userVerification: 'required',
+        },
+        excludeCredentials: (account.webauthnCredentials || []).map((c) => ({
+          id: c.credentialId,
+          type: 'public-key' as const,
+        })),
+        timeout: 60000,
+        attestation: 'direct',
       });
     }
   );
 
-  // 3b. Authenticated WebAuthn Passkey Registration Verification (#12, #22)
-  // Requires an authenticated session matching the challenge's memberId, strict origin check, authenticatorData UP+UV verification, and a valid SPKI public key!
+  // 3b. Authenticated WebAuthn Passkey Registration Verification (#12, #22, #76)
+  // Requires an authenticated session matching the challenge's memberId, strict origin check,
+  // and full W3C CBOR attestationObject + Attested Credential Data (AT=0x40, AAGUID, Credential ID, COSE_Key P-256) verification.
+  // Rejects software-synthesized 37-byte authenticatorData or fake registrations!
   app.post(
     '/api/auth/webauthn-register-verify',
     requireAuth,
@@ -654,20 +719,16 @@ export function createPilotExpressApp(customDbFile?: string) {
         challengeId,
         credentialId,
         clientDataJSON,
+        attestationObject,
         authenticatorData,
         publicKeySpkiB64,
+        authenticatorAttachment,
       } = req.body || {};
-      if (
-        !challengeId ||
-        !credentialId ||
-        !clientDataJSON ||
-        !authenticatorData ||
-        !publicKeySpkiB64
-      ) {
+      if (!challengeId || !credentialId || !clientDataJSON) {
         res.status(400).json({
           error: 'MISSING_WEBAUTHN_REGISTRATION_DATA',
           message:
-            'WebAuthn donanım kayıt doğrulaması için challengeId, credentialId, clientDataJSON, authenticatorData ve publicKeySpkiB64 (ECDSA P-256 SPKI) zorunludur.',
+            'WebAuthn donanım kayıt doğrulaması için challengeId, credentialId, clientDataJSON ve CBOR attestationObject zorunludur.',
         });
         return;
       }
@@ -732,62 +793,38 @@ export function createPilotExpressApp(customDbFile?: string) {
         return;
       }
 
-      // Verify registration authenticatorData (rpIdHash + UP/UV flags)
-      const regAuthDataBuf = Buffer.from(String(authenticatorData), 'base64url');
-      if (regAuthDataBuf.length < 37) {
-        res.status(401).json({
-          error: 'INVALID_AUTHENTICATOR_DATA',
-          message: 'WebAuthn kayıt authenticatorData en az 37 byte olmalıdır.',
-        });
-        return;
-      }
-      const expectedRpIdHash = crypto
-        .createHash('sha256')
-        .update(stored.rpId, 'utf8')
-        .digest();
-      if (
-        !crypto.timingSafeEqual(expectedRpIdHash, regAuthDataBuf.subarray(0, 32))
-      ) {
-        res.status(401).json({
-          error: 'INVALID_RP_ID_HASH',
-          message:
-            'WebAuthn kayıt authenticatorData rpIdHash değeri sunucu rpId özetiyle eşleşmiyor.',
-        });
-        return;
-      }
-      const regFlags = regAuthDataBuf[32];
-      if ((regFlags & 0x01) === 0 || (regFlags & 0x04) === 0) {
-        res.status(401).json({
-          error: 'USER_VERIFICATION_REQUIRED',
-          message:
-            'WebAuthn donanım kaydında User Present (UP) ve User Verified (UV) bayrakları zorunludur.',
-        });
-        return;
-      }
+      const verifiedReg = verifyAndExtractWebAuthnRegistration({
+        attestationObjectB64Url:
+          typeof attestationObject === 'string' ? attestationObject : undefined,
+        clientDataJSONB64Url: String(clientDataJSON),
+        credentialIdB64Url: String(credentialId),
+        expectedRpId: stored.rpId,
+        authenticatorDataB64Url:
+          typeof authenticatorData === 'string' ? authenticatorData : undefined,
+        publicKeySpkiB64Url:
+          typeof publicKeySpkiB64 === 'string' ? publicKeySpkiB64 : undefined,
+        authenticatorAttachment:
+          typeof authenticatorAttachment === 'string'
+            ? authenticatorAttachment
+            : undefined,
+      });
 
-      // Validate that publicKeySpkiB64 is a genuine cryptographic SPKI public key
-      try {
-        crypto.createPublicKey({
-          key: Buffer.from(String(publicKeySpkiB64), 'base64url'),
-          format: 'der',
-          type: 'spki',
-        });
-      } catch {
-        res.status(400).json({
-          error: 'INVALID_PUBLIC_KEY_SPKI',
-          message: 'Sunulan publicKeySpkiB64 geçerli bir DER SPKI açık anahtar değil.',
+      if (!verifiedReg.ok) {
+        res.status(verifiedReg.status).json({
+          error: verifiedReg.error,
+          message: verifiedReg.message,
         });
         return;
       }
-
-      const initialSignCount = regAuthDataBuf.readUInt32BE(33);
 
       const account = store.registerWebAuthnCredential(user.memberId, {
         credentialId: String(credentialId),
-        publicKeySpkiB64: String(publicKeySpkiB64),
-        signCount: initialSignCount,
+        publicKeySpkiB64: verifiedReg.publicKeySpkiB64,
+        signCount: verifiedReg.signCount,
         registeredAt: new Date().toISOString(),
         rpId: stored.rpId,
+        aaguid: verifiedReg.aaguidHex,
+        attestationFmt: verifiedReg.fmt,
       });
 
       if (!account) {
@@ -804,7 +841,10 @@ export function createPilotExpressApp(customDbFile?: string) {
         actorRole: user.role,
         module: 'Yönetim & Güvenlik',
         action: 'Donanım WebAuthn ECDSA P-256 Passkey Açık Anahtarı Kaydedildi',
-        detail: `${account.fullName} için doğrulanmış SPKI açık anahtarlı Passkey (${String(
+        detail: `${account.fullName} için CBOR Attestation (${verifiedReg.fmt}, AAGUID: ${verifiedReg.aaguidHex.slice(
+          0,
+          8
+        )}...) ve COSE_Key P-256 doğrulamalı Passkey (${String(
           credentialId
         ).slice(0, 14)}...) kaydedildi.`,
         timestamp: formatNowTR(),
@@ -813,6 +853,8 @@ export function createPilotExpressApp(customDbFile?: string) {
       res.json({
         ok: true,
         credentialId: String(credentialId),
+        aaguid: verifiedReg.aaguidHex,
+        fmt: verifiedReg.fmt,
       });
     }
   );

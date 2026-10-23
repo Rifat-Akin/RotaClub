@@ -6,6 +6,10 @@ import os from 'os';
 import path from 'path';
 import type { Server } from 'http';
 import { createPilotExpressApp } from '../../server';
+import {
+  buildHardwareWebAuthnRegistrationPayload,
+  encodeCborAttestationObject,
+} from './pilotEngine';
 
 // Configure test environment credentials via environment variables (no hardcoded PINs in production source code)
 process.env.ROTACLUB_PIN_UYE = 'GalataUye#2026';
@@ -289,9 +293,11 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, st
     const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
       namedCurve: 'prime256v1',
     });
-    const publicKeySpkiB64 = (
-      publicKey.export({ type: 'spki', format: 'der' }) as Buffer
-    ).toString('base64url');
+    const publicKeySpkiDer = publicKey.export({
+      type: 'spki',
+      format: 'der',
+    }) as Buffer;
+    const publicKeySpkiB64 = publicKeySpkiDer.toString('base64url');
     const credentialId = crypto.randomBytes(16).toString('base64url');
 
     // 2b. Attempting registration with a mismatched phishing origin is rejected with 401 WEBAUTHN_ORIGIN_MISMATCH (#22)
@@ -333,7 +339,146 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, st
     const badOriginRegBody = await badOriginRegRes.json();
     assert.equal(badOriginRegBody.error, 'WEBAUTHN_ORIGIN_MISMATCH');
 
-    // Request fresh registration options and register with the legitimate origin
+    // 2c. Attempting software-synthesized registration WITHOUT CBOR attestationObject (only 37-byte authenticatorData) MUST be rejected with 400 ATTESTATION_OBJECT_REQUIRED (#22, #76)
+    const regOptSoftRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-options`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+      }
+    );
+    const regOptSoft = await regOptSoftRes.json();
+    const softClientData = Buffer.from(
+      JSON.stringify({
+        type: 'webauthn.create',
+        challenge: regOptSoft.challenge,
+        origin: baseUrl,
+      }),
+      'utf8'
+    ).toString('base64url');
+    const softRpIdHash = crypto
+      .createHash('sha256')
+      .update(regOptSoft.rpId, 'utf8')
+      .digest();
+    const bare37ByteAuthData = Buffer.alloc(37);
+    softRpIdHash.copy(bare37ByteAuthData, 0);
+    bare37ByteAuthData[32] = 0x05; // Missing AT (0x40) and missing Attested Credential Data
+
+    const bareSoftRegRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-verify`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+        body: JSON.stringify({
+          challengeId: regOptSoft.challengeId,
+          credentialId,
+          clientDataJSON: softClientData,
+          authenticatorData: bare37ByteAuthData.toString('base64url'),
+          publicKeySpkiB64,
+        }),
+      }
+    );
+    assert.equal(bareSoftRegRes.status, 400);
+    const bareSoftRegBody = await bareSoftRegRes.json();
+    assert.equal(bareSoftRegBody.error, 'ATTESTATION_OBJECT_REQUIRED');
+
+    // 2d. Attempting CBOR attestationObject wrapping a bare 37-byte authData (no AT=0x40 flag / no COSE_Key) MUST be rejected with 401 ATTESTED_CREDENTIAL_DATA_REQUIRED (#22, #76)
+    const regOptBareCborRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-options`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+      }
+    );
+    const regOptBareCbor = await regOptBareCborRes.json();
+    const bareCborClientData = Buffer.from(
+      JSON.stringify({
+        type: 'webauthn.create',
+        challenge: regOptBareCbor.challenge,
+        origin: baseUrl,
+      }),
+      'utf8'
+    ).toString('base64url');
+    const fakeAttObj37 = encodeCborAttestationObject({
+      fmt: 'none',
+      authData: bare37ByteAuthData,
+    });
+    const bareCborVerifyRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-verify`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+        body: JSON.stringify({
+          challengeId: regOptBareCbor.challengeId,
+          credentialId,
+          clientDataJSON: bareCborClientData,
+          attestationObject: fakeAttObj37.toString('base64url'),
+        }),
+      }
+    );
+    assert.equal(bareCborVerifyRes.status, 401);
+    const bareCborVerifyBody = await bareCborVerifyRes.json();
+    assert.equal(
+      bareCborVerifyBody.error,
+      'ATTESTED_CREDENTIAL_DATA_REQUIRED'
+    );
+
+    // 2e. Attempting CBOR attestationObject with all-zero software AAGUID (00000000-0000-0000-0000-000000000000) and unattested fmt:'none' MUST be rejected with 401 SOFTWARE_AUTHENTICATOR_REJECTED (#22, #76)
+    const regOptZeroAaguidRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-options`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+      }
+    );
+    const regOptZeroAaguid = await regOptZeroAaguidRes.json();
+    const zeroAaguidPayload = buildHardwareWebAuthnRegistrationPayload({
+      rpId: regOptZeroAaguid.rpId,
+      challenge: regOptZeroAaguid.challenge,
+      origin: baseUrl,
+      credentialIdB64Url: credentialId,
+      publicKeySpkiDer,
+      privateKey,
+      aaguidHex: '00000000000000000000000000000000',
+      fmt: 'none',
+    });
+    const zeroAaguidVerifyRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-verify`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+        body: JSON.stringify({
+          challengeId: regOptZeroAaguid.challengeId,
+          ...zeroAaguidPayload,
+        }),
+      }
+    );
+    assert.equal(zeroAaguidVerifyRes.status, 401);
+    const zeroAaguidVerifyBody = await zeroAaguidVerifyRes.json();
+    assert.equal(
+      zeroAaguidVerifyBody.error,
+      'SOFTWARE_AUTHENTICATOR_REJECTED'
+    );
+
+    // 2f. Request fresh registration options and register with genuine W3C CBOR attestationObject + COSE_Key P-256 (iPhone Passkey / FIDO2 packed hardware format)
     const regOptRes2 = await fetch(
       `${baseUrl}/api/auth/webauthn-register-options`,
       {
@@ -346,23 +491,17 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, st
     );
     const regOpt2 = await regOptRes2.json();
 
-    const regClientDataJSON = Buffer.from(
-      JSON.stringify({
-        type: 'webauthn.create',
-        challenge: regOpt2.challenge,
-        origin: baseUrl,
-      }),
-      'utf8'
-    ).toString('base64url');
-
-    const regRpIdHash = crypto
-      .createHash('sha256')
-      .update(regOpt2.rpId, 'utf8')
-      .digest();
-    const regAuthDataBuf = Buffer.alloc(37);
-    regRpIdHash.copy(regAuthDataBuf, 0);
-    regAuthDataBuf[32] = 0x05; // UP + UV hardware verification flags
-    regAuthDataBuf.writeUInt32BE(0, 33); // initial signCount = 0
+    const validHwRegPayload = buildHardwareWebAuthnRegistrationPayload({
+      rpId: regOpt2.rpId,
+      challenge: regOpt2.challenge,
+      origin: baseUrl,
+      credentialIdB64Url: credentialId,
+      publicKeySpkiDer,
+      privateKey,
+      // Apple iCloud Keychain Passkey AAGUID (iOS 16/17/18 Face ID / Touch ID)
+      aaguidHex: 'fbfc3007-154e-4ecc-8c0b-6e020557d7bd',
+      fmt: 'packed',
+    });
 
     const regVerifyRes = await fetch(
       `${baseUrl}/api/auth/webauthn-register-verify`,
@@ -374,10 +513,7 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, st
         },
         body: JSON.stringify({
           challengeId: regOpt2.challengeId,
-          credentialId,
-          clientDataJSON: regClientDataJSON,
-          authenticatorData: regAuthDataBuf.toString('base64url'),
-          publicKeySpkiB64,
+          ...validHwRegPayload,
         }),
       }
     );
@@ -1277,7 +1413,11 @@ test('Issue #76 v5.3 Audit: Zero-env one-time initial admin activation flow, har
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rotaclub-bootstrap-'));
   try {
     const freshDbPath = path.join(tmpDir, 'rotaclub_pilot_v5_3_db.json');
-    const { app } = createPilotExpressApp(freshDbPath);
+    const bootstrapTokenFile = path.join(
+      tmpDir,
+      'rotaclub_bootstrap_claim_token.json'
+    );
+    const { app, store: bootstrapStore } = createPilotExpressApp(freshDbPath);
     const server: Server = await new Promise((resolve) => {
       const s = app.listen(0, '127.0.0.1', () => resolve(s));
     });
@@ -1286,10 +1426,24 @@ test('Issue #76 v5.3 Audit: Zero-env one-time initial admin activation flow, har
     const baseUrl = `http://127.0.0.1:${port}`;
 
     try {
-      // Check bootstrap-status on fresh zero-env database -> bootstrapClaimRequired === true
+      // Check bootstrap-status on fresh zero-env database -> bootstrapClaimRequired === true, no token/account leak
       const statusRes1 = await fetch(`${baseUrl}/api/auth/bootstrap-status`);
       const statusBody1 = await statusRes1.json();
       assert.equal(statusBody1.bootstrapClaimRequired, true);
+      assert.equal(statusBody1.ownershipVerificationRequired, true);
+      assert.equal('bootstrapToken' in statusBody1, false);
+      assert.equal('targetAccount' in statusBody1, false);
+
+      // Verify one-time ownership token exists in store and on-disk 0o600 file, and only hash is in DB
+      const ownerBootstrapToken = bootstrapStore.getBootstrapOwnershipToken();
+      assert.ok(ownerBootstrapToken && ownerBootstrapToken.startsWith('RC2420-'));
+      assert.equal(fs.existsSync(bootstrapTokenFile), true);
+      const rawDbBeforeClaim = fs.readFileSync(freshDbPath, 'utf8');
+      assert.equal(
+        rawDbBeforeClaim.includes(ownerBootstrapToken!),
+        false,
+        'Plaintext bootstrapToken must never be stored in database JSON'
+      );
 
       // Attempting login before activation returns 403 ACCOUNT_ACTIVATION_REQUIRED
       const unactivatedLogin = await fetch(`${baseUrl}/api/auth/login`, {
@@ -1304,11 +1458,51 @@ test('Issue #76 v5.3 Audit: Zero-env one-time initial admin activation flow, har
       const unactivatedBody = await unactivatedLogin.json();
       assert.equal(unactivatedBody.error, 'ACCOUNT_ACTIVATION_REQUIRED');
 
-      // Claim initial admin bootstrap once
+      // Attempting to claim bootstrap WITHOUT bootstrapToken MUST be rejected with 401 BOOTSTRAP_OWNERSHIP_TOKEN_REQUIRED
+      const missingTokenClaimRes = await fetch(
+        `${baseUrl}/api/auth/bootstrap-claim`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            baskanPin: 'AttackerNoToken#2026',
+          }),
+        }
+      );
+      assert.equal(missingTokenClaimRes.status, 401);
+      const missingTokenClaimBody = await missingTokenClaimRes.json();
+      assert.equal(
+        missingTokenClaimBody.error,
+        'BOOTSTRAP_OWNERSHIP_TOKEN_REQUIRED'
+      );
+
+      // Attempting to claim bootstrap with an INVALID/FORGED bootstrapToken MUST be rejected with 403 INVALID_BOOTSTRAP_OWNERSHIP_TOKEN
+      const forgedTokenClaimRes = await fetch(
+        `${baseUrl}/api/auth/bootstrap-claim`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            bootstrapToken: 'RC2420-forged-invalid-token-value',
+            baskanPin: 'AttackerForgedToken#2026',
+          }),
+        }
+      );
+      assert.equal(forgedTokenClaimRes.status, 403);
+      const forgedTokenClaimBody = await forgedTokenClaimRes.json();
+      assert.equal(
+        forgedTokenClaimBody.error,
+        'INVALID_BOOTSTRAP_OWNERSHIP_TOKEN'
+      );
+
+      // Claim initial admin bootstrap once with verified one-time ownership token
       const claimRes = await fetch(`${baseUrl}/api/auth/bootstrap-claim`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          bootstrapToken: ownerBootstrapToken,
+          rotaryId: 'TR-2420-74105',
+          email: 'baskan@galatarotary.org',
           baskanPin: 'GalataFirstAdmin#2026',
           sekreterPin: 'GalataFirstSek#2026',
           saymanPin: 'GalataFirstSay#2026',
@@ -1321,6 +1515,10 @@ test('Issue #76 v5.3 Audit: Zero-env one-time initial admin activation flow, har
       assert.ok(claimBody.token);
       assert.equal(claimBody.user.role, 'baskan');
 
+      // One-time bootstrap token file must be deleted and runtime token cleared after claim
+      assert.equal(fs.existsSync(bootstrapTokenFile), false);
+      assert.equal(bootstrapStore.getBootstrapOwnershipToken(), null);
+
       // Attempting to claim bootstrap a second time is permanently rejected with 409 BOOTSTRAP_ALREADY_CLAIMED
       const secondClaimRes = await fetch(
         `${baseUrl}/api/auth/bootstrap-claim`,
@@ -1328,6 +1526,7 @@ test('Issue #76 v5.3 Audit: Zero-env one-time initial admin activation flow, har
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
+            bootstrapToken: ownerBootstrapToken,
             baskanPin: 'AttackerHijack#2026',
           }),
         }

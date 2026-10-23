@@ -79,7 +79,8 @@ function base64UrlToBytes(b64url: string): ArrayBuffer {
 
 /**
  * Hardware-Only W3C WebAuthn Passkey Enrollment (#12, #22, #76).
- * Strictly requires genuine platform/hardware authenticator (`window.PublicKeyCredential` and `navigator.credentials.create`).
+ * Strictly requires genuine platform/hardware authenticator (`window.PublicKeyCredential` and `navigator.credentials.create`)
+ * and sends the full CBOR `attestationObject` for server-side Attested Credential Data (AT=0x40, AAGUID, COSE_Key P-256) verification.
  * Zero software WebCrypto fallback or client-synthesized authenticatorData flags in production!
  */
 async function enrollHardwareWebAuthnPasskey(
@@ -123,11 +124,21 @@ async function enrollHardwareWebAuthnPasskey(
         displayName: optionsData.user.displayName,
       },
       pubKeyCredParams: optionsData.pubKeyCredParams,
-      authenticatorSelection: {
+      authenticatorSelection: optionsData.authenticatorSelection || {
+        authenticatorAttachment: 'platform',
+        residentKey: 'preferred',
         userVerification: 'required',
       },
-      timeout: optionsData.timeout || 30000,
-      attestation: 'none',
+      excludeCredentials: Array.isArray(optionsData.excludeCredentials)
+        ? optionsData.excludeCredentials.map(
+            (c: { id: string; type: PublicKeyCredentialType }) => ({
+              id: base64UrlToBytes(c.id),
+              type: c.type,
+            })
+          )
+        : undefined,
+      timeout: optionsData.timeout || 60000,
+      attestation: optionsData.attestation || 'direct',
     },
   })) as PublicKeyCredential | null;
 
@@ -144,6 +155,17 @@ async function enrollHardwareWebAuthnPasskey(
       getAuthenticatorData?: () => ArrayBuffer;
     };
 
+  if (
+    !attestationRes.attestationObject ||
+    attestationRes.attestationObject.byteLength < 55
+  ) {
+    return {
+      ok: false,
+      message:
+        'Cihaz doğrulayıcısı geçerli bir W3C CBOR attestationObject döndürmedi.',
+    };
+  }
+
   const spkiBuf =
     typeof attestationRes.getPublicKey === 'function'
       ? attestationRes.getPublicKey()
@@ -153,20 +175,19 @@ async function enrollHardwareWebAuthnPasskey(
       ? attestationRes.getAuthenticatorData()
       : null;
 
-  if (!spkiBuf || !authDataBuf) {
-    return {
-      ok: false,
-      message:
-        'Cihaz doğrulayıcısı SPKI açık anahtar veya authenticatorData verisini sağlamadı.',
-    };
-  }
-
   const credentialId = bytesToBase64Url(new Uint8Array(createdCred.rawId));
   const clientDataJSON = bytesToBase64Url(
     new Uint8Array(attestationRes.clientDataJSON)
   );
-  const authenticatorData = bytesToBase64Url(new Uint8Array(authDataBuf));
-  const publicKeySpkiB64 = bytesToBase64Url(new Uint8Array(spkiBuf));
+  const attestationObject = bytesToBase64Url(
+    new Uint8Array(attestationRes.attestationObject)
+  );
+  const authenticatorData = authDataBuf
+    ? bytesToBase64Url(new Uint8Array(authDataBuf))
+    : undefined;
+  const publicKeySpkiB64 = spkiBuf
+    ? bytesToBase64Url(new Uint8Array(spkiBuf))
+    : undefined;
 
   const verifyRes = await fetch('/api/auth/webauthn-register-verify', {
     method: 'POST',
@@ -178,8 +199,10 @@ async function enrollHardwareWebAuthnPasskey(
       challengeId: optionsData.challengeId,
       credentialId,
       clientDataJSON,
+      attestationObject,
       authenticatorData,
       publicKeySpkiB64,
+      authenticatorAttachment: createdCred.authenticatorAttachment || 'platform',
     }),
   });
   const verifyData = await verifyRes.json();
@@ -211,8 +234,9 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [webAuthnStatus, setWebAuthnStatus] = useState<string | null>(null);
 
-  // One-Time Initial Admin Activation State (#22, #76)
+  // One-Time Initial Admin Activation State with Ownership Verification (#22, #76)
   const [bootstrapRequired, setBootstrapRequired] = useState<boolean>(false);
+  const [bootstrapTokenInput, setBootstrapTokenInput] = useState<string>('');
   const [newAdminPinInput, setNewAdminPinInput] = useState<string>('');
   const [newBoardPinInput, setNewBoardPinInput] = useState<string>('');
 
@@ -253,11 +277,17 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
   };
 
   /**
-   * One-Time First-Admin Claim Handler (POST /api/auth/bootstrap-claim) (#22, #76)
+   * One-Time First-Admin Claim Handler with Ownership Verification (POST /api/auth/bootstrap-claim) (#22, #76)
    */
   const handleBootstrapClaim = async (e: React.FormEvent) => {
     e.preventDefault();
     if (authenticating || !kvkkAccepted) return;
+    if (!bootstrapTokenInput.trim()) {
+      setErrorMessage(
+        'Lütfen tek kullanımlık sunucu sahiplik doğrulama anahtarını (bootstrapToken) girin.'
+      );
+      return;
+    }
     if (!newAdminPinInput.trim()) {
       setErrorMessage(
         'Lütfen Dönem Başkanı (TR-2420-74105) için en az 6 karakterli güçlü bir kurumsal parola/PIN belirleyin.'
@@ -281,6 +311,9 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          bootstrapToken: bootstrapTokenInput.trim(),
+          rotaryId: 'TR-2420-74105',
+          email: 'baskan@galatarotary.org',
           newAdminPin: newAdminPinInput.trim(),
           rolePins,
         }),
@@ -535,13 +568,30 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
           >
             <div className="flex items-center gap-2 text-xs font-bold text-[#F7A81B]">
               <Sparkles className="w-4 h-4 shrink-0" />
-              <span>Tek Kullanımlık İlk Yönetici Aktivasyonu (İlk Kurulum)</span>
+              <span>Tek Kullanımlık İlk Yönetici Aktivasyonu (Sahiplik Doğrulamalı)</span>
             </div>
             <p className="text-[11px] text-slate-200 leading-relaxed">
-              Hiçbir ortam değişkeni (environment variable) girmenize gerek olmadan, Dönem Başkanı (<strong>Rtn. Mimar Emre Karaca · TR-2420-74105</strong>) hesabını kendi belirleyeceğiniz güçlü parola/PIN ile etkinleştirin. Bu adım tamamlandığında kurulum uç noktası kalıcı olarak kilitlenir.
+              Dönem Başkanı (<strong>Rtn. Mimar Emre Karaca · TR-2420-74105</strong>) hesabını etkinleştirmek için tek kullanımlık sunucu sahiplik doğrulama anahtarını (<code>bootstrapToken</code>) ve yeni kurumsal parola/PIN değerinizi girin. Bu adım tamamlandığında kurulum uç noktası ve sahiplik anahtarı kalıcı olarak imha edilir.
             </p>
 
             <div className="space-y-2.5">
+              <div>
+                <label
+                  htmlFor="bootstrap-ownership-token"
+                  className="block text-[11px] font-semibold text-[#F7A81B] mb-1"
+                >
+                  Tek Kullanımlık Sunucu Sahiplik Anahtarı (bootstrapToken · Zorunlu)
+                </label>
+                <input
+                  id="bootstrap-ownership-token"
+                  type="password"
+                  value={bootstrapTokenInput}
+                  onChange={(e) => setBootstrapTokenInput(e.target.value)}
+                  placeholder="RC2420-..."
+                  className="w-full text-xs font-mono-num bg-[#09152B]/90 border border-white/20 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-[#F7A81B]"
+                />
+              </div>
+
               <div>
                 <label
                   htmlFor="bootstrap-admin-pin"
@@ -595,8 +645,8 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
               <CheckCircle2 className="w-4 h-4" />
               <span>
                 {authenticating
-                  ? 'Yönetici Hesabı Etkinleştiriliyor...'
-                  : 'İlk Yönetici Hesabını Etkinleştir ve Oturum Aç'}
+                  ? 'Sahiplik Doğrulanıyor ve Hesap Etkinleştiriliyor...'
+                  : 'Sahipliği Doğrula ve İlk Yönetici Hesabını Etkinleştir'}
               </span>
             </button>
           </form>
