@@ -49,6 +49,14 @@ export interface WeeklyMeeting {
   bulletinSummary?: string;
   attendanceCount?: number;
   highlights?: string[];
+  // Issue #29 & #42: Persisted Hotel Banquet Commitment & Official Confirmation Fields
+  minHotelGuarantee?: number;
+  unitKuverCostTL?: number;
+  protocolSpeakerKuver?: number;
+  isLcvLockedForHotel?: boolean;
+  hotelConfirmationRef?: string;
+  hotelConfirmedBy?: string;
+  hotelConfirmedAt?: string;
 }
 
 export interface MakeupSubmission {

@@ -115,6 +115,10 @@ export const UPCOMING_MEETING: WeeklyMeeting = {
   certificateStatus: 'Hazır — İmzalandı',
   certificateDonationTree: 'Uluslararası Rotary Çocuk Felci (End Polio Now) Fonu — 50 Çocuk Aşı Bağışı Sertifikası (#PL-2420-891)',
   isPast: false,
+  minHotelGuarantee: 35,
+  unitKuverCostTL: 1850,
+  protocolSpeakerKuver: 2,
+  isLcvLockedForHotel: false,
 };
 
 export const INITIAL_MEETINGS_LIST: WeeklyMeeting[] = [
@@ -133,6 +137,13 @@ export const INITIAL_MEETINGS_LIST: WeeklyMeeting[] = [
     certificateDonationTree: 'End Polio Now Fonu — 50 Çocuk Aşı Bağışı Sertifikası (#PL-2420-889)',
     isPast: true,
     attendanceCount: 39,
+    minHotelGuarantee: 35,
+    unitKuverCostTL: 1850,
+    protocolSpeakerKuver: 1,
+    isLcvLockedForHotel: true,
+    hotelConfirmationRef: 'PERA-BNQ-2026-1840',
+    hotelConfirmedBy: 'Pera Palace Banket Md. — Selin Kaya',
+    hotelConfirmedAt: '12 Ekim 2026 · 17:00',
     bulletinSummary:
       '1840. toplantımızda 39 üyemiz ve 4 konuğumuzla Pera Palace Grand Pera Salonu’nda bir araya geldik. GALATART 2026 sergi komitesi bütçesi oybirliğiyle kabul edildi. Konuğumuz Prof. Dr. Kerem Alkin’e PolioPlus sertifikası Dönem Başkanımız Rtn. Emre Karaca tarafından takdim edildi.',
     highlights: [
@@ -156,6 +167,13 @@ export const INITIAL_MEETINGS_LIST: WeeklyMeeting[] = [
     certificateDonationTree: 'End Polio Now Fonu — 50 Çocuk Aşı Bağışı Sertifikası (#PL-2420-890)',
     isPast: true,
     attendanceCount: 41,
+    minHotelGuarantee: 35,
+    unitKuverCostTL: 1850,
+    protocolSpeakerKuver: 1,
+    isLcvLockedForHotel: true,
+    hotelConfirmationRef: 'PERA-BNQ-2026-1841',
+    hotelConfirmedBy: 'Pera Palace Banket Md. — Selin Kaya',
+    hotelConfirmedAt: '19 Ekim 2026 · 17:30',
     bulletinSummary:
       '1841. toplantımızda Geleneksel Ustalara Saygı Konseri repertuvarı ve CRR Konser Salonu protokol davetiyeleri tanıtıldı. Maestro Murat Cem Orhan, genç konservatuvar öğrencilerine sağlanan enstrüman bursları için kulübümüze teşekkür etti.',
     highlights: [

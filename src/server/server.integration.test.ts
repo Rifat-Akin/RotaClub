@@ -900,30 +900,50 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, st
     const mismatchedAaguidBody = await mismatchedAaguidRes.json();
     assert.equal(mismatchedAaguidBody.error, 'ATTESTATION_AAGUID_MISMATCH');
 
-    // 2j. Negative Test (#22, #17): Spoofed Host header on verify OR insecure http:// origin on non-localhost domain MUST be rejected with 401 WEBAUTHN_ORIGIN_MISMATCH
-    const regOptHostSpoofRes = await fetch(
+    // 2j. Negative Test (#22, #76, #17): Untrusted X-Forwarded-Host header on register-options or challenge MUST be rejected with 403 WEBAUTHN_UNTRUSTED_ORIGIN_HOST, and insecure http:// origin on pinned domain MUST be rejected with 401 WEBAUTHN_ORIGIN_MISMATCH
+    const untrustedForwardedHostRes = await fetch(
       `${baseUrl}/api/auth/webauthn-register-options`,
       {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${uyeSession.token}`,
-          'X-Forwarded-Host': 'galata.rotary2420.org',
+          'X-Forwarded-Host': 'evil-spoofed-host.example.com',
           'X-Forwarded-Proto': 'https',
         },
       }
     );
-    const regOptHostSpoof = await regOptHostSpoofRes.json();
-    assert.equal(regOptHostSpoof.rpId, 'galata.rotary2420.org');
+    assert.equal(untrustedForwardedHostRes.status, 403);
+    const untrustedForwardedHostBody = await untrustedForwardedHostRes.json();
+    assert.equal(
+      untrustedForwardedHostBody.error,
+      'WEBAUTHN_UNTRUSTED_ORIGIN_HOST'
+    );
+
+    const regOptPinnedCanonicalRes = await fetch(
+      `${baseUrl}/api/auth/webauthn-register-options`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+          'X-Forwarded-Host': 'rotaclub.galatarotary.org',
+          'X-Forwarded-Proto': 'https',
+        },
+      }
+    );
+    assert.equal(regOptPinnedCanonicalRes.status, 200);
+    const regOptHostSpoof = await regOptPinnedCanonicalRes.json();
+    assert.equal(regOptHostSpoof.rpId, 'rotaclub.galatarotary.org');
     assert.equal(
       regOptHostSpoof.expectedOrigin,
-      'https://galata.rotary2420.org'
+      'https://rotaclub.galatarotary.org'
     );
 
     const insecureHttpOriginPayload = buildTestWebAuthnRegistrationPayload({
-      rpId: 'galata.rotary2420.org',
+      rpId: 'rotaclub.galatarotary.org',
       challenge: regOptHostSpoof.challenge,
-      origin: 'http://galata.rotary2420.org', // Plain HTTP on non-localhost domain!
+      origin: 'http://rotaclub.galatarotary.org', // Plain HTTP on pinned canonical domain!
       credentialIdB64Url: credentialId,
       publicKeySpkiDer,
       privateKey,
@@ -936,7 +956,7 @@ test('Issue #76 / #12 / #22: Authenticated ECDSA P-256 WebAuthn registration, st
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${uyeSession.token}`,
-          'X-Forwarded-Host': 'galata.rotary2420.org',
+          'X-Forwarded-Host': 'rotaclub.galatarotary.org',
         },
         body: JSON.stringify({
           challengeId: regOptHostSpoof.challengeId,
@@ -2235,4 +2255,130 @@ test('Issue #76 v5.3 Audit: Zero-env one-time initial admin activation flow, har
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confirmation, blocks member RSVP changes when locked, and enforces volunteer shift capacity', async () => {
+  await withTestServer(async (baseUrl) => {
+    const sekreterSession = await loginRole(
+      baseUrl,
+      'TR-2420-81024',
+      TEST_PINS.sekreter
+    );
+    const uyeSession = await loginRole(
+      baseUrl,
+      'TR-2420-88412',
+      TEST_PINS.uye
+    );
+
+    const initialStateRes = await fetch(
+      `${baseUrl}/api/pilot/state?clubId=club-galata`,
+      {
+        headers: { Authorization: `Bearer ${sekreterSession.token}` },
+      }
+    );
+    const initialState = await initialStateRes.json();
+
+    // 1. Issue #29 Negative Test: Recording a hotel confirmation reference while isLcvLockedForHotel is false MUST fail with 422 HOTEL_CONFIRMATION_REQUIRES_LCV_LOCK
+    const unlockedMeetingsWithRef = initialState.meetings.map(
+      (m: { meetingNo: number }) =>
+        m.meetingNo === 1842
+          ? {
+              ...m,
+              isLcvLockedForHotel: false,
+              hotelConfirmationRef: 'PP-BNQ-2026-1842',
+            }
+          : m
+    );
+    const badHotelConfirmRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${sekreterSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: initialState.revision,
+        state: { meetings: unlockedMeetingsWithRef },
+      }),
+    });
+    assert.equal(badHotelConfirmRes.status, 422);
+    const badHotelConfirmBody = await badHotelConfirmRes.json();
+    assert.equal(
+      badHotelConfirmBody.error,
+      'HOTEL_CONFIRMATION_REQUIRES_LCV_LOCK'
+    );
+
+    // 2. Issue #29 Positive + Lock Enforcement Test: Sekreter locks meeting #1842 and records hotel confirmation ref (200 OK), then regular member attempting to change RSVP is blocked with 409 LCV_LOCKED_FOR_HOTEL
+    const lockedMeetingsWithRef = initialState.meetings.map(
+      (m: { meetingNo: number }) =>
+        m.meetingNo === 1842
+          ? {
+              ...m,
+              isLcvLockedForHotel: true,
+              hotelConfirmationRef: 'PP-BNQ-2026-1842',
+              hotelConfirmedBy: 'Rtn. Av. Nazlı Denizmen',
+            }
+          : m
+    );
+    const lockHotelRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${sekreterSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: initialState.revision,
+        state: { meetings: lockedMeetingsWithRef },
+      }),
+    });
+    assert.equal(lockHotelRes.status, 200);
+    const lockHotelBody = await lockHotelRes.json();
+
+    const lockedMemberRsvpRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${uyeSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: lockHotelBody.revision,
+        state: { rsvpStatus: 'excused' },
+      }),
+    });
+    assert.equal(lockedMemberRsvpRes.status, 409);
+    const lockedMemberRsvpBody = await lockedMemberRsvpRes.json();
+    assert.equal(lockedMemberRsvpBody.error, 'LCV_LOCKED_FOR_HOTEL');
+
+    // 3. Issue #46 Negative Test: Exceeding shift capacity (requiredCount) on /api/pilot/sync MUST fail with 422 SHIFT_CAPACITY_EXCEEDED
+    const overCapacityShifts = initialState.volunteerShifts.map(
+      (s: { id: string; assignedVolunteers: string[] }) =>
+        s.id === 'shift-kermes-1'
+          ? {
+              ...s,
+              assignedVolunteers: [
+                ...s.assignedVolunteers,
+                'Rtn. Fazla Gönüllü',
+              ],
+            }
+          : s
+    );
+    const overCapRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${uyeSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: lockHotelBody.revision,
+        state: { volunteerShifts: overCapacityShifts },
+      }),
+    });
+    assert.equal(overCapRes.status, 422);
+    const overCapBody = await overCapRes.json();
+    assert.equal(overCapBody.error, 'SHIFT_CAPACITY_EXCEEDED');
+  });
+});
+
 

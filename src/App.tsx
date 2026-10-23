@@ -57,7 +57,12 @@ import {
   createSpeakerProposal,
   executeJulyFirstRollover,
   formatTL,
+  SpecializedModuleData,
+  SYNTHETIC_SPECIALIZED_MODULES,
+  SYNTHETIC_VOLUNTEER_SHIFTS,
+  toggleVolunteerShiftAssignment,
   toggleVoteSpeakerProposal,
+  VolunteerShiftSlot,
 } from './utils/rotaryLogic';
 import { HeaderAndRoleBar } from './components/HeaderAndRoleBar';
 import { BottomNav } from './components/BottomNav';
@@ -163,6 +168,11 @@ export default function App() {
   const [auditChainValid, setAuditChainValid] = useState<boolean>(true);
   const [auditHeadHash, setAuditHeadHash] = useState<string>('GENESIS_2420');
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
+  const [volunteerShifts, setVolunteerShifts] = useState<VolunteerShiftSlot[]>(
+    SYNTHETIC_VOLUNTEER_SHIFTS
+  );
+  const [specializedModules, setSpecializedModules] =
+    useState<SpecializedModuleData>(SYNTHETIC_SPECIALIZED_MODULES);
 
   useEffect(() => {
     document.title = `RotaClub — ${activeTenantClubName} · 2420. Bölge`;
@@ -218,6 +228,17 @@ export default function App() {
     }
     if (typeof serverData.kvkkMaskPhone === 'boolean') {
       setKvkkMaskPhone(serverData.kvkkMaskPhone);
+    }
+    if (Array.isArray(serverData.volunteerShifts)) {
+      setVolunteerShifts(serverData.volunteerShifts as VolunteerShiftSlot[]);
+    }
+    if (
+      serverData.specializedModules &&
+      typeof serverData.specializedModules === 'object'
+    ) {
+      setSpecializedModules(
+        serverData.specializedModules as SpecializedModuleData
+      );
     }
   };
 
@@ -1280,6 +1301,85 @@ export default function App() {
     );
   };
 
+  const activeMemberDisplayName =
+    activeRole === 'sekreter'
+      ? 'Rtn. Dr. Kerem Aydın'
+      : activeRole === 'sayman'
+      ? 'Rtn. YMM Levent Soydan'
+      : activeRole === 'baskan'
+      ? 'Rtn. Av. Nazlı Denizmen'
+      : 'Rtn. Rifat Akın';
+
+  const handleUpdateMeetingHotelCommitment = (
+    meetingNo: number,
+    patch: Partial<WeeklyMeeting>
+  ) => {
+    const nextMeetings = meetings.map((m) =>
+      m.meetingNo === meetingNo ? { ...m, ...patch } : m
+    );
+    setMeetings(nextMeetings);
+    recordServerAudit(
+      'LCV & Kuver',
+      `Otel Banket & LCV Mutabakatı Güncellendi (#${meetingNo})`,
+      patch.hotelConfirmationRef
+        ? `Toplantı #${meetingNo} kuver listesi kilitlendi ve otel teyidi (${patch.hotelConfirmationRef}) kaydedildi.`
+        : `Toplantı #${meetingNo} LCV kilidi / garanti kuver parametreleri güncellendi.`,
+      ['sekreter', 'baskan'],
+      { meetings: nextMeetings }
+    );
+    if (patch.hotelConfirmationRef) {
+      showToast(
+        `Otel Banket Teyidi Kaydedildi (${patch.hotelConfirmationRef})`,
+        `Toplantı #${meetingNo} kesin kuver listesi otele onaylandı ve kilitlendi (#29).`
+      );
+    }
+  };
+
+  const handleToggleVolunteerShift = (
+    shiftId: string,
+    volunteerName: string
+  ) => {
+    const targetSlot = volunteerShifts.find((s) => s.id === shiftId);
+    if (!targetSlot) return;
+    const isAlreadyIn = targetSlot.assignedVolunteers.includes(volunteerName);
+    if (
+      !isAlreadyIn &&
+      targetSlot.assignedVolunteers.length >= targetSlot.requiredCount
+    ) {
+      showToast(
+        'Vardiya Kontenjanı Dolu (#46)',
+        `"${targetSlot.taskTitle}" vardiyası maksimum kapasiteye (${targetSlot.requiredCount} gönüllü) ulaşmıştır.`
+      );
+      return;
+    }
+
+    const nextShifts = toggleVolunteerShiftAssignment(
+      volunteerShifts,
+      shiftId,
+      volunteerName
+    );
+    setVolunteerShifts(nextShifts);
+    recordServerAudit(
+      'QR Yoklama & Make-up',
+      `Vardiya Gönüllü Ataması: ${targetSlot.taskTitle}`,
+      `${volunteerName} "${targetSlot.taskTitle}" vardiyasına ${isAlreadyIn ? 'ayrıldı' : 'katıldı'}.`,
+      undefined,
+      { volunteerShifts: nextShifts }
+    );
+    showToast(
+      isAlreadyIn
+        ? `Vardiya Görevinden Ayrıldınız: ${targetSlot.taskTitle}`
+        : `Vardiya Görevi Atandı: ${targetSlot.taskTitle}`,
+      isAlreadyIn
+        ? `${volunteerName} vardiya listesinden çıkarıldı.`
+        : `${volunteerName} (${targetSlot.shiftWindow}) vardiya çizelgesine kaydedildi.`
+    );
+  };
+
+  const selectedMeetingObj =
+    meetings.find((m) => m.meetingNo === selectedMeetingNo) ||
+    meetings[meetings.length - 1];
+
   return (
     <div className="min-h-screen flex flex-col bg-[#F8FAFC] text-[#0F172A] pb-24">
       {/* Top Bar, Multi-Tenant Switcher & Role Simulator */}
@@ -1358,6 +1458,7 @@ export default function App() {
             onUpdateMemberRsvp={handleUpdateMemberRsvp}
             onRemindUnrespondedMembers={handleRemindUnrespondedMembers}
             onDownloadKuverCsvNotify={handleDownloadKuverCsvNotify}
+            onUpdateMeetingHotelCommitment={handleUpdateMeetingHotelCommitment}
           />
         )}
 
@@ -1378,6 +1479,9 @@ export default function App() {
             onSubmitFiresideReport={handleSubmitFiresideReport}
             members={members}
             onCreateFiresideGroup={handleCreateFiresideGroup}
+            activeMemberName={activeMemberDisplayName}
+            volunteerShifts={volunteerShifts}
+            onToggleVolunteerShift={handleToggleVolunteerShift}
           />
         )}
 
@@ -1400,6 +1504,9 @@ export default function App() {
             onBulkAccrual={handleBulkAccrual}
             onAddTreasuryEntry={handleAddTreasuryEntry}
             onDownloadFinanceCsvNotify={handleDownloadFinanceCsvNotify}
+            kuverSummary={kuverSummary}
+            minHotelGuarantee={selectedMeetingObj?.minHotelGuarantee ?? 35}
+            defaultUnitKuverCostTL={selectedMeetingObj?.unitKuverCostTL ?? 1850}
           />
         )}
 
@@ -1414,6 +1521,8 @@ export default function App() {
             onCreateProject={handleCreateProject}
             onSponsorScholarMonth={handleSponsorScholarMonth}
             onToggleProjectVolunteer={handleToggleProjectVolunteer}
+            specializedModules={specializedModules}
+            activeMemberName={activeMemberDisplayName}
           />
         )}
 

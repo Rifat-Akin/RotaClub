@@ -45,7 +45,13 @@ import {
   TreasuryLedgerEntry,
   WeeklyMeeting,
 } from '../types/rotary';
-import { maskPhoneForKvkk } from '../utils/rotaryLogic';
+import {
+  maskPhoneForKvkk,
+  SpecializedModuleData,
+  SYNTHETIC_SPECIALIZED_MODULES,
+  SYNTHETIC_VOLUNTEER_SHIFTS,
+  VolunteerShiftSlot,
+} from '../utils/rotaryLogic';
 
 export const ALLOWED_TENANT_CLUB_IDS = [
   'club-galata',
@@ -193,6 +199,8 @@ export interface TenantClubDatabaseState {
   committees: ClubCommittee[];
   pastPresidents: PastPresidentRecord[];
   boardResolutions: BoardResolutionItem[];
+  volunteerShifts?: VolunteerShiftSlot[];
+  specializedModules?: SpecializedModuleData;
   kvkkMaskPhone: boolean;
   bankStatements: BankStatementEntry[];
   auditLedger: ChainedAuditLogEntry[];
@@ -1935,6 +1943,17 @@ export function createTenantClubState(
     boardResolutions: isGalata
       ? INITIAL_BOARD_RESOLUTIONS.map((br) => ({ ...br }))
       : [],
+    volunteerShifts: isGalata
+      ? SYNTHETIC_VOLUNTEER_SHIFTS.map((s) => ({
+          ...s,
+          assignedVolunteers: [...s.assignedVolunteers],
+        }))
+      : [],
+    specializedModules: {
+      kermes: { ...SYNTHETIC_SPECIALIZED_MODULES.kermes },
+      galatart: { ...SYNTHETIC_SPECIALIZED_MODULES.galatart },
+      ryla: { ...SYNTHETIC_SPECIALIZED_MODULES.ryla },
+    },
     kvkkMaskPhone: false,
     bankStatements: createInitialBankStatementsForClub(clubId),
     auditLedger: createInitialAuditChainForClub(clubId, clubPrefix),
@@ -2066,6 +2085,27 @@ export function migrateDatabaseLossless(
       boardResolutions: Array.isArray(existingTenant.boardResolutions)
         ? existingTenant.boardResolutions
         : defaultTenant.boardResolutions,
+      volunteerShifts: Array.isArray(existingTenant.volunteerShifts)
+        ? existingTenant.volunteerShifts
+        : defaultTenant.volunteerShifts,
+      specializedModules:
+        existingTenant.specializedModules &&
+        typeof existingTenant.specializedModules === 'object'
+          ? {
+              kermes: {
+                ...SYNTHETIC_SPECIALIZED_MODULES.kermes,
+                ...(existingTenant.specializedModules.kermes || {}),
+              },
+              galatart: {
+                ...SYNTHETIC_SPECIALIZED_MODULES.galatart,
+                ...(existingTenant.specializedModules.galatart || {}),
+              },
+              ryla: {
+                ...SYNTHETIC_SPECIALIZED_MODULES.ryla,
+                ...(existingTenant.specializedModules.ryla || {}),
+              },
+            }
+          : defaultTenant.specializedModules,
       bankStatements: Array.isArray(existingTenant.bankStatements)
         ? existingTenant.bankStatements
         : defaultTenant.bankStatements,

@@ -24,10 +24,12 @@ import {
   TreasuryLedgerEntry,
 } from '../types/rotary';
 import {
+  calculateKuverSummary,
   calculateMeetingCostSharingAndExemptions,
   calculateTreasurySummary,
   formatTL,
   generateMembersFinanceCsvContent,
+  KuverSummaryResult,
   MemberFinanceSummary,
 } from '../utils/rotaryLogic';
 
@@ -58,6 +60,9 @@ interface FinanceTabProps {
   ) => void;
   onAddTreasuryEntry: (entry: Omit<TreasuryLedgerEntry, 'id'>) => void;
   onDownloadFinanceCsvNotify: () => void;
+  kuverSummary?: KuverSummaryResult;
+  minHotelGuarantee?: number;
+  defaultUnitKuverCostTL?: number;
 }
 
 const CLUB_IBAN = 'TR42 0006 2000 4190 0006 2420 01';
@@ -81,6 +86,9 @@ export const FinanceTab: React.FC<FinanceTabProps> = ({
   onBulkAccrual,
   onAddTreasuryEntry,
   onDownloadFinanceCsvNotify,
+  kuverSummary,
+  minHotelGuarantee = 35,
+  defaultUnitKuverCostTL = 1850,
 }) => {
   const [treasurerSubTab, setTreasurerSubTab] = useState<
     'approvals' | 'member_matrix' | 'treasury_ledger'
@@ -124,17 +132,47 @@ export const FinanceTab: React.FC<FinanceTabProps> = ({
 
   const treasurySummary = calculateTreasurySummary(treasuryLedger, members);
 
-  // Issue #42 Synthetic Pilot State: Per-capita meeting cost sharing & exemptions
-  const [unitKuverCostTL, setUnitKuverCostTL] = useState<number>(1850);
-  const [billableKuverCount, setBillableKuverCount] = useState<number>(35);
+  // Issue #42 Live State: Per-capita meeting cost sharing & exemptions bound to live club RSVP summary
+  const effectiveKuverSummary =
+    kuverSummary ||
+    calculateKuverSummary(
+      members.map((m) => ({
+        memberId: m.id,
+        memberName: m.fullName,
+        status: m.rsvpStatus,
+        menu: m.mealPreference,
+        guestCount: m.rsvpStatus === 'with_guest' ? 1 : 0,
+      })),
+      'attending',
+      'Standart'
+    );
+  const [unitKuverCostTL, setUnitKuverCostTL] = useState<number>(
+    defaultUnitKuverCostTL
+  );
+  const [billableKuverCount, setBillableKuverCount] = useState<number>(
+    Math.max(
+      minHotelGuarantee,
+      effectiveKuverSummary.totalKuver + 3
+    )
+  );
   const [exemptSpeakerCount, setExemptSpeakerCount] = useState<number>(1);
-  const [exemptHonoraryOrYouthCount, setExemptHonoraryOrYouthCount] = useState<number>(2);
+  const [exemptHonoraryOrYouthCount, setExemptHonoraryOrYouthCount] =
+    useState<number>(2);
+
+  const liveAttendingPayingMembers = Math.max(
+    1,
+    effectiveKuverSummary.attendingMembers
+  );
+  const livePayingCompanions = Math.max(
+    0,
+    effectiveKuverSummary.spousesCount + effectiveKuverSummary.guestsCount
+  );
 
   const meetingCostSharing = calculateMeetingCostSharingAndExemptions({
     unitKuverCostTL,
     billableKuverCount,
-    attendingPayingMembersCount: 24,
-    payingCompanionsCount: 5,
+    attendingPayingMembersCount: liveAttendingPayingMembers,
+    payingCompanionsCount: livePayingCompanions,
     exemptSpeakerCount,
     exemptHonoraryOrYouthCount,
   });
@@ -967,7 +1005,7 @@ export const FinanceTab: React.FC<FinanceTabProps> = ({
                 </h2>
               </div>
               <span className="text-xs font-mono-num text-slate-500">
-                24 Ödeyen Üye · 5 Eş/Konuk
+                {liveAttendingPayingMembers} Canlı LCV Üye · {livePayingCompanions} Eş/Konuk
               </span>
             </div>
 

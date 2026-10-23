@@ -12,6 +12,7 @@ import {
   calculateUpdatedAttendance,
   calculateVolunteerShiftMetrics,
   createSpeakerProposal,
+  deriveLiveMeetingCostSharing,
   executeJulyFirstRollover,
   filterMembersByQueryAndClassification,
   generateKuverCsvContent,
@@ -301,7 +302,7 @@ test('applyBulkMemberAccrual, calculateTreasurySummary and CSV generators work a
   assert.ok(ics.includes('Pera Palace Hotel'));
 });
 
-test('Issue #29: calculateHotelBanquetCommitment computes definitive LCV, minimum guarantee shortfall, and hotel confirmation status', () => {
+test('Issue #29: calculateHotelBanquetCommitment enforces two-step LCV lock and explicit hotel confirmation reference', () => {
   const sampleKuver = {
     attendingMembers: 16,
     spousesCount: 4,
@@ -312,27 +313,47 @@ test('Issue #29: calculateHotelBanquetCommitment computes definitive LCV, minimu
     menuBreakdown: { Standart: 12, Balık: 6, Vejetaryen: 4 },
   };
 
-  // Case 1: Actual headcount (22 + 2 protocol = 24) is below hotel minimum guarantee (30) -> guaranteedBillableKuver is 30 with 6 unfilledGuaranteeSeats
-  const shortfallCommitment = calculateHotelBanquetCommitment(
+  // Step 1: LCV locked, but no hotel confirmation reference yet -> awaiting hotel banquet confirmation
+  const lockedAwaitingHotel = calculateHotelBanquetCommitment(
     sampleKuver,
     30,
     true,
     2
   );
 
-  assert.equal(shortfallCommitment.reportedMemberAndGuestKuver, 22);
-  assert.equal(shortfallCommitment.protocolSpeakerKuver, 2);
-  assert.equal(shortfallCommitment.actualHeadcount, 24);
-  assert.equal(shortfallCommitment.minHotelGuarantee, 30);
-  assert.equal(shortfallCommitment.guaranteedBillableKuver, 30);
-  assert.equal(shortfallCommitment.unfilledGuaranteeSeats, 6);
-  assert.equal(shortfallCommitment.isLockedForHotel, true);
+  assert.equal(lockedAwaitingHotel.reportedMemberAndGuestKuver, 22);
+  assert.equal(lockedAwaitingHotel.protocolSpeakerKuver, 2);
+  assert.equal(lockedAwaitingHotel.actualHeadcount, 24);
+  assert.equal(lockedAwaitingHotel.minHotelGuarantee, 30);
+  assert.equal(lockedAwaitingHotel.guaranteedBillableKuver, 30);
+  assert.equal(lockedAwaitingHotel.unfilledGuaranteeSeats, 6);
+  assert.equal(lockedAwaitingHotel.isLockedForHotel, true);
+  assert.equal(lockedAwaitingHotel.isHotelConfirmed, false);
   assert.equal(
-    shortfallCommitment.hotelConfirmationStatus,
+    lockedAwaitingHotel.hotelConfirmationStatus,
+    'LCV Kilitlendi — Otel Banket Teyidi Bekleniyor'
+  );
+
+  // Step 2: LCV locked AND explicit hotel confirmation reference recorded -> confirmed & locked
+  const confirmedWithHotel = calculateHotelBanquetCommitment(
+    sampleKuver,
+    30,
+    true,
+    2,
+    'PP-BNQ-2026-1842',
+    'Rtn. Dr. Kerem Aydın'
+  );
+  assert.equal(confirmedWithHotel.isHotelConfirmed, true);
+  assert.equal(
+    confirmedWithHotel.hotelConfirmationRef,
+    'PP-BNQ-2026-1842'
+  );
+  assert.equal(
+    confirmedWithHotel.hotelConfirmationStatus,
     'Kesin Kuver Otele Onaylandı (Kilitli)'
   );
 
-  // Case 2: Actual headcount (22 + 1 protocol = 23) exceeds minimum guarantee (20) -> guaranteedBillableKuver is 23, zero unfilled seats
+  // Step 3: Actual headcount (22 + 1 protocol = 23) exceeds minimum guarantee (20), LCV open
   const fullCommitment = calculateHotelBanquetCommitment(
     sampleKuver,
     20,
@@ -343,13 +364,14 @@ test('Issue #29: calculateHotelBanquetCommitment computes definitive LCV, minimu
   assert.equal(fullCommitment.actualHeadcount, 23);
   assert.equal(fullCommitment.guaranteedBillableKuver, 23);
   assert.equal(fullCommitment.unfilledGuaranteeSeats, 0);
+  assert.equal(fullCommitment.isHotelConfirmed, false);
   assert.equal(
     fullCommitment.hotelConfirmationStatus,
     'LCV Bildirimi Açık — Otel Onayı Bekleniyor'
   );
 });
 
-test('Issue #42: calculateMeetingCostSharingAndExemptions computes per-capita meeting share, exemptions, and shared surcharge', () => {
+test('Issue #42: calculateMeetingCostSharingAndExemptions and deriveLiveMeetingCostSharing compute live per-capita share and exemptions', () => {
   // 30 billable kuver * 2000 TL = 60,000 TL hotel invoice
   // 20 paying members + 4 paying companions + 2 exemptions (1 speaker + 1 honorary) = 26 occupied seats -> 4 unfilled guarantee seats
   // Exemption cost = 2 * 2000 = 4,000 TL; unfilled cost = 4 * 2000 = 8,000 TL; sharedPool = 12,000 TL / 20 paying members = 600 TL surcharge
@@ -369,9 +391,38 @@ test('Issue #42: calculateMeetingCostSharingAndExemptions computes per-capita me
   assert.equal(result.sharedPoolCostTL, 12000);
   assert.equal(result.perPayingMemberSharedSurchargeTL, 600);
   assert.equal(result.effectivePerMemberTotalTL, 2600);
+
+  // Live derivation from KuverSummaryResult (no hardcoded member/companion numbers)
+  const liveKuver = calculateKuverSummary(
+    SAMPLE_MEMBERS.map((m) => ({
+      memberId: m.id,
+      memberName: m.fullName,
+      status: m.rsvpStatus,
+      menu: m.mealPreference,
+      guestCount: m.rsvpStatus === 'with_guest' ? 1 : 0,
+    })),
+    'attending',
+    'Standart'
+  );
+  const liveShared = deriveLiveMeetingCostSharing({
+    kuverSummary: liveKuver,
+    unitKuverCostTL: 1850,
+    minHotelGuarantee: 10,
+    exemptSpeakerCount: 1,
+    exemptHonoraryOrYouthCount: 1,
+  });
+  assert.equal(
+    liveShared.attendingPayingMembersCount,
+    liveKuver.attendingMembers - 1
+  );
+  assert.equal(
+    liveShared.payingCompanionsCount,
+    liveKuver.spousesCount + liveKuver.guestsCount
+  );
+  assert.equal(liveShared.billableKuverCount, 10);
 });
 
-test('Issue #46: Volunteer, task, and shift management computes coverage metrics and toggles member assignments', () => {
+test('Issue #46: Volunteer, task, and shift management computes coverage metrics, toggles assignments, and blocks over-capacity', () => {
   const initialMetrics = calculateVolunteerShiftMetrics(SYNTHETIC_VOLUNTEER_SHIFTS);
   assert.equal(SYNTHETIC_VOLUNTEER_SHIFTS.length, 3);
   assert.equal(initialMetrics.totalRequired, 10);
@@ -379,7 +430,7 @@ test('Issue #46: Volunteer, task, and shift management computes coverage metrics
   assert.equal(initialMetrics.openSlotsCount, 2);
   assert.equal(initialMetrics.fillRatePercent, 80);
 
-  // Assign Rtn. Selim Koçak to shift-galatart-1
+  // Assign Rtn. Selim Koçak to shift-galatart-1 (currently 2/3)
   const afterJoin = toggleVolunteerShiftAssignment(
     SYNTHETIC_VOLUNTEER_SHIFTS,
     'shift-galatart-1',
@@ -389,6 +440,22 @@ test('Issue #46: Volunteer, task, and shift management computes coverage metrics
   assert.equal(
     updatedShift.assignedVolunteers.includes('Rtn. Selim Koçak'),
     true
+  );
+  assert.equal(updatedShift.assignedVolunteers.length, 3);
+
+  // Attempt to assign another volunteer ('Rtn. Dr. Kerem Aydın') to shift-galatart-1 now that it is at capacity (3/3) -> MUST be blocked!
+  const afterOverCapacityAttempt = toggleVolunteerShiftAssignment(
+    afterJoin,
+    'shift-galatart-1',
+    'Rtn. Dr. Kerem Aydın'
+  );
+  const fullShift = afterOverCapacityAttempt.find(
+    (s) => s.id === 'shift-galatart-1'
+  )!;
+  assert.equal(fullShift.assignedVolunteers.length, 3);
+  assert.equal(
+    fullShift.assignedVolunteers.includes('Rtn. Dr. Kerem Aydın'),
+    false
   );
 
   // Toggle again to remove Rtn. Selim Koçak from shift-galatart-1
@@ -404,12 +471,23 @@ test('Issue #46: Volunteer, task, and shift management computes coverage metrics
   );
 });
 
-test('Issue #51: Kermes, GALATART, and RYLA specialized modules summary aggregates synthetic financial and impact metrics', () => {
+test('Issue #51: Kermes, GALATART, and RYLA specialized modules summary strictly separates Gross Revenue, Program Expenses, and Net Club Impact Fund', () => {
   const summary = calculateSpecializedModulesSummary(SYNTHETIC_SPECIALIZED_MODULES);
   assert.equal(summary.kermesFillPercent, 83);
-  assert.equal(summary.galatartNetCommissionTL, 480000);
+  assert.equal(summary.kermesNetSurplusTL, 205000);
+  assert.equal(summary.galatartNetCommissionTL, 420000);
+  assert.equal(summary.galatartExhibitionExpenseTL, 60000);
   assert.equal(summary.rylaFillPercent, 83);
-  assert.equal(summary.combinedNetImpactFundTL, 250000 + 480000 + 142500);
+  assert.equal(summary.rylaProgramExpenseBudgetTL, 142500);
+  assert.equal(summary.rylaNetReserveTL, 28500);
+  assert.equal(summary.totalGrossRevenueTL, 250000 + 1200000 + 171000);
+  assert.equal(summary.totalProgramExpensesTL, 45000 + 720000 + 60000 + 142500);
+  assert.equal(summary.combinedNetImpactFundTL, 205000 + 420000 + 28500);
+  assert.equal(
+    summary.totalGrossRevenueTL - summary.totalProgramExpensesTL,
+    summary.combinedNetImpactFundTL
+  );
 });
+
 
 

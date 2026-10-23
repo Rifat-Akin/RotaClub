@@ -165,57 +165,143 @@ function verifyTenantBoundary(
 }
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1']);
+const DEFAULT_CANONICAL_WEBAUTHN_ORIGINS = [
+  'https://rotaclub.galatarotary.org',
+  'https://galata.rotary2420.org',
+];
 
-function resolveTrustedWebAuthnRpAndOrigin(req: Request): {
-  rpId: string;
-  expectedOrigin: string;
-} {
-  const configuredOrigin = process.env.ROTACLUB_WEBAUTHN_ORIGIN?.trim();
-  if (configuredOrigin) {
+function resolveTrustedWebAuthnRpAndOrigin(
+  req: Request,
+  extraTrustedOrigins?: string[]
+):
+  | {
+      ok: true;
+      rpId: string;
+      expectedOrigin: string;
+    }
+  | {
+      ok: false;
+      error: string;
+      message: string;
+    } {
+  const configuredPrimary = process.env.ROTACLUB_WEBAUTHN_ORIGIN?.trim();
+  const envTrustedList = (process.env.ROTACLUB_WEBAUTHN_TRUSTED_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const appUrlOrigin = process.env.APP_URL?.trim();
+
+  const trustedOriginStrings = [
+    ...DEFAULT_CANONICAL_WEBAUTHN_ORIGINS,
+    ...(configuredPrimary ? [configuredPrimary] : []),
+    ...envTrustedList,
+    ...(appUrlOrigin ? [appUrlOrigin] : []),
+    ...(extraTrustedOrigins || []),
+  ];
+
+  const trustedOriginsMap = new Map<
+    string,
+    { rpId: string; expectedOrigin: string }
+  >();
+  for (const rawOrigin of trustedOriginStrings) {
     try {
-      const parsed = new URL(configuredOrigin);
+      const parsed = new URL(rawOrigin);
+      const hostKey = parsed.host.toLowerCase();
+      const rpId = parsed.hostname.toLowerCase();
+      const isLoopback = LOOPBACK_HOSTS.has(rpId);
+      if (!isLoopback && parsed.protocol !== 'https:') {
+        continue;
+      }
+      const expectedOrigin = isLoopback
+        ? parsed.origin
+        : `https://${parsed.host.toLowerCase()}`;
+      trustedOriginsMap.set(hostKey, { rpId, expectedOrigin });
+    } catch {
+      // Ignore malformed origin entries
+    }
+  }
+
+  const forwardedHostHeader = String(req.get('x-forwarded-host') || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  const hostHeader = String(req.get('host') || '')
+    .trim()
+    .toLowerCase();
+
+  // Security Audit (#76, #22): If X-Forwarded-Host is supplied, it MUST match a pinned trusted origin or loopback in non-prod
+  if (forwardedHostHeader) {
+    const forwardedHostname = forwardedHostHeader.split(':')[0] || '';
+    const isForwardedLoopback =
+      process.env.NODE_ENV !== 'production' &&
+      LOOPBACK_HOSTS.has(forwardedHostname);
+    const matchedForwarded = trustedOriginsMap.get(forwardedHostHeader);
+    if (!matchedForwarded && !isForwardedLoopback) {
+      return {
+        ok: false,
+        error: 'WEBAUTHN_UNTRUSTED_ORIGIN_HOST',
+        message: `WebAuthn güvenilir origin ihlali (#22, #76): Gönderilen X-Forwarded-Host ("${forwardedHostHeader}") sabitlenmiş güvenilir HTTPS origin listesinde yer almıyor.`,
+      };
+    }
+  }
+
+  // If ROTACLUB_WEBAUTHN_ORIGIN is explicitly pinned, always enforce it
+  if (configuredPrimary) {
+    try {
+      const parsed = new URL(configuredPrimary);
       const rpId = parsed.hostname.toLowerCase();
       const isLoopback = LOOPBACK_HOSTS.has(rpId);
       const expectedOrigin = isLoopback
         ? parsed.origin
         : `https://${parsed.host.toLowerCase()}`;
-      return { rpId, expectedOrigin };
+      return { ok: true, rpId, expectedOrigin };
     } catch {
-      // Fall through to request host resolution
+      // Fall through to allowlist verification
     }
   }
 
-  const forwardedHost = String(req.get('x-forwarded-host') || '')
-    .split(',')[0]
-    .trim()
-    .toLowerCase();
-  const rawHost = (
-    forwardedHost ||
-    req.get('host') ||
+  const effectiveRawHost = (
+    forwardedHostHeader ||
+    hostHeader ||
     req.hostname ||
     'localhost'
   )
     .trim()
     .toLowerCase();
-  const safeHost = /^[a-z0-9.-]+(?::\d{1,5})?$/.test(rawHost)
-    ? rawHost
-    : 'localhost';
-  const rpId = safeHost.split(':')[0] || 'localhost';
-  const isLoopback = LOOPBACK_HOSTS.has(rpId);
 
-  const forwardedProto = String(req.get('x-forwarded-proto') || '')
-    .split(',')[0]
-    .trim()
-    .toLowerCase();
-  const scheme = !isLoopback
-    ? 'https'
-    : forwardedProto === 'https' || req.protocol === 'https'
-    ? 'https'
-    : 'http';
+  if (!/^[a-z0-9.-]+(?::\d{1,5})?$/.test(effectiveRawHost)) {
+    return {
+      ok: false,
+      error: 'WEBAUTHN_UNTRUSTED_ORIGIN_HOST',
+      message: 'WebAuthn için geçersiz Host başlığı formatı reddedildi (#22).',
+    };
+  }
+
+  const pinnedMatch = trustedOriginsMap.get(effectiveRawHost);
+  if (pinnedMatch) {
+    return { ok: true, ...pinnedMatch };
+  }
+
+  const candidateRpId = effectiveRawHost.split(':')[0] || 'localhost';
+  const isLoopback = LOOPBACK_HOSTS.has(candidateRpId);
+  if (isLoopback && process.env.NODE_ENV !== 'production') {
+    const forwardedProto = String(req.get('x-forwarded-proto') || '')
+      .split(',')[0]
+      .trim()
+      .toLowerCase();
+    const scheme =
+      forwardedProto === 'https' || req.protocol === 'https' ? 'https' : 'http';
+    return {
+      ok: true,
+      rpId: candidateRpId,
+      expectedOrigin: `${scheme}://${effectiveRawHost}`,
+    };
+  }
 
   return {
-    rpId,
-    expectedOrigin: `${scheme}://${safeHost}`,
+    ok: false,
+    error: 'WEBAUTHN_UNTRUSTED_ORIGIN_HOST',
+    message: `WebAuthn güvenilir origin ihlali (#22, #76): "${effectiveRawHost}" sabitlenmiş güvenilir HTTPS origin listesinde (ROTACLUB_WEBAUTHN_ORIGIN) tanımlı değil.`,
   };
 }
 
@@ -269,7 +355,10 @@ function isTrustedWebAuthnOrigin(
 
 export function createPilotExpressApp(
   customDbFile?: string,
-  options?: { trustedWebAuthnRootPems?: string[] }
+  options?: {
+    trustedWebAuthnRootPems?: string[];
+    trustedWebAuthnOrigins?: string[];
+  }
 ) {
   const app = express();
   app.set('trust proxy', 1);
@@ -759,9 +848,20 @@ export function createPilotExpressApp(
         return;
       }
 
+      const originResolution = resolveTrustedWebAuthnRpAndOrigin(
+        req,
+        options?.trustedWebAuthnOrigins
+      );
+      if (!originResolution.ok) {
+        res.status(403).json({
+          error: originResolution.error,
+          message: originResolution.message,
+        });
+        return;
+      }
+      const { rpId, expectedOrigin } = originResolution;
       const challenge = crypto.randomBytes(32).toString('base64url');
       const challengeId = crypto.randomUUID();
-      const { rpId, expectedOrigin } = resolveTrustedWebAuthnRpAndOrigin(req);
 
       activeChallenges.set(challengeId, {
         challenge,
@@ -1000,9 +1100,20 @@ export function createPilotExpressApp(
       return;
     }
 
+    const originResolution = resolveTrustedWebAuthnRpAndOrigin(
+      req,
+      options?.trustedWebAuthnOrigins
+    );
+    if (!originResolution.ok) {
+      res.status(403).json({
+        error: originResolution.error,
+        message: originResolution.message,
+      });
+      return;
+    }
+    const { rpId, expectedOrigin } = originResolution;
     const challenge = crypto.randomBytes(32).toString('base64url');
     const challengeId = crypto.randomUUID();
-    const { rpId, expectedOrigin } = resolveTrustedWebAuthnRpAndOrigin(req);
 
     activeChallenges.set(challengeId, {
       challenge,
@@ -2337,6 +2448,72 @@ export function createPilotExpressApp(
         }
       }
 
+      // Issue #29 Fix: Validate hotel banquet confirmation workflow & LCV lock rules
+      if (Array.isArray(incomingPatch.meetings)) {
+        for (const m of incomingPatch.meetings) {
+          const hasConfirmationRef =
+            typeof m.hotelConfirmationRef === 'string' &&
+            m.hotelConfirmationRef.trim().length > 0;
+          if (hasConfirmationRef && !m.isLcvLockedForHotel) {
+            res.status(422).json({
+              error: 'HOTEL_CONFIRMATION_REQUIRES_LCV_LOCK',
+              message:
+                'Otel banket teyit referansı kaydedilmeden önce toplantı LCV listesi kilitlenmelidir (#29).',
+            });
+            return;
+          }
+        }
+      }
+
+      const activeMeetingInState =
+        currentTenant.meetings.find(
+          (m) => m.meetingNo === currentTenant.selectedMeetingNo
+        ) || currentTenant.meetings[0];
+
+      if (!isBoardAdmin && activeMeetingInState?.isLcvLockedForHotel) {
+        const selfMemberExisting = currentTenant.members.find(
+          (m) => m.id === user.memberId
+        );
+        const selfMemberIncoming = Array.isArray(incomingPatch.members)
+          ? incomingPatch.members.find(
+              (m: { id: string }) => m.id === user.memberId
+            )
+          : undefined;
+        const rsvpChanged =
+          (incomingPatch.rsvpStatus !== undefined &&
+            incomingPatch.rsvpStatus !== currentTenant.rsvpStatus) ||
+          (selfMemberIncoming &&
+            selfMemberExisting &&
+            (selfMemberIncoming.rsvpStatus !== selfMemberExisting.rsvpStatus ||
+              selfMemberIncoming.mealPreference !==
+                selfMemberExisting.mealPreference));
+
+        if (rsvpChanged) {
+          res.status(409).json({
+            error: 'LCV_LOCKED_FOR_HOTEL',
+            message: `Toplantı #${activeMeetingInState.meetingNo} kuver listesi otele bildirildiği ve kilitlendiği için LCV veya menü tercihi değiştirilemez (#29).`,
+          });
+          return;
+        }
+      }
+
+      // Issue #46 Fix: Enforce strict volunteer shift capacity on the server
+      if (Array.isArray(incomingPatch.volunteerShifts)) {
+        for (const slot of incomingPatch.volunteerShifts) {
+          if (
+            typeof slot.requiredCount === 'number' &&
+            Array.isArray(slot.assignedVolunteers) &&
+            slot.assignedVolunteers.length > slot.requiredCount
+          ) {
+            res.status(422).json({
+              error: 'SHIFT_CAPACITY_EXCEEDED',
+              message: `Vardiya kontenjanı aşıldı (#46): "${slot.roleTitle}" vardiyası en fazla ${slot.requiredCount} gönüllü kabul edebilir.`,
+            });
+            return;
+          }
+        }
+      }
+
       const casResult = store.updateTenant(
         authorizedClubId,
         (curr) => {
@@ -2543,6 +2720,33 @@ export function createPilotExpressApp(
                     ...curr.paymentNotifications,
                   ]
               : curr.paymentNotifications,
+            volunteerShifts: Array.isArray(incomingPatch.volunteerShifts)
+              ? incomingPatch.volunteerShifts.map(
+                  (slot: {
+                    id: string;
+                    projectId: string;
+                    projectTitle: string;
+                    shiftTimeLabel: string;
+                    roleTitle: string;
+                    requiredCount: number;
+                    assignedVolunteers: string[];
+                  }) => ({
+                    ...slot,
+                    assignedVolunteers: Array.from(
+                      new Set(
+                        Array.isArray(slot.assignedVolunteers)
+                          ? slot.assignedVolunteers
+                          : []
+                      )
+                    ).slice(0, Math.max(0, Number(slot.requiredCount) || 0)),
+                  })
+                )
+              : curr.volunteerShifts,
+            specializedModules:
+              (isBoardAdmin || isFinanceAdmin) &&
+              incomingPatch.specializedModules
+                ? incomingPatch.specializedModules
+                : curr.specializedModules,
             members: sanitizedMembers,
           };
         },

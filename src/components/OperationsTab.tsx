@@ -41,6 +41,9 @@ interface OperationsTabProps {
   onSubmitFiresideReport: (groupId: string, summary: string, attendanceRate: string) => void;
   members: RotaryMember[];
   onCreateFiresideGroup: (newGroup: Omit<FiresideGroup, 'id' | 'reportSubmitted'>) => void;
+  activeMemberName?: string;
+  volunteerShifts?: VolunteerShiftSlot[];
+  onToggleVolunteerShift?: (shiftId: string, volunteerName: string) => void;
 }
 
 export const OperationsTab: React.FC<OperationsTabProps> = ({
@@ -57,6 +60,9 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
   onSubmitFiresideReport,
   members,
   onCreateFiresideGroup,
+  activeMemberName,
+  volunteerShifts: externalVolunteerShifts,
+  onToggleVolunteerShift,
 }) => {
   const [makeupSubTab, setMakeupSubTab] = useState<'member_makeup' | 'guest_makeup'>(
     'member_makeup'
@@ -105,16 +111,31 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
 
   const isBoardLeader = activeRole === 'sekreter' || activeRole === 'baskan';
 
-  // Issue #46 Synthetic Pilot State: Volunteer, Task & Shift Management
-  const [volunteerShifts, setVolunteerShifts] = useState<VolunteerShiftSlot[]>(
-    SYNTHETIC_VOLUNTEER_SHIFTS
-  );
+  // Issue #46 Live Volunteer, Task & Shift Management bound to active session/role member
+  const effectiveVolunteerName =
+    activeMemberName ||
+    (activeRole === 'sekreter'
+      ? 'Rtn. Dr. Kerem Aydın'
+      : activeRole === 'sayman'
+      ? 'Rtn. YMM Levent Soydan'
+      : activeRole === 'baskan'
+      ? 'Rtn. Av. Nazlı Denizmen'
+      : 'Rtn. Rifat Akın');
+
+  const [localVolunteerShifts, setLocalVolunteerShifts] = useState<
+    VolunteerShiftSlot[]
+  >(SYNTHETIC_VOLUNTEER_SHIFTS);
+  const volunteerShifts = externalVolunteerShifts || localVolunteerShifts;
   const shiftMetrics = calculateVolunteerShiftMetrics(volunteerShifts);
 
   const handleToggleShiftSlot = (shiftId: string) => {
-    setVolunteerShifts((prev) =>
-      toggleVolunteerShiftAssignment(prev, shiftId, 'Rtn. Rifat Akın')
-    );
+    if (onToggleVolunteerShift) {
+      onToggleVolunteerShift(shiftId, effectiveVolunteerName);
+    } else {
+      setLocalVolunteerShifts((prev) =>
+        toggleVolunteerShiftAssignment(prev, shiftId, effectiveVolunteerName)
+      );
+    }
   };
 
   const handleMemberMakeupSubmit = (e: React.FormEvent) => {
@@ -835,8 +856,12 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
 
             <div className="space-y-3">
               {volunteerShifts.map((shift) => {
-                const isAssigned = shift.assignedVolunteers.includes('Rtn. Rifat Akın');
-                const isFull = shift.assignedVolunteers.length >= shift.requiredCount;
+                const isAssigned = shift.assignedVolunteers.includes(
+                  effectiveVolunteerName
+                );
+                const isFull =
+                  shift.assignedVolunteers.length >= shift.requiredCount;
+                const isBlockedByCapacity = !isAssigned && isFull;
                 return (
                   <div
                     key={shift.id}
@@ -864,16 +889,21 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                     </div>
                     <button
                       type="button"
+                      disabled={isBlockedByCapacity}
                       onClick={() => handleToggleShiftSlot(shift.id)}
-                      className={`w-full min-h-[36px] px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                      className={`w-full min-h-[36px] px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
                         isAssigned
-                          ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                          : 'bg-[#0C3C7C] text-white hover:bg-[#17458F]'
+                          ? 'bg-emerald-50 text-emerald-800 border border-emerald-200 cursor-pointer'
+                          : isBlockedByCapacity
+                          ? 'bg-slate-200 text-slate-500 cursor-not-allowed'
+                          : 'bg-[#0C3C7C] text-white hover:bg-[#17458F] cursor-pointer'
                       }`}
                     >
                       {isAssigned
-                        ? 'Vardiyada Görevlisiniz (Ayrılmak İçin Dokunun)'
-                        : 'Bu Vardiyada Görev Al (+Make-up Kredisi)'}
+                        ? `Vardiyada Görevlisiniz (${effectiveVolunteerName} · Ayrılmak İçin Dokunun)`
+                        : isBlockedByCapacity
+                        ? 'Vardiya Kontenjanı Dolu (Maksimum Kapasite)'
+                        : `Bu Vardiyada Görev Al (${effectiveVolunteerName} · +Make-up Kredisi)`}
                     </button>
                   </div>
                 );

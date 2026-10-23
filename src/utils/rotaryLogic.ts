@@ -464,7 +464,8 @@ export function maskPhoneForKvkk(phone: string, maskEnabled: boolean): string {
 }
 
 /**
- * Issue #29 — Kesin LCV, Kuver ve Otel Onayı (Hotel Banquet Commitment & Guarantee Reconciliation)
+ * Issue #29 — Kesin LCV, Kuver ve Otel Onayı (Hotel Banquet Commitment & Official Confirmation Reconciliation)
+ * Hotel banquet confirmation requires BOTH club LCV lock AND an explicit hotel confirmation reference code.
  */
 export interface HotelBanquetCommitmentResult {
   reportedMemberAndGuestKuver: number;
@@ -474,8 +475,12 @@ export interface HotelBanquetCommitmentResult {
   guaranteedBillableKuver: number;
   unfilledGuaranteeSeats: number;
   isLockedForHotel: boolean;
+  isHotelConfirmed: boolean;
+  hotelConfirmationRef?: string;
+  hotelConfirmedBy?: string;
   hotelConfirmationStatus:
     | 'Kesin Kuver Otele Onaylandı (Kilitli)'
+    | 'LCV Kilitlendi — Otel Banket Teyidi Bekleniyor'
     | 'LCV Bildirimi Açık — Otel Onayı Bekleniyor';
 }
 
@@ -483,7 +488,9 @@ export function calculateHotelBanquetCommitment(
   kuverSummary: KuverSummaryResult,
   minHotelGuarantee: number = 25,
   isLockedForHotel: boolean = false,
-  protocolSpeakerKuver: number = 1
+  protocolSpeakerKuver: number = 1,
+  hotelConfirmationRef?: string,
+  hotelConfirmedBy?: string
 ): HotelBanquetCommitmentResult {
   const safeMinGuarantee = Math.max(0, minHotelGuarantee);
   const safeProtocol = Math.max(0, protocolSpeakerKuver);
@@ -493,6 +500,15 @@ export function calculateHotelBanquetCommitment(
     0,
     safeMinGuarantee - actualHeadcount
   );
+  const cleanRef = hotelConfirmationRef?.trim() || undefined;
+  const cleanOfficer = hotelConfirmedBy?.trim() || undefined;
+  const isHotelConfirmed = Boolean(isLockedForHotel && cleanRef);
+
+  const hotelConfirmationStatus = !isLockedForHotel
+    ? 'LCV Bildirimi Açık — Otel Onayı Bekleniyor'
+    : isHotelConfirmed
+    ? 'Kesin Kuver Otele Onaylandı (Kilitli)'
+    : 'LCV Kilitlendi — Otel Banket Teyidi Bekleniyor';
 
   return {
     reportedMemberAndGuestKuver: kuverSummary.totalKuver,
@@ -502,9 +518,10 @@ export function calculateHotelBanquetCommitment(
     guaranteedBillableKuver,
     unfilledGuaranteeSeats,
     isLockedForHotel,
-    hotelConfirmationStatus: isLockedForHotel
-      ? 'Kesin Kuver Otele Onaylandı (Kilitli)'
-      : 'LCV Bildirimi Açık — Otel Onayı Bekleniyor',
+    isHotelConfirmed,
+    hotelConfirmationRef: cleanRef,
+    hotelConfirmedBy: cleanOfficer,
+    hotelConfirmationStatus,
   };
 }
 
@@ -514,6 +531,8 @@ export function calculateHotelBanquetCommitment(
 export interface MeetingCostSharingResult {
   unitKuverCostTL: number;
   billableKuverCount: number;
+  attendingPayingMembersCount: number;
+  payingCompanionsCount: number;
   totalHotelInvoiceTL: number;
   totalExemptionsCount: number;
   clubSubsidizedExemptionCostTL: number;
@@ -555,6 +574,8 @@ export function calculateMeetingCostSharingAndExemptions(params: {
   return {
     unitKuverCostTL: unitCost,
     billableKuverCount: billable,
+    attendingPayingMembersCount: payingMembers,
+    payingCompanionsCount: payingCompanions,
     totalHotelInvoiceTL,
     totalExemptionsCount,
     clubSubsidizedExemptionCostTL,
@@ -563,6 +584,45 @@ export function calculateMeetingCostSharingAndExemptions(params: {
     perPayingMemberSharedSurchargeTL,
     effectivePerMemberTotalTL,
   };
+}
+
+/**
+ * Derives live per-capita meeting cost sharing directly from the active meeting's KuverSummaryResult
+ * (computed from real member RSVPs) and hotel minimum guarantee (#29, #42).
+ */
+export function deriveLiveMeetingCostSharing(params: {
+  kuverSummary: KuverSummaryResult;
+  unitKuverCostTL: number;
+  minHotelGuarantee: number;
+  exemptSpeakerCount: number;
+  exemptHonoraryOrYouthCount: number;
+}): MeetingCostSharingResult {
+  const safeSpeakerExemptions = Math.max(0, params.exemptSpeakerCount);
+  const safeMemberExemptions = Math.min(
+    params.kuverSummary.attendingMembers,
+    Math.max(0, params.exemptHonoraryOrYouthCount)
+  );
+  const attendingPayingMembersCount = Math.max(
+    0,
+    params.kuverSummary.attendingMembers - safeMemberExemptions
+  );
+  const payingCompanionsCount =
+    params.kuverSummary.spousesCount + params.kuverSummary.guestsCount;
+  const actualHeadcount =
+    params.kuverSummary.totalKuver + safeSpeakerExemptions;
+  const billableKuverCount = Math.max(
+    Math.max(0, params.minHotelGuarantee),
+    actualHeadcount
+  );
+
+  return calculateMeetingCostSharingAndExemptions({
+    unitKuverCostTL: params.unitKuverCostTL,
+    billableKuverCount,
+    attendingPayingMembersCount,
+    payingCompanionsCount,
+    exemptSpeakerCount: safeSpeakerExemptions,
+    exemptHonoraryOrYouthCount: safeMemberExemptions,
+  });
 }
 
 /**
@@ -641,26 +701,44 @@ export function calculateVolunteerShiftMetrics(shifts: VolunteerShiftSlot[]): {
   };
 }
 
+/**
+ * Toggles a member's volunteer shift assignment while strictly enforcing shift capacity (`requiredCount`).
+ * If a shift is already at full capacity (`assignedVolunteers.length >= requiredCount`), new volunteers
+ * cannot be added, while already-assigned volunteers can always leave their shift (#46).
+ */
 export function toggleVolunteerShiftAssignment(
   shifts: VolunteerShiftSlot[],
   shiftId: string,
   memberName: string
 ): VolunteerShiftSlot[] {
+  const cleanMember = memberName.trim();
+  if (!cleanMember) return shifts;
+
   return shifts.map((slot) => {
     if (slot.id !== shiftId) return slot;
-    const exists = slot.assignedVolunteers.includes(memberName);
-    const nextVolunteers = exists
-      ? slot.assignedVolunteers.filter((v) => v !== memberName)
-      : [...slot.assignedVolunteers, memberName];
+    const exists = slot.assignedVolunteers.includes(cleanMember);
+    if (exists) {
+      return {
+        ...slot,
+        assignedVolunteers: slot.assignedVolunteers.filter(
+          (v) => v !== cleanMember
+        ),
+      };
+    }
+    // Enforce strict shift capacity: reject new signups when slot is already full
+    if (slot.assignedVolunteers.length >= Math.max(0, slot.requiredCount)) {
+      return slot;
+    }
     return {
       ...slot,
-      assignedVolunteers: nextVolunteers,
+      assignedVolunteers: [...slot.assignedVolunteers, cleanMember],
     };
   });
 }
 
 /**
- * Issue #51 — Kermes, GALATART ve RYLA Özel Modülleri (Synthetic Specialized Project Modules)
+ * Issue #51 — Kermes, GALATART ve RYLA Özel Modülleri (Specialized Project Modules with Strict Accounting Separation)
+ * Strictly separates Gross Revenue, Program/Artist/Camp Expenses, and Net Club Scholarship/Service Fund.
  */
 export interface SpecializedModuleData {
   kermes: {
@@ -669,12 +747,16 @@ export interface SpecializedModuleData {
     stallSponsorFeeTL: number;
     donatedProductItems: number;
     expectedStallRevenueTL: number;
+    operatingExpenseTL: number;
+    netServiceFundTL: number;
   };
   galatart: {
     curatedArtworksCount: number;
     soldArtworksCount: number;
     grossArtworkSalesTL: number;
     clubCommissionPercent: number;
+    artistPayoutTL: number;
+    exhibitionExpenseTL: number;
     netScholarshipFundTL: number;
   };
   ryla: {
@@ -682,7 +764,9 @@ export interface SpecializedModuleData {
     approvedScholars: number;
     waitlistedCandidates: number;
     sponsorCostPerScholarTL: number;
+    grossSponsorContributionsTL: number;
     totalSponsoredBudgetTL: number;
+    reservedYouthFundSurplusTL: number;
   };
 }
 
@@ -693,20 +777,26 @@ export const SYNTHETIC_SPECIALIZED_MODULES: SpecializedModuleData = {
     stallSponsorFeeTL: 12500,
     donatedProductItems: 340,
     expectedStallRevenueTL: 250000,
+    operatingExpenseTL: 45000,
+    netServiceFundTL: 205000,
   },
   galatart: {
     curatedArtworksCount: 42,
     soldArtworksCount: 29,
     grossArtworkSalesTL: 1200000,
     clubCommissionPercent: 40,
-    netScholarshipFundTL: 480000,
+    artistPayoutTL: 720000,
+    exhibitionExpenseTL: 60000,
+    netScholarshipFundTL: 420000,
   },
   ryla: {
     totalQuota: 18,
     approvedScholars: 15,
     waitlistedCandidates: 4,
     sponsorCostPerScholarTL: 9500,
+    grossSponsorContributionsTL: 171000,
     totalSponsoredBudgetTL: 142500,
+    reservedYouthFundSurplusTL: 28500,
   },
 };
 
@@ -714,8 +804,19 @@ export function calculateSpecializedModulesSummary(
   data: SpecializedModuleData = SYNTHETIC_SPECIALIZED_MODULES
 ): {
   kermesFillPercent: number;
+  kermesGrossRevenueTL: number;
+  kermesOperatingExpenseTL: number;
+  kermesNetSurplusTL: number;
+  galatartGrossSalesTL: number;
+  galatartGrossCommissionTL: number;
+  galatartExhibitionExpenseTL: number;
   galatartNetCommissionTL: number;
   rylaFillPercent: number;
+  rylaGrossSponsorRevenueTL: number;
+  rylaProgramExpenseBudgetTL: number;
+  rylaNetReserveTL: number;
+  totalGrossRevenueTL: number;
+  totalProgramExpensesTL: number;
   combinedNetImpactFundTL: number;
 } {
   const kermesFillPercent =
@@ -724,25 +825,82 @@ export function calculateSpecializedModulesSummary(
           (data.kermes.allocatedStalls / data.kermes.totalStalls) * 100
         )
       : 0;
-  const galatartNetCommissionTL = Math.round(
-    (data.galatart.grossArtworkSalesTL * data.galatart.clubCommissionPercent) /
-      100
+  const kermesGrossRevenueTL = Math.max(
+    0,
+    data.kermes.allocatedStalls * data.kermes.stallSponsorFeeTL
   );
+  const kermesOperatingExpenseTL = Math.max(
+    0,
+    data.kermes.operatingExpenseTL ?? 0
+  );
+  const kermesNetSurplusTL = Math.max(
+    0,
+    kermesGrossRevenueTL - kermesOperatingExpenseTL
+  );
+
+  const galatartGrossSalesTL = Math.max(0, data.galatart.grossArtworkSalesTL);
+  const galatartGrossCommissionTL = Math.round(
+    (galatartGrossSalesTL * data.galatart.clubCommissionPercent) / 100
+  );
+  const galatartArtistPayoutTL = Math.max(
+    0,
+    galatartGrossSalesTL - galatartGrossCommissionTL
+  );
+  const galatartExhibitionExpenseTL = Math.max(
+    0,
+    data.galatart.exhibitionExpenseTL ?? 0
+  );
+  const galatartNetCommissionTL = Math.max(
+    0,
+    galatartGrossCommissionTL - galatartExhibitionExpenseTL
+  );
+
   const rylaFillPercent =
     data.ryla.totalQuota > 0
       ? Math.round((data.ryla.approvedScholars / data.ryla.totalQuota) * 100)
       : 0;
+  const rylaGrossSponsorRevenueTL = Math.max(
+    0,
+    data.ryla.grossSponsorContributionsTL ??
+      data.ryla.totalQuota * data.ryla.sponsorCostPerScholarTL
+  );
+  const rylaProgramExpenseBudgetTL = Math.max(
+    0,
+    data.ryla.approvedScholars * data.ryla.sponsorCostPerScholarTL
+  );
+  const rylaNetReserveTL = Math.max(
+    0,
+    rylaGrossSponsorRevenueTL - rylaProgramExpenseBudgetTL
+  );
+
+  const totalGrossRevenueTL =
+    kermesGrossRevenueTL + galatartGrossSalesTL + rylaGrossSponsorRevenueTL;
+  const totalProgramExpensesTL =
+    kermesOperatingExpenseTL +
+    galatartArtistPayoutTL +
+    galatartExhibitionExpenseTL +
+    rylaProgramExpenseBudgetTL;
   const combinedNetImpactFundTL =
-    data.kermes.expectedStallRevenueTL +
-    galatartNetCommissionTL +
-    data.ryla.totalSponsoredBudgetTL;
+    kermesNetSurplusTL + galatartNetCommissionTL + rylaNetReserveTL;
 
   return {
     kermesFillPercent,
+    kermesGrossRevenueTL,
+    kermesOperatingExpenseTL,
+    kermesNetSurplusTL,
+    galatartGrossSalesTL,
+    galatartGrossCommissionTL,
+    galatartExhibitionExpenseTL,
     galatartNetCommissionTL,
     rylaFillPercent,
+    rylaGrossSponsorRevenueTL,
+    rylaProgramExpenseBudgetTL,
+    rylaNetReserveTL,
+    totalGrossRevenueTL,
+    totalProgramExpensesTL,
     combinedNetImpactFundTL,
   };
 }
+
 
 

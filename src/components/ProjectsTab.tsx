@@ -19,6 +19,7 @@ import {
   calculateProjectProgress,
   calculateSpecializedModulesSummary,
   formatTL,
+  SpecializedModuleData,
   SYNTHETIC_SPECIALIZED_MODULES,
 } from '../utils/rotaryLogic';
 import { ProjectVisualArtwork } from './RotaryArtwork';
@@ -33,6 +34,8 @@ interface ProjectsTabProps {
   onCreateProject: (newProject: Omit<GalataProject, 'id' | 'collectedAmount' | 'supportersCount'>) => void;
   onSponsorScholarMonth: (scholarId: string) => void;
   onToggleProjectVolunteer?: (projectId: string) => void;
+  specializedModules?: SpecializedModuleData;
+  activeMemberName?: string;
 }
 
 export const ProjectsTab: React.FC<ProjectsTabProps> = ({
@@ -45,6 +48,8 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({
   onCreateProject,
   onSponsorScholarMonth,
   onToggleProjectVolunteer,
+  specializedModules,
+  activeMemberName = 'Rtn. Rifat Akın',
 }) => {
   const [selectedProject, setSelectedProject] = useState<GalataProject | null>(null);
   const [supportTier, setSupportTier] = useState<'ticket' | 'double_ticket' | 'patron'>('ticket');
@@ -67,7 +72,11 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({
   const [newVisualTheme, setNewVisualTheme] = useState<GalataProject['visualTheme']>('school');
 
   const isBoardLeader = activeRole === 'baskan' || activeRole === 'sekreter';
-  const specializedSummary = calculateSpecializedModulesSummary(SYNTHETIC_SPECIALIZED_MODULES);
+  const activeSpecializedModules =
+    specializedModules || SYNTHETIC_SPECIALIZED_MODULES;
+  const specializedSummary = calculateSpecializedModulesSummary(
+    activeSpecializedModules
+  );
 
   const openSupportModal = (project: GalataProject) => {
     setSelectedProject(project);
@@ -279,7 +288,7 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({
                     >
                       <UserCheck className="w-4 h-4 text-[#0C3C7C] shrink-0" />
                       <span>
-                        {(project.volunteers || []).includes('Rtn. Rifat Akın')
+                        {(project.volunteers || []).includes(activeMemberName)
                           ? 'Saha Gönüllüsüsünüz (Make-up)'
                           : 'Projede Saha Gönüllüsü Ol'}
                       </span>
@@ -413,7 +422,7 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({
         </div>
       </section>
 
-      {/* Issue #51 Synthetic Pilot Module: Kermes, GALATART ve RYLA Özel Modülleri */}
+      {/* Issue #51 Module: Kermes, GALATART ve RYLA Özel Modülleri (Ayrıştırılmış Brüt Gelir, Program Gideri ve Net Kulüp Fonu) */}
       <section
         aria-labelledby="specialized-modules-heading"
         data-testid="specialized-modules-panel"
@@ -422,7 +431,7 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-4">
           <div>
             <div className="text-xs font-semibold text-[#0C3C7C]">
-              Galata İmzalı Özel Programlar · Sentetik Pilot Modülleri (#51)
+              Galata İmzalı Özel Programlar · Muhasebe Ayrıştırmalı Modül (#51)
             </div>
             <h2
               id="specialized-modules-heading"
@@ -431,13 +440,27 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({
               Kermes, GALATART ve RYLA Operasyon Modülleri
             </h2>
             <p className="text-xs text-slate-600 mt-1">
-              Stant doluluğu, çağdaş sanat eser bağış payları ve RYLA liderlik akademisi kontenjan takibi (sentetik pilot verisi).
+              Brüt etkinlik hasılatı, sanatçı/kamp giderleri ve kulübe kalan net hizmet/burs fonu ayrı muhasebe kalemleri olarak izlenir.
             </p>
           </div>
-          <div className="sm:text-right shrink-0">
-            <div className="text-xs text-slate-500">Birleşik Net Etki & Burs Fonu</div>
-            <div className="text-lg font-bold font-mono-num text-[#0C3C7C]">
-              {formatTL(specializedSummary.combinedNetImpactFundTL)}
+          <div className="grid grid-cols-3 gap-3 text-right shrink-0">
+            <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+              <div className="text-[11px] text-slate-500">Toplam Brüt Hasılat</div>
+              <div className="text-sm font-bold font-mono-num text-slate-900">
+                {formatTL(specializedSummary.totalGrossRevenueTL)}
+              </div>
+            </div>
+            <div className="p-2.5 rounded-xl bg-rose-50/60 border border-rose-200">
+              <div className="text-[11px] text-rose-700">Program / Sanatçı Gideri</div>
+              <div className="text-sm font-bold font-mono-num text-rose-800">
+                {formatTL(specializedSummary.totalProgramExpensesTL)}
+              </div>
+            </div>
+            <div className="p-2.5 rounded-xl bg-emerald-50/70 border border-emerald-200">
+              <div className="text-[11px] text-emerald-800">Birleşik Net Etki & Burs Fonu</div>
+              <div className="text-sm font-bold font-mono-num text-[#0C3C7C]">
+                {formatTL(specializedSummary.combinedNetImpactFundTL)}
+              </div>
             </div>
           </div>
         </div>
@@ -458,19 +481,19 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({
               <div className="flex justify-between">
                 <span className="text-slate-500">Stant Doluluğu:</span>
                 <span className="font-mono-num font-bold text-slate-900">
-                  {SYNTHETIC_SPECIALIZED_MODULES.kermes.allocatedStalls}/{SYNTHETIC_SPECIALIZED_MODULES.kermes.totalStalls} Stant (%{specializedSummary.kermesFillPercent})
+                  {activeSpecializedModules.kermes.allocatedStalls}/{activeSpecializedModules.kermes.totalStalls} Stant (%{specializedSummary.kermesFillPercent})
                 </span>
               </div>
               <div className="flex justify-between">
-                <span className="text-slate-500">Bağışlanan Tasarım Ürün:</span>
-                <span className="font-mono-num font-semibold text-[#0C3C7C]">
-                  {SYNTHETIC_SPECIALIZED_MODULES.kermes.donatedProductItems} Adet
+                <span className="text-slate-500">Brüt Stant / Lojistik Gideri:</span>
+                <span className="font-mono-num font-semibold text-slate-700">
+                  {formatTL(activeSpecializedModules.kermes.expectedStallRevenueTL)} / -{formatTL(activeSpecializedModules.kermes.operatingExpenseTL ?? 35000)}
                 </span>
               </div>
               <div className="flex justify-between pt-1 border-t border-slate-100">
-                <span className="text-slate-500">Beklenen Stant Geliri:</span>
+                <span className="text-slate-500">Net Kulüp Hizmet Fonu:</span>
                 <span className="font-mono-num font-bold text-emerald-700">
-                  {formatTL(SYNTHETIC_SPECIALIZED_MODULES.kermes.expectedStallRevenueTL)}
+                  {formatTL(specializedSummary.kermesNetSurplusTL)}
                 </span>
               </div>
             </div>
@@ -491,17 +514,17 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({
               <div className="flex justify-between">
                 <span className="text-slate-500">Koleksiyoner Devri:</span>
                 <span className="font-mono-num font-bold text-slate-900">
-                  {SYNTHETIC_SPECIALIZED_MODULES.galatart.soldArtworksCount}/{SYNTHETIC_SPECIALIZED_MODULES.galatart.curatedArtworksCount} Eser
+                  {activeSpecializedModules.galatart.soldArtworksCount}/{activeSpecializedModules.galatart.curatedArtworksCount} Eser
                 </span>
               </div>
               <div className="flex justify-between">
-                <span className="text-slate-500">Kulüp Burs Komisyonu:</span>
-                <span className="font-mono-num font-semibold text-[#0C3C7C]">
-                  %{SYNTHETIC_SPECIALIZED_MODULES.galatart.clubCommissionPercent}
+                <span className="text-slate-500">Brüt Satış / Sanatçı Payı:</span>
+                <span className="font-mono-num font-semibold text-slate-700">
+                  {formatTL(activeSpecializedModules.galatart.grossArtworkSalesTL)} / -{formatTL(activeSpecializedModules.galatart.artistPayoutTL)}
                 </span>
               </div>
               <div className="flex justify-between pt-1 border-t border-slate-100">
-                <span className="text-slate-500">Net Burs Fonu Payı:</span>
+                <span className="text-slate-500">Net Burs Fonu (%{activeSpecializedModules.galatart.clubCommissionPercent}):</span>
                 <span className="font-mono-num font-bold text-emerald-700">
                   {formatTL(specializedSummary.galatartNetCommissionTL)}
                 </span>
@@ -524,19 +547,19 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({
               <div className="flex justify-between">
                 <span className="text-slate-500">Onaylanan Bursiyer:</span>
                 <span className="font-mono-num font-bold text-slate-900">
-                  {SYNTHETIC_SPECIALIZED_MODULES.ryla.approvedScholars}/{SYNTHETIC_SPECIALIZED_MODULES.ryla.totalQuota} Lider (%{specializedSummary.rylaFillPercent})
+                  {activeSpecializedModules.ryla.approvedScholars}/{activeSpecializedModules.ryla.totalQuota} Lider (%{specializedSummary.rylaFillPercent})
                 </span>
               </div>
               <div className="flex justify-between">
-                <span className="text-slate-500">Yedek Liste Adayı:</span>
-                <span className="font-mono-num font-semibold text-[#0C3C7C]">
-                  {SYNTHETIC_SPECIALIZED_MODULES.ryla.waitlistedCandidates} Aday
+                <span className="text-slate-500">Sponsorlu / Kamp Gideri:</span>
+                <span className="font-mono-num font-semibold text-slate-700">
+                  {formatTL(activeSpecializedModules.ryla.grossSponsorContributionsTL)} / -{formatTL(specializedSummary.rylaProgramExpenseBudgetTL)}
                 </span>
               </div>
               <div className="flex justify-between pt-1 border-t border-slate-100">
-                <span className="text-slate-500">Sponsorlu Kamp Bütçesi:</span>
+                <span className="text-slate-500">Net Yeni Liderlik İhtiyatı:</span>
                 <span className="font-mono-num font-bold text-emerald-700">
-                  {formatTL(SYNTHETIC_SPECIALIZED_MODULES.ryla.totalSponsoredBudgetTL)}
+                  {formatTL(specializedSummary.rylaNetReserveTL)}
                 </span>
               </div>
             </div>

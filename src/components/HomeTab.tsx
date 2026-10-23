@@ -76,6 +76,10 @@ interface HomeTabProps {
   ) => void;
   onRemindUnrespondedMembers: () => void;
   onDownloadKuverCsvNotify: (meetingNo: number) => void;
+  onUpdateMeetingHotelCommitment?: (
+    meetingNo: number,
+    patch: Partial<WeeklyMeeting>
+  ) => void;
 }
 
 const RSVP_OPTIONS: {
@@ -126,6 +130,7 @@ export const HomeTab: React.FC<HomeTabProps> = ({
   onUpdateMemberRsvp,
   onRemindUnrespondedMembers,
   onDownloadKuverCsvNotify,
+  onUpdateMeetingHotelCommitment,
 }) => {
   const [isSpeakerPoolOpen, setIsSpeakerPoolOpen] = useState(true);
   const [showAddSpeakerForm, setShowAddSpeakerForm] = useState(false);
@@ -162,17 +167,89 @@ export const HomeTab: React.FC<HomeTabProps> = ({
   const isBoardManager = activeRole === 'sekreter' || activeRole === 'baskan';
   const completedRitualsCount = ritualSteps.filter((s) => s.completed).length;
 
-  // Issue #29 Synthetic Pilot State: Definitive LCV lock, hotel minimum guarantee, and hotel banquet confirmation
-  const [hotelMinGuarantee, setHotelMinGuarantee] = useState<number>(35);
-  const [hotelUnitKuverPrice, setHotelUnitKuverPrice] = useState<number>(1850);
-  const [isLcvLockedForHotel, setIsLcvLockedForHotel] = useState<boolean>(true);
+  // Issue #29 Live Meeting Hotel Banquet Commitment & Two-Step Confirmation State
+  const [localMinGuarantee, setLocalMinGuarantee] = useState<number>(
+    meeting.minHotelGuarantee ?? 35
+  );
+  const [localUnitKuverPrice, setLocalUnitKuverPrice] = useState<number>(
+    meeting.unitKuverCostTL ?? 1850
+  );
+  const [localLcvLocked, setLocalLcvLocked] = useState<boolean>(
+    meeting.isLcvLockedForHotel ?? true
+  );
+  const [localHotelRef, setLocalHotelRef] = useState<string>(
+    meeting.hotelConfirmationRef ?? 'PP-BNQ-2026-1842'
+  );
+  const [hotelRefDraft, setHotelRefDraft] = useState<string>(
+    meeting.hotelConfirmationRef || 'PP-BNQ-2026-1842'
+  );
+
+  const hotelMinGuarantee = onUpdateMeetingHotelCommitment
+    ? meeting.minHotelGuarantee ?? 35
+    : localMinGuarantee;
+  const hotelUnitKuverPrice = onUpdateMeetingHotelCommitment
+    ? meeting.unitKuverCostTL ?? 1850
+    : localUnitKuverPrice;
+  const isLcvLockedForHotel = onUpdateMeetingHotelCommitment
+    ? meeting.isLcvLockedForHotel ?? false
+    : localLcvLocked;
+  const activeHotelConfirmationRef = onUpdateMeetingHotelCommitment
+    ? meeting.hotelConfirmationRef
+    : localHotelRef;
+  const activeHotelConfirmedBy = onUpdateMeetingHotelCommitment
+    ? meeting.hotelConfirmedBy
+    : activeHotelConfirmationRef
+    ? 'Rtn. Dr. Kerem Aydın (Genel Sekreter)'
+    : undefined;
 
   const hotelCommitment = calculateHotelBanquetCommitment(
     kuverSummary,
     hotelMinGuarantee,
     isLcvLockedForHotel,
-    2
+    meeting.protocolSpeakerKuver ?? 2,
+    activeHotelConfirmationRef,
+    activeHotelConfirmedBy
   );
+
+  const handleToggleLcvLock = () => {
+    const nextLocked = !isLcvLockedForHotel;
+    if (onUpdateMeetingHotelCommitment) {
+      onUpdateMeetingHotelCommitment(meeting.meetingNo, {
+        isLcvLockedForHotel: nextLocked,
+        ...(nextLocked
+          ? {}
+          : {
+              hotelConfirmationRef: undefined,
+              hotelConfirmedBy: undefined,
+              hotelConfirmedAt: undefined,
+            }),
+      });
+    } else {
+      setLocalLcvLocked(nextLocked);
+      if (!nextLocked) {
+        setLocalHotelRef('');
+      }
+    }
+  };
+
+  const handleConfirmHotelBanquetRef = () => {
+    const cleanedRef = hotelRefDraft.trim() || `PP-BNQ-2026-${meeting.meetingNo}`;
+    const officerLabel =
+      activeRole === 'baskan'
+        ? 'Rtn. Av. Nazlı Denizmen (Dönem Başkanı)'
+        : 'Rtn. Dr. Kerem Aydın (Genel Sekreter)';
+    if (onUpdateMeetingHotelCommitment) {
+      onUpdateMeetingHotelCommitment(meeting.meetingNo, {
+        isLcvLockedForHotel: true,
+        hotelConfirmationRef: cleanedRef,
+        hotelConfirmedBy: officerLabel,
+        hotelConfirmedAt: new Date().toISOString(),
+      });
+    } else {
+      setLocalLcvLocked(true);
+      setLocalHotelRef(cleanedRef);
+    }
+  };
 
   const handleSpeakerSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -938,7 +1015,7 @@ export const HomeTab: React.FC<HomeTabProps> = ({
                   </div>
                 </div>
 
-                {/* Issue #29 Synthetic Pilot Module: Kesin LCV, Minimum Garanti & Otel Banket Mutabakatı */}
+                {/* Issue #29 Live Module: Kesin LCV Kilidi, Minimum Garanti & İki Aşamalı Otel Banket Mutabakatı */}
                 <div
                   data-testid="hotel-banquet-commitment-panel"
                   className="p-3.5 rounded-xl bg-white/5 border border-white/15 space-y-3"
@@ -946,18 +1023,44 @@ export const HomeTab: React.FC<HomeTabProps> = ({
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div>
                       <div className="text-[11px] font-semibold text-[#F7A81B]">
-                        Kesin LCV, Kuver Garantisi & Otel Onayı (Sentetik Pilot #29)
+                        Kesin LCV, Kuver Garantisi & Otel Banket Mutabakatı (#29)
                       </div>
                       <div className="text-xs font-bold text-white">
                         {hotelCommitment.hotelConfirmationStatus}
                       </div>
+                      {hotelCommitment.isHotelConfirmed && (
+                        <div className="text-[11px] text-emerald-300 font-mono-num mt-0.5">
+                          Teyit Ref: {hotelCommitment.hotelConfirmationRef} ·{' '}
+                          {hotelCommitment.hotelConfirmedBy}
+                        </div>
+                      )}
                     </div>
                     <button
                       type="button"
-                      onClick={() => setIsLcvLockedForHotel((prev) => !prev)}
+                      onClick={handleToggleLcvLock}
                       className="min-h-[30px] px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-[11px] font-semibold text-white cursor-pointer"
                     >
-                      {isLcvLockedForHotel ? 'LCV Kilidini Aç' : 'Kesin LCV Kilitle & Otele Onayla'}
+                      {isLcvLockedForHotel
+                        ? 'LCV Kilidini Aç'
+                        : '1. Adım: Kesin LCV Listesini Kilitle'}
+                    </button>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <input
+                      type="text"
+                      aria-label="Otel Banket Teyit Referans No"
+                      value={hotelRefDraft}
+                      onChange={(e) => setHotelRefDraft(e.target.value)}
+                      placeholder="Örn: PP-BNQ-2026-1842"
+                      className="flex-1 min-w-[160px] text-xs font-mono-num bg-[#09152B]/90 border border-white/15 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-[#F7A81B]"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleConfirmHotelBanquetRef}
+                      className="min-h-[32px] px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-bold cursor-pointer"
+                    >
+                      2. Adım: Otel Banket Teyidini Kaydet
                     </button>
                   </div>
 
@@ -972,7 +1075,16 @@ export const HomeTab: React.FC<HomeTabProps> = ({
                         min={10}
                         max={100}
                         value={hotelMinGuarantee}
-                        onChange={(e) => setHotelMinGuarantee(Number(e.target.value) || 35)}
+                        onChange={(e) => {
+                          const nextVal = Number(e.target.value) || 35;
+                          if (onUpdateMeetingHotelCommitment) {
+                            onUpdateMeetingHotelCommitment(meeting.meetingNo, {
+                              minHotelGuarantee: nextVal,
+                            });
+                          } else {
+                            setLocalMinGuarantee(nextVal);
+                          }
+                        }}
                         className="w-full mt-0.5 bg-transparent font-mono-num font-bold text-white text-xs focus:outline-none"
                       />
                     </div>
@@ -986,7 +1098,16 @@ export const HomeTab: React.FC<HomeTabProps> = ({
                         min={500}
                         step={50}
                         value={hotelUnitKuverPrice}
-                        onChange={(e) => setHotelUnitKuverPrice(Number(e.target.value) || 1850)}
+                        onChange={(e) => {
+                          const nextPrice = Number(e.target.value) || 1850;
+                          if (onUpdateMeetingHotelCommitment) {
+                            onUpdateMeetingHotelCommitment(meeting.meetingNo, {
+                              unitKuverCostTL: nextPrice,
+                            });
+                          } else {
+                            setLocalUnitKuverPrice(nextPrice);
+                          }
+                        }}
                         className="w-full mt-0.5 bg-transparent font-mono-num font-bold text-white text-xs focus:outline-none"
                       />
                     </div>
