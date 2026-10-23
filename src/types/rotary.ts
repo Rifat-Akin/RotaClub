@@ -110,6 +110,8 @@ export interface PaymentNotification {
   submittedAt: string;
   receiptRef: string;
   status: 'Bekliyor' | 'Onaylandı' | 'Reddedildi';
+  targetProjectId?: string;
+  targetScholarId?: string;
 }
 
 export interface OverdueMemberItem {

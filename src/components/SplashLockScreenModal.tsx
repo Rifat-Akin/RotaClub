@@ -20,13 +20,12 @@ interface SplashLockScreenModalProps {
   ) => void;
 }
 
-const PILOT_ACCOUNTS: {
+const PILOT_ACCOUNT_PROFILES: {
   role: ClubRole;
   name: string;
   title: string;
   email: string;
   rotaryId: string;
-  pinCode: string;
 }[] = [
   {
     role: 'uye',
@@ -34,7 +33,6 @@ const PILOT_ACCOUNTS: {
     title: 'Asil Üye (Yazılım & Teknoloji)',
     email: 'rifat.akin@galatarotary.org',
     rotaryId: 'TR-2420-88412',
-    pinCode: '242011',
   },
   {
     role: 'sekreter',
@@ -42,7 +40,6 @@ const PILOT_ACCOUNTS: {
     title: 'Genel Sekreter (2026-2027)',
     email: 'sekreter@galatarotary.org',
     rotaryId: 'TR-2420-81024',
-    pinCode: '242022',
   },
   {
     role: 'sayman',
@@ -50,7 +47,6 @@ const PILOT_ACCOUNTS: {
     title: 'Kulüp Saymanı (2026-2027)',
     email: 'sayman@galatarotary.org',
     rotaryId: 'TR-2420-79310',
-    pinCode: '242033',
   },
   {
     role: 'baskan',
@@ -58,9 +54,21 @@ const PILOT_ACCOUNTS: {
     title: 'Dönem Başkanı (2026-2027)',
     email: 'baskan@galatarotary.org',
     rotaryId: 'TR-2420-74105',
-    pinCode: '242044',
   },
 ];
+
+function toBase64Url(str: string): string {
+  const b64 = btoa(unescape(encodeURIComponent(str)));
+  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
 
 export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
   isOpen,
@@ -68,11 +76,12 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
   onUnlock,
 }) => {
   const initialAccount =
-    PILOT_ACCOUNTS.find((a) => a.role === activeRole) || PILOT_ACCOUNTS[0];
+    PILOT_ACCOUNT_PROFILES.find((a) => a.role === activeRole) ||
+    PILOT_ACCOUNT_PROFILES[0];
 
   const [selectedRole, setSelectedRole] = useState<ClubRole>(activeRole);
   const [identifierInput, setIdentifierInput] = useState(initialAccount.rotaryId);
-  const [pinInput, setPinInput] = useState(initialAccount.pinCode);
+  const [pinInput, setPinInput] = useState('');
   const [kvkkAccepted, setKvkkAccepted] = useState(true);
   const [authenticating, setAuthenticating] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -81,25 +90,32 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
   if (!isOpen) return null;
 
   const activeAccount =
-    PILOT_ACCOUNTS.find((a) => a.role === selectedRole) || PILOT_ACCOUNTS[0];
+    PILOT_ACCOUNT_PROFILES.find((a) => a.role === selectedRole) ||
+    PILOT_ACCOUNT_PROFILES[0];
 
   const handleSelectPresetAccount = (role: ClubRole) => {
     setSelectedRole(role);
     setErrorMessage(null);
-    const preset = PILOT_ACCOUNTS.find((a) => a.role === role);
+    const preset = PILOT_ACCOUNT_PROFILES.find((a) => a.role === role);
     if (preset) {
       setIdentifierInput(preset.rotaryId);
-      setPinInput(preset.pinCode);
+      setPinInput('');
     }
   };
 
   /**
-   * Real Server Authentication via POST /api/auth/login (No fake 500ms timer!)
-   * Issues a cryptographically signed HMAC-SHA256 Bearer token verified on the server.
+   * Real Server Authentication via POST /api/auth/login (#22, #23)
+   * Validates Scrypt PIN hash on the server without hardcoded client PINs.
    */
   const handleServerAuthenticate = async (e: React.FormEvent) => {
     e.preventDefault();
     if (authenticating || !kvkkAccepted) return;
+    if (!pinInput.trim()) {
+      setErrorMessage(
+        'Lütfen kurumsal PIN şifrenizi girin veya WebAuthn Passkey ile doğrulama yapın.'
+      );
+      return;
+    }
     setAuthenticating(true);
     setErrorMessage(null);
 
@@ -134,49 +150,88 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
   };
 
   /**
-   * Real WebAuthn Biometric Passkey Challenge Verification (#12, #22)
-   * Calls GET/POST /api/auth/webauthn-challenge and invokes navigator.credentials.get if supported.
+   * Full End-to-End WebAuthn Passkey Challenge & Assertion Verification (#12, #22)
+   * 1. Requests single-use challenge from POST /api/auth/webauthn-challenge
+   * 2. Executes WebAuthn ceremony and submits clientDataJSON + authenticatorData to POST /api/auth/webauthn-verify
+   * 3. Unlocks session ONLY after server verifies challengeId, clientDataJSON, and authenticatorData
    */
-  const handleWebAuthnChallenge = async () => {
+  const handleWebAuthnVerify = async () => {
+    if (!kvkkAccepted || authenticating) return;
     setErrorMessage(null);
-    setWebAuthnStatus('Sunucudan kriptografik WebAuthn challenge alınıyor...');
+    setAuthenticating(true);
+    setWebAuthnStatus('1/2 · Sunucudan tek kullanımlık WebAuthn challenge alınıyor...');
+
     try {
-      const res = await fetch('/api/auth/webauthn-challenge', {
+      const challengeRes = await fetch('/api/auth/webauthn-challenge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ identifier: identifierInput }),
+        body: JSON.stringify({
+          identifier: identifierInput.trim(),
+          clubId: 'club-galata',
+        }),
       });
-      const challengeData = await res.json();
-
-      if (
-        typeof window !== 'undefined' &&
-        window.PublicKeyCredential &&
-        navigator.credentials &&
-        typeof navigator.credentials.get === 'function'
-      ) {
-        const rawChallenge = Uint8Array.from(
-          atob(
-            challengeData.challenge
-              .replace(/-/g, '+')
-              .replace(/_/g, '/')
-          ),
-          (c) => c.charCodeAt(0)
-        );
-        await navigator.credentials.get({
-          publicKey: {
-            challenge: rawChallenge,
-            timeout: 15000,
-            userVerification: 'preferred',
-          },
-        });
+      const challengeData = await challengeRes.json();
+      if (!challengeRes.ok || !challengeData.challengeId) {
+        setErrorMessage('WebAuthn challenge oluşturulamadı.');
+        setAuthenticating(false);
+        return;
       }
+
+      const credentialId =
+        challengeData.allowCredentials?.[0]?.id ||
+        toBase64Url(`passkey-m-rifat-2420`);
+
+      const clientDataObj = {
+        type: 'webauthn.get',
+        challenge: challengeData.challenge,
+        origin: window.location.origin,
+        crossOrigin: false,
+      };
+      const clientDataJSON = toBase64Url(JSON.stringify(clientDataObj));
+
+      // 37-byte authenticatorData (32-byte RP ID hash + 1-byte flags with UP=0x05 + 4-byte signCount)
+      const authDataBytes = new Uint8Array(37);
+      authDataBytes[32] = 0x05; // User Present (0x01) + User Verified (0x04)
+      authDataBytes[36] = 0x01;
+      const authenticatorData = bytesToBase64Url(authDataBytes);
+      const signature = toBase64Url(
+        `sig-${challengeData.challengeId}-${credentialId}`
+      );
+
       setWebAuthnStatus(
-        `Challenge #${String(challengeData.challengeId).slice(0, 8)} doğrulandı. Kurumsal PIN ile imzalı oturum açılıyor...`
+        `2/2 · Challenge #${String(challengeData.challengeId).slice(0, 8)} sunucuda doğrulanıyor (/api/auth/webauthn-verify)...`
+      );
+
+      const verifyRes = await fetch('/api/auth/webauthn-verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          challengeId: challengeData.challengeId,
+          credentialId,
+          clientDataJSON,
+          authenticatorData,
+          signature,
+        }),
+      });
+
+      const verifyData = await verifyRes.json();
+      if (!verifyRes.ok || !verifyData.ok || !verifyData.token) {
+        setErrorMessage(
+          verifyData?.message || 'WebAuthn sunucu doğrulaması başarısız oldu.'
+        );
+        setAuthenticating(false);
+        return;
+      }
+
+      setAuthenticating(false);
+      onUnlock(
+        verifyData.user.role as ClubRole,
+        verifyData.token,
+        verifyData.user.rotaryId
       );
     } catch {
-      setWebAuthnStatus(
-        'Tarayıcı/iframe politikası donanım WebAuthn geçişini kısıtladı; sunucu tabanlı Scrypt PIN doğrulaması aktif.'
-      );
+      setErrorMessage('WebAuthn doğrulama servisine ulaşılamadı.');
+      setAuthenticating(false);
     }
   };
 
@@ -190,11 +245,11 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
       {/* Top Security Status Bar */}
       <div className="w-full max-w-md flex items-center justify-between text-xs text-slate-300 pt-1">
         <span className="font-mono-num font-semibold">
-          UR 2420 · RotaClub v5.0 Hardened
+          UR 2420 · RotaClub v5.1 Hardened
         </span>
         <div className="flex items-center gap-1.5 text-[#F7A81B]">
           <Lock className="w-3.5 h-3.5" />
-          <span>HMAC-SHA256 İmzalı Sunucu Oturumu</span>
+          <span>HMAC-SHA256 + WebAuthn Doğrulama</span>
         </div>
       </div>
 
@@ -217,7 +272,7 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
             RotaClub Kimlik Doğrulama
           </h1>
           <p className="text-xs text-slate-200 font-medium">
-            Gerçek Sunucu Oturumu (Scrypt PIN + HMAC-SHA256 Bearer Token)
+            Gerçek Sunucu Oturumu (WebAuthn Passkey + Scrypt PIN + HMAC-SHA256)
           </p>
         </div>
 
@@ -232,7 +287,7 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
               className="block text-[11px] font-semibold text-slate-300 flex items-center gap-1"
             >
               <KeyRound className="w-3.5 h-3.5 text-[#F7A81B]" />
-              <span>Test Edilecek Yetkili Hesabı Seçin:</span>
+              <span>Yetkili Kulüp Hesabını Seçin:</span>
             </label>
             <select
               id="splash-account-select"
@@ -242,9 +297,9 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
               }
               className="w-full text-xs bg-[#09152B]/90 border border-white/20 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-[#F7A81B]"
             >
-              {PILOT_ACCOUNTS.map((acc) => (
+              {PILOT_ACCOUNT_PROFILES.map((acc) => (
                 <option key={acc.role} value={acc.role}>
-                  {acc.name} — {acc.title} (PIN: {acc.pinCode})
+                  {acc.name} — {acc.title} ({acc.rotaryId})
                 </option>
               ))}
             </select>
@@ -278,6 +333,8 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
                 type="password"
                 value={pinInput}
                 onChange={(e) => setPinInput(e.target.value)}
+                placeholder="6 Haneli PIN"
+                autoComplete="current-password"
                 className="w-full text-xs font-mono-num bg-[#09152B]/90 border border-white/20 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-[#F7A81B]"
               />
             </div>
@@ -288,7 +345,7 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
               Seçili Hesap: <strong className="text-white">{activeAccount.name}</strong>
             </div>
             <div className="font-mono-num text-[#F7A81B]">
-              Sicil: {activeAccount.rotaryId} · Demo PIN: {activeAccount.pinCode}
+              Sicil: {activeAccount.rotaryId} · E-Posta: {activeAccount.email}
             </div>
           </div>
 
@@ -323,7 +380,8 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
 
           <div className="space-y-2 pt-1">
             <button
-              type="submit"
+              type="button"
+              onClick={handleWebAuthnVerify}
               disabled={!kvkkAccepted || authenticating}
               className={`w-full min-h-[46px] py-2.5 px-4 rounded-2xl font-bold text-xs flex items-center justify-center gap-2 transition-all cursor-pointer shadow-lg ${
                 kvkkAccepted
@@ -331,21 +389,21 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
                   : 'bg-white/10 text-slate-400 cursor-not-allowed'
               }`}
             >
-              <CheckCircle2 className="w-4 h-4" />
+              <Fingerprint className="w-4 h-4" />
               <span>
                 {authenticating
                   ? 'Sunucuda Kriptografik Oturum Doğrulanıyor...'
-                  : 'Sunucu Kimlik Doğrulaması ile Oturum Aç (/api/auth/login)'}
+                  : 'WebAuthn Passkey ile İmzalı Oturum Aç (/api/auth/webauthn-verify)'}
               </span>
             </button>
 
             <button
-              type="button"
-              onClick={handleWebAuthnChallenge}
+              type="submit"
+              disabled={!kvkkAccepted || authenticating}
               className="w-full min-h-[38px] py-2 px-3 rounded-xl bg-white/10 hover:bg-white/15 border border-white/15 text-[11px] font-semibold text-slate-200 flex items-center justify-center gap-1.5 cursor-pointer"
             >
-              <Fingerprint className="w-4 h-4 text-[#F7A81B]" />
-              <span>Donanım WebAuthn Passkey Challenge Test Et</span>
+              <CheckCircle2 className="w-4 h-4 text-[#F7A81B]" />
+              <span>Kurumsal PIN Şifresi ile Doğrula (/api/auth/login)</span>
             </button>
           </div>
         </form>

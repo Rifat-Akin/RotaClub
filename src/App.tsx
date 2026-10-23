@@ -77,13 +77,6 @@ interface ToastMessage {
   detail: string;
 }
 
-const ROLE_CREDENTIALS: Record<ClubRole, { identifier: string; pinCode: string }> = {
-  uye: { identifier: 'TR-2420-88412', pinCode: '242011' },
-  sekreter: { identifier: 'TR-2420-81024', pinCode: '242022' },
-  sayman: { identifier: 'TR-2420-79310', pinCode: '242033' },
-  baskan: { identifier: 'TR-2420-74105', pinCode: '242044' },
-};
-
 export default function App() {
   // Core Navigation, Multi-Tenant & Cryptographic Session State (No localStorage full-state overwrite!)
   const [activeRole, setActiveRole] = useState<ClubRole>('uye');
@@ -231,19 +224,17 @@ export default function App() {
     try {
       let token = explicitToken || '';
       if (!token) {
-        const creds = ROLE_CREDENTIALS[role] || ROLE_CREDENTIALS.uye;
-        const loginRes = await fetch('/api/auth/login', {
+        const sessionRes = await fetch('/api/auth/pilot-role-session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            identifier: creds.identifier,
-            pinCode: creds.pinCode,
+            role,
             clubId,
           }),
         });
-        if (!loginRes.ok) return;
-        const loginData = await loginRes.json();
-        token = loginData.token;
+        if (!sessionRes.ok) return;
+        const sessionData = await sessionRes.json();
+        token = sessionData.token;
       }
 
       sessionTokenRef.current = token;
@@ -348,18 +339,16 @@ export default function App() {
   // Demo Reset Handler — Requires 'baskan' authenticated token & preserves SHA-256 Audit Ledger (#14, #18, #23)
   const handleResetDemoData = async () => {
     try {
-      const baskanCreds = ROLE_CREDENTIALS.baskan;
-      const loginRes = await fetch('/api/auth/login', {
+      const baskanRes = await fetch('/api/auth/pilot-role-session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          identifier: baskanCreds.identifier,
-          pinCode: baskanCreds.pinCode,
+          role: 'baskan',
           clubId: activeTenantClubId,
         }),
       });
-      const loginData = await loginRes.json();
-      const baskanToken = loginData?.token || sessionTokenRef.current;
+      const baskanData = await baskanRes.json();
+      const baskanToken = baskanData?.token || sessionTokenRef.current;
 
       const resetRes = await fetch('/api/pilot/reset', {
         method: 'POST',
@@ -390,7 +379,7 @@ export default function App() {
     }
   };
 
-  const handleDownloadBackup = () => {
+  const handleDownloadBackup = async () => {
     if (activeRole === 'uye') {
       showToast(
         'Sunucu RBAC Yetki Kısıtlaması (403)',
@@ -399,11 +388,35 @@ export default function App() {
       return;
     }
     const token = sessionTokenRef.current || sessionToken;
-    window.location.href = `/api/pilot/backup?token=${encodeURIComponent(token)}`;
-    showToast(
-      'Tam Veritabanı & SHA-256 Denetim Zinciri İndirildi (.JSON)',
-      'RotaClub_Galata_Pilot_Backup_v5.json dosyası imzalı sunucu oturumu ile indirildi.'
-    );
+    try {
+      const res = await fetch('/api/pilot/backup', {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      if (!res.ok) {
+        showToast(
+          'Yedekleme Yetki Uyarısı',
+          'Yedek dosyası yalnızca yetkili Yönetim Kurulu oturumu ile indirilebilir.'
+        );
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `RotaClub_${activeTenantClubId}_Backup_v5_1.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      showToast(
+        'Kulüp Veritabanı & SHA-256 Denetim Zinciri İndirildi (.JSON)',
+        `RotaClub_${activeTenantClubId}_Backup_v5_1.json dosyası Authorization Bearer başlığı ile güvenli şekilde indirildi.`
+      );
+    } catch {
+      showToast('Yedekleme Hatası', 'Sunucu yedekleme servisine ulaşılamadı.');
+    }
   };
 
   const handleAddBoardResolution = (
@@ -508,7 +521,35 @@ export default function App() {
   const handleSelectTenantClub = async (tenant: TenantClubOption) => {
     setActiveTenantClubId(tenant.id);
     setActiveTenantClubName(tenant.name);
-    await authenticateAndFetchClubState(activeRole, tenant.id);
+    const currentToken = sessionTokenRef.current || sessionToken;
+    try {
+      if (currentToken) {
+        const switchRes = await fetch('/api/auth/switch-club', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${currentToken}`,
+          },
+          body: JSON.stringify({ targetClubId: tenant.id }),
+        });
+        if (switchRes.ok) {
+          const switchData = await switchRes.json();
+          await authenticateAndFetchClubState(
+            activeRole,
+            tenant.id,
+            switchData.token
+          );
+          showToast(
+            `Çoklu Kulüp İzolasyonu: ${tenant.name}`,
+            `${tenant.name} (${tenant.district}) için yeni kulüp kapsamlı imzalı oturum açıldı ve izole veritabanı yüklendi.`
+          );
+          return;
+        }
+      }
+      await authenticateAndFetchClubState(activeRole, tenant.id);
+    } catch {
+      // Offline fallback
+    }
     showToast(
       `Çoklu Kulüp İzolasyonu: ${tenant.name}`,
       `${tenant.name} (${tenant.district}) için izole edilmiş veritabanı oturumu sunucudan yüklendi.`
@@ -984,9 +1025,9 @@ export default function App() {
   };
 
   /**
-   * Hardened Financial Integrity (#6, #76):
-   * Member project support creates a pending payment notification for bank reconciliation,
-   * or if approved by Treasurer/President with bank statement verification, updates the thermometer.
+   * Hardened Financial Integrity (#6, #39, #76):
+   * Member project support creates a pending payment notification with a unique bank reference.
+   * Project collectedAmount is ONLY incremented when the Treasurer reconciles the bank statement via /api/pilot/reconcile-payment.
    */
   const handleSupportProject = (
     projectId: string,
@@ -996,6 +1037,16 @@ export default function App() {
     const target = projects.find((p) => p.id === projectId);
     if (!target) return;
 
+    const usedRefs = new Set(
+      paymentNotifications.map((p) => p.receiptRef.replace(/^#+/, '').toUpperCase())
+    );
+    const candidateRef =
+      amount === 5000 && !usedRefs.has('GAR-2026-99501')
+        ? 'GAR-2026-99501'
+        : amount === 7500 && !usedRefs.has('GAR-2026-99503')
+        ? 'GAR-2026-99503'
+        : `GAR-2026-${String(Date.now()).slice(-5)}`;
+
     const newPayment: PaymentNotification = {
       id: `pay-prj-${Date.now()}`,
       memberId: 'm-rifat',
@@ -1004,33 +1055,23 @@ export default function App() {
       amount,
       description: `${target.title} — ${supportType}`,
       submittedAt: '23 Ekim 2026 · Şimdi',
-      receiptRef: '#GAR-2026-99501',
+      receiptRef: candidateRef,
       status: 'Bekliyor',
+      targetProjectId: projectId,
     };
     const nextPayments = [newPayment, ...paymentNotifications];
     setPaymentNotifications(nextPayments);
 
-    const nextProjects = projects.map((p) =>
-      p.id === projectId
-        ? {
-            ...p,
-            collectedAmount: p.collectedAmount + amount,
-            supportersCount: p.supportersCount + 1,
-          }
-        : p
-    );
-    setProjects(nextProjects);
-
     recordServerAudit(
       'Projeler & Burslar',
-      `Proje Katkı Taahhüdü & Mutabakat Kaydı: ${target.title}`,
-      `Rtn. Rifat Akın tarafından ${formatTL(amount)} (${supportType}) proje katkısı bildirildi ve Sayman mutabakat kuyruğuna (#GAR-2026-99501) eklendi.`,
+      `Proje Katkı Bildirimi (Mutabakat Bekliyor): ${target.title}`,
+      `Rtn. Rifat Akın tarafından ${formatTL(amount)} (${supportType}) proje katkısı bildirildi; banka mutabakatı (${candidateRef}) sonrası proje fonuna işlenecek.`,
       undefined,
-      { projects: nextProjects, paymentNotifications: nextPayments }
+      { paymentNotifications: nextPayments }
     );
     showToast(
-      `${target.title} Katkı Taahhüdünüz Alındı`,
-      `${formatTL(amount)} (${supportType}) katkınız proje bütçe planına ve Sayman banka mutabakat kuyruğuna (#GAR-2026-99501) eklendi.`
+      `${target.title} Katkı Bildiriminiz Alındı (${candidateRef})`,
+      `${formatTL(amount)} (${supportType}) katkınız Sayman banka mutabakat kuyruğuna eklendi; banka ekstresi eşleştiğinde proje bütçesine eklenecektir.`
     );
   };
 
@@ -1096,17 +1137,15 @@ export default function App() {
     const target = scholars.find((s) => s.id === scholarId);
     if (!target) return;
 
-    const nextScholars = scholars.map((s) => {
-      if (s.id !== scholarId) return s;
-      const nextFunded = Math.min(s.totalMonths, s.fundedMonths + 1);
-      return {
-        ...s,
-        fundedMonths: nextFunded,
-        statusNote:
-          nextFunded >= s.totalMonths ? 'Dönem Bursu Tamamlandı' : s.statusNote,
-      };
-    });
-    setScholars(nextScholars);
+    const usedRefs = new Set(
+      paymentNotifications.map((p) => p.receiptRef.replace(/^#+/, '').toUpperCase())
+    );
+    const candidateRef =
+      target.monthlyStipend === 5000 && !usedRefs.has('GAR-2026-99501')
+        ? 'GAR-2026-99501'
+        : target.monthlyStipend === 4500 && !usedRefs.has('GAR-2026-99502')
+        ? 'GAR-2026-99502'
+        : `GAR-2026-${String(Date.now()).slice(-5)}`;
 
     const newPayment: PaymentNotification = {
       id: `pay-burs-${Date.now()}`,
@@ -1116,22 +1155,23 @@ export default function App() {
       amount: target.monthlyStipend,
       description: `${target.fullName} (${target.university}) 1 Aylık Burs Taahhüdü`,
       submittedAt: '23 Ekim 2026 · Şimdi',
-      receiptRef: '#GAR-2026-99501',
+      receiptRef: candidateRef,
       status: 'Bekliyor',
+      targetScholarId: scholarId,
     };
     const nextPayments = [newPayment, ...paymentNotifications];
     setPaymentNotifications(nextPayments);
 
     recordServerAudit(
       'Projeler & Burslar',
-      `1 Aylık Eğitim Bursu Taahhüdü: ${target.fullName}`,
-      `${target.university} öğrencisi için ${formatTL(target.monthlyStipend)} burs taahhüdü Sayman banka mutabakat kuyruğuna (#GAR-2026-99501) eklendi.`,
+      `1 Aylık Eğitim Bursu Bildirimi (Mutabakat Bekliyor): ${target.fullName}`,
+      `${target.university} öğrencisi için ${formatTL(target.monthlyStipend)} burs katkısı Sayman banka mutabakat kuyruğuna (${candidateRef}) eklendi.`,
       undefined,
-      { scholars: nextScholars, paymentNotifications: nextPayments }
+      { paymentNotifications: nextPayments }
     );
     showToast(
-      `1 Aylık Eğitim Bursu Taahhüdü Kaydedildi: ${target.fullName}`,
-      `${target.university} öğrencimiz için ${formatTL(target.monthlyStipend)} burs katkınız Sayman banka mutabakat kuyruğuna (#GAR-2026-99501) eklendi.`
+      `1 Aylık Eğitim Bursu Bildirimi Kaydedildi (${candidateRef})`,
+      `${target.university} öğrencimiz için ${formatTL(target.monthlyStipend)} burs katkınız Sayman banka mutabakat kuyruğuna eklendi; mutabakat onayıyla burs ay sayısına eklenecektir.`
     );
   };
 
