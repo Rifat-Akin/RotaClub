@@ -32,6 +32,8 @@ import {
   WeeklyMeeting,
 } from '../types/rotary';
 import {
+  calculateHotelBanquetCommitment,
+  formatTL,
   generateKuverCsvContent,
   generateMeetingIcsContent,
   KuverSummaryResult,
@@ -159,6 +161,18 @@ export const HomeTab: React.FC<HomeTabProps> = ({
 
   const isBoardManager = activeRole === 'sekreter' || activeRole === 'baskan';
   const completedRitualsCount = ritualSteps.filter((s) => s.completed).length;
+
+  // Issue #29 Synthetic Pilot State: Definitive LCV lock, hotel minimum guarantee, and hotel banquet confirmation
+  const [hotelMinGuarantee, setHotelMinGuarantee] = useState<number>(35);
+  const [hotelUnitKuverPrice, setHotelUnitKuverPrice] = useState<number>(1850);
+  const [isLcvLockedForHotel, setIsLcvLockedForHotel] = useState<boolean>(true);
+
+  const hotelCommitment = calculateHotelBanquetCommitment(
+    kuverSummary,
+    hotelMinGuarantee,
+    isLcvLockedForHotel,
+    2
+  );
 
   const handleSpeakerSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -921,6 +935,73 @@ export const HomeTab: React.FC<HomeTabProps> = ({
                         </select>
                       </div>
                     ))}
+                  </div>
+                </div>
+
+                {/* Issue #29 Synthetic Pilot Module: Kesin LCV, Minimum Garanti & Otel Banket Mutabakatı */}
+                <div
+                  data-testid="hotel-banquet-commitment-panel"
+                  className="p-3.5 rounded-xl bg-white/5 border border-white/15 space-y-3"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="text-[11px] font-semibold text-[#F7A81B]">
+                        Kesin LCV, Kuver Garantisi & Otel Onayı (Sentetik Pilot #29)
+                      </div>
+                      <div className="text-xs font-bold text-white">
+                        {hotelCommitment.hotelConfirmationStatus}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setIsLcvLockedForHotel((prev) => !prev)}
+                      className="min-h-[30px] px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-[11px] font-semibold text-white cursor-pointer"
+                    >
+                      {isLcvLockedForHotel ? 'LCV Kilidini Aç' : 'Kesin LCV Kilitle & Otele Onayla'}
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
+                    <div className="p-2 rounded-lg bg-[#09152B]/80 border border-white/10">
+                      <label htmlFor="min-guarantee-input" className="block text-slate-400">
+                        Min. Garanti Kuver
+                      </label>
+                      <input
+                        id="min-guarantee-input"
+                        type="number"
+                        min={10}
+                        max={100}
+                        value={hotelMinGuarantee}
+                        onChange={(e) => setHotelMinGuarantee(Number(e.target.value) || 35)}
+                        className="w-full mt-0.5 bg-transparent font-mono-num font-bold text-white text-xs focus:outline-none"
+                      />
+                    </div>
+                    <div className="p-2 rounded-lg bg-[#09152B]/80 border border-white/10">
+                      <label htmlFor="unit-kuver-input" className="block text-slate-400">
+                        Birim Kuver (TL)
+                      </label>
+                      <input
+                        id="unit-kuver-input"
+                        type="number"
+                        min={500}
+                        step={50}
+                        value={hotelUnitKuverPrice}
+                        onChange={(e) => setHotelUnitKuverPrice(Number(e.target.value) || 1850)}
+                        className="w-full mt-0.5 bg-transparent font-mono-num font-bold text-white text-xs focus:outline-none"
+                      />
+                    </div>
+                    <div className="p-2 rounded-lg bg-[#09152B]/80 border border-white/10">
+                      <div className="text-slate-400">Faturalanan / Boş Garanti</div>
+                      <div className="font-mono-num font-bold text-white text-xs mt-0.5">
+                        {hotelCommitment.guaranteedBillableKuver} Kuver ({hotelCommitment.unfilledGuaranteeSeats} Boş)
+                      </div>
+                    </div>
+                    <div className="p-2 rounded-lg bg-[#09152B]/80 border border-white/10">
+                      <div className="text-slate-400">Tahmini Otel Faturası</div>
+                      <div className="font-mono-num font-bold text-[#F7A81B] text-xs mt-0.5">
+                        {formatTL(hotelCommitment.guaranteedBillableKuver * hotelUnitKuverPrice)}
+                      </div>
+                    </div>
                   </div>
                 </div>
 

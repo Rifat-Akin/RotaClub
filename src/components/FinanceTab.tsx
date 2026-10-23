@@ -24,6 +24,7 @@ import {
   TreasuryLedgerEntry,
 } from '../types/rotary';
 import {
+  calculateMeetingCostSharingAndExemptions,
   calculateTreasurySummary,
   formatTL,
   generateMembersFinanceCsvContent,
@@ -122,6 +123,21 @@ export const FinanceTab: React.FC<FinanceTabProps> = ({
     activeRole === 'sayman' || activeRole === 'baskan';
 
   const treasurySummary = calculateTreasurySummary(treasuryLedger, members);
+
+  // Issue #42 Synthetic Pilot State: Per-capita meeting cost sharing & exemptions
+  const [unitKuverCostTL, setUnitKuverCostTL] = useState<number>(1850);
+  const [billableKuverCount, setBillableKuverCount] = useState<number>(35);
+  const [exemptSpeakerCount, setExemptSpeakerCount] = useState<number>(1);
+  const [exemptHonoraryOrYouthCount, setExemptHonoraryOrYouthCount] = useState<number>(2);
+
+  const meetingCostSharing = calculateMeetingCostSharingAndExemptions({
+    unitKuverCostTL,
+    billableKuverCount,
+    attendingPayingMembersCount: 24,
+    payingCompanionsCount: 5,
+    exemptSpeakerCount,
+    exemptHonoraryOrYouthCount,
+  });
 
   const filteredMatrixMembers = members.filter((m) => {
     const q = matrixSearch.trim().toLocaleLowerCase('tr-TR');
@@ -931,6 +947,116 @@ export const FinanceTab: React.FC<FinanceTabProps> = ({
               )}
             </section>
           )}
+
+          {/* Issue #42 Synthetic Pilot Module: Kişi Başı Toplantı Maliyeti ve Muafiyetler */}
+          <section
+            aria-labelledby="meeting-cost-sharing-heading"
+            data-testid="meeting-cost-sharing-panel"
+            className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 space-y-4 shadow-xs"
+          >
+            <div className="flex flex-wrap items-start justify-between gap-2 border-b border-slate-100 pb-3.5">
+              <div>
+                <div className="text-xs font-semibold text-[#0C3C7C]">
+                  Toplantı Banket Muhasebesi · Sentetik Pilot Modülü (#42)
+                </div>
+                <h2
+                  id="meeting-cost-sharing-heading"
+                  className="font-serif-display text-xl font-bold text-slate-900"
+                >
+                  Kişi Başı Toplantı Maliyeti & Muafiyet Paylaşımı
+                </h2>
+              </div>
+              <span className="text-xs font-mono-num text-slate-500">
+                24 Ödeyen Üye · 5 Eş/Konuk
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
+              <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                <label htmlFor="unit-cost-tl-input" className="block text-[11px] text-slate-500">
+                  Birim Kuver (TL)
+                </label>
+                <input
+                  id="unit-cost-tl-input"
+                  type="number"
+                  min={500}
+                  step={50}
+                  value={unitKuverCostTL}
+                  onChange={(e) => setUnitKuverCostTL(Number(e.target.value) || 1850)}
+                  className="w-full mt-0.5 font-mono-num font-bold text-slate-900 bg-transparent focus:outline-none"
+                />
+              </div>
+              <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                <label htmlFor="billable-kuver-input" className="block text-[11px] text-slate-500">
+                  Garanti Kuver Adedi
+                </label>
+                <input
+                  id="billable-kuver-input"
+                  type="number"
+                  min={15}
+                  max={80}
+                  value={billableKuverCount}
+                  onChange={(e) => setBillableKuverCount(Number(e.target.value) || 35)}
+                  className="w-full mt-0.5 font-mono-num font-bold text-slate-900 bg-transparent focus:outline-none"
+                />
+              </div>
+              <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                <label htmlFor="exempt-speaker-input" className="block text-[11px] text-slate-500">
+                  Konuşmacı Muafiyeti
+                </label>
+                <input
+                  id="exempt-speaker-input"
+                  type="number"
+                  min={0}
+                  max={5}
+                  value={exemptSpeakerCount}
+                  onChange={(e) => setExemptSpeakerCount(Number(e.target.value) || 0)}
+                  className="w-full mt-0.5 font-mono-num font-bold text-slate-900 bg-transparent focus:outline-none"
+                />
+              </div>
+              <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                <label htmlFor="exempt-honorary-input" className="block text-[11px] text-slate-500">
+                  Onur / Rotaract Muafiyeti
+                </label>
+                <input
+                  id="exempt-honorary-input"
+                  type="number"
+                  min={0}
+                  max={10}
+                  value={exemptHonoraryOrYouthCount}
+                  onChange={(e) => setExemptHonoraryOrYouthCount(Number(e.target.value) || 0)}
+                  className="w-full mt-0.5 font-mono-num font-bold text-slate-900 bg-transparent focus:outline-none"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
+              <div className="p-3 rounded-xl bg-[#0F172A] text-white">
+                <div className="text-[11px] text-slate-300">Kişi Başı Efektif Tutar</div>
+                <div className="text-base font-bold font-mono-num text-[#F7A81B] mt-0.5">
+                  {formatTL(meetingCostSharing.effectivePerMemberTotalTL)}
+                </div>
+              </div>
+              <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                <div className="text-[11px] text-slate-500">Toplam Otel Faturası</div>
+                <div className="text-sm font-bold font-mono-num text-slate-900 mt-0.5">
+                  {formatTL(meetingCostSharing.totalHotelInvoiceTL)}
+                </div>
+              </div>
+              <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                <div className="text-[11px] text-slate-500">Muafiyet Maliyeti ({meetingCostSharing.totalExemptionsCount} Kişi)</div>
+                <div className="text-sm font-bold font-mono-num text-[#0C3C7C] mt-0.5">
+                  {formatTL(meetingCostSharing.clubSubsidizedExemptionCostTL)}
+                </div>
+              </div>
+              <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                <div className="text-[11px] text-slate-500">Üye Başı Ortak Havuz Farkı</div>
+                <div className="text-sm font-bold font-mono-num text-emerald-800 mt-0.5">
+                  +{formatTL(meetingCostSharing.perPayingMemberSharedSurchargeTL)}
+                </div>
+              </div>
+            </div>
+          </section>
         </div>
       </div>
 

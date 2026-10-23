@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
@@ -7,9 +8,11 @@ import path from 'path';
 import type { Server } from 'http';
 import { createPilotExpressApp } from '../../server';
 import {
+  APPLE_WEBAUTHN_ROOT_CA_PEM,
   encodeCborAttestationObject,
   encodeCborCoseEc2P256Key,
   extractP256CoordinatesFromSpkiDer,
+  loadTrustedWebAuthnRootCerts,
 } from './pilotEngine';
 
 function asn1Len(len: number): Buffer {
@@ -1894,7 +1897,50 @@ test('Issue #76 / #70: Authentic per-club role bindings — Galata President (m-
   });
 });
 
-test('Issue #76 v5.3 Audit: Zero-env one-time initial admin activation flow, hardware-only WebAuthn client enforcement, and automatic discovery of v5.2 database files', async () => {
+test('Issue #76 v5.3 Audit: Zero-env one-time initial admin activation flow, hardware-only WebAuthn client enforcement, official Apple Root CA OpenSSL verification, and automatic discovery of v5.2 database files', async () => {
+  // 0. Issue #22 & #17: Verify embedded official Apple WebAuthn Root CA certificate parses cleanly in Node crypto.X509Certificate AND OpenSSL x509, self-verifies, and is loaded in trust store without silent fallback
+  const appleCert = new crypto.X509Certificate(APPLE_WEBAUTHN_ROOT_CA_PEM);
+  assert.equal(appleCert.ca, true, 'Official Apple WebAuthn Root CA must have CA:TRUE');
+  assert.equal(
+    appleCert.serialNumber,
+    '681D016C7A3CE30225A5019428475771',
+    'Official Apple WebAuthn Root CA serial number must match 68:1d:01:6c:7a:3c:e3:02:25:a5:01:94:28:47:57:71'
+  );
+  assert.equal(
+    appleCert.subject.includes('CN=Apple WebAuthn Root CA'),
+    true,
+    'Official Apple WebAuthn Root CA subject must include CN=Apple WebAuthn Root CA'
+  );
+  assert.equal(
+    appleCert.verify(appleCert.publicKey),
+    true,
+    'Official Apple WebAuthn Root CA must cryptographically self-verify with ECDSA P-384'
+  );
+
+  // Verify with OpenSSL CLI (openssl x509 -noout -subject -serial)
+  const opensslOut = execFileSync(
+    'openssl',
+    ['x509', '-noout', '-subject', '-issuer', '-serial'],
+    { input: APPLE_WEBAUTHN_ROOT_CA_PEM, encoding: 'utf8' }
+  );
+  assert.equal(
+    opensslOut.includes('Apple WebAuthn Root CA'),
+    true,
+    'OpenSSL x509 must parse Apple WebAuthn Root CA subject'
+  );
+  assert.equal(
+    opensslOut.toUpperCase().includes('SERIAL=681D016C7A3CE30225A5019428475771'),
+    true,
+    'OpenSSL x509 must confirm official Apple WebAuthn Root CA serial'
+  );
+
+  const loadedRoots = loadTrustedWebAuthnRootCerts();
+  assert.equal(
+    loadedRoots.some((c) => c.serialNumber === '681D016C7A3CE30225A5019428475771'),
+    true,
+    'loadTrustedWebAuthnRootCerts() must include the official Apple WebAuthn Root CA'
+  );
+
   // 1. Verify SplashLockScreenModal.tsx has zero software WebCrypto keypair fallback (no subtle.generateKey or subtle.sign)
   const splashModalSource = fs.readFileSync(
     path.resolve(process.cwd(), 'src/components/SplashLockScreenModal.tsx'),

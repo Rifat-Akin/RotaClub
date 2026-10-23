@@ -15,6 +15,12 @@ import {
   MakeupSubmission,
   RotaryMember,
 } from '../types/rotary';
+import {
+  calculateVolunteerShiftMetrics,
+  SYNTHETIC_VOLUNTEER_SHIFTS,
+  toggleVolunteerShiftAssignment,
+  VolunteerShiftSlot,
+} from '../utils/rotaryLogic';
 import { RotaryWheelIcon } from './RotaryArtwork';
 
 interface OperationsTabProps {
@@ -98,6 +104,18 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
   ]);
 
   const isBoardLeader = activeRole === 'sekreter' || activeRole === 'baskan';
+
+  // Issue #46 Synthetic Pilot State: Volunteer, Task & Shift Management
+  const [volunteerShifts, setVolunteerShifts] = useState<VolunteerShiftSlot[]>(
+    SYNTHETIC_VOLUNTEER_SHIFTS
+  );
+  const shiftMetrics = calculateVolunteerShiftMetrics(volunteerShifts);
+
+  const handleToggleShiftSlot = (shiftId: string) => {
+    setVolunteerShifts((prev) =>
+      toggleVolunteerShiftAssignment(prev, shiftId, 'Rtn. Rifat Akın')
+    );
+  };
 
   const handleMemberMakeupSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -784,6 +802,82 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                   </div>
                 </div>
               ))}
+            </div>
+          </section>
+
+          {/* Issue #46 Synthetic Pilot Module: Gönüllü, Görev ve Vardiya Yönetimi */}
+          <section
+            aria-labelledby="volunteer-shift-heading"
+            data-testid="volunteer-shift-panel"
+            className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 space-y-4 shadow-xs"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3.5">
+              <div>
+                <div className="text-xs font-semibold text-[#0C3C7C]">
+                  Saha Operasyonları · Sentetik Pilot Modülü (#46)
+                </div>
+                <h2
+                  id="volunteer-shift-heading"
+                  className="font-serif-display text-xl font-bold text-slate-900"
+                >
+                  Gönüllü, Görev ve Vardiya Çizelgesi
+                </h2>
+              </div>
+              <div className="text-right font-mono-num text-xs">
+                <div className="font-bold text-[#0C3C7C]">
+                  %{shiftMetrics.fillRatePercent} Doluluk ({shiftMetrics.totalAssigned}/{shiftMetrics.totalRequired})
+                </div>
+                <div className="text-[11px] text-slate-500">
+                  {shiftMetrics.openSlotsCount} Açık Kontenjan
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              {volunteerShifts.map((shift) => {
+                const isAssigned = shift.assignedVolunteers.includes('Rtn. Rifat Akın');
+                const isFull = shift.assignedVolunteers.length >= shift.requiredCount;
+                return (
+                  <div
+                    key={shift.id}
+                    className="p-3.5 rounded-xl border border-slate-200 bg-slate-50/70 space-y-2 text-xs"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <div className="font-bold text-slate-900">{shift.taskTitle}</div>
+                        <div className="text-[11px] text-[#0C3C7C] font-semibold">
+                          {shift.eventTitle} · {shift.shiftWindow}
+                        </div>
+                      </div>
+                      <span
+                        className={`text-[11px] font-semibold shrink-0 ${
+                          isFull ? 'text-emerald-700' : 'text-amber-700'
+                        }`}
+                      >
+                        {shift.assignedVolunteers.length}/{shift.requiredCount} Gönüllü
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-slate-600">
+                      <strong className="text-slate-800">Konum: </strong>
+                      {shift.location} · <strong className="text-slate-800">Vardiya: </strong>
+                      {shift.assignedVolunteers.join(', ')}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleToggleShiftSlot(shift.id)}
+                      className={`w-full min-h-[36px] px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                        isAssigned
+                          ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                          : 'bg-[#0C3C7C] text-white hover:bg-[#17458F]'
+                      }`}
+                    >
+                      {isAssigned
+                        ? 'Vardiyada Görevlisiniz (Ayrılmak İçin Dokunun)'
+                        : 'Bu Vardiyada Görev Al (+Make-up Kredisi)'}
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           </section>
         </div>

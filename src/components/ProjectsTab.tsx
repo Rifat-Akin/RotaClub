@@ -15,7 +15,12 @@ import {
   GalleryArchivePhoto,
   ScholarStudent,
 } from '../types/rotary';
-import { calculateProjectProgress, formatTL } from '../utils/rotaryLogic';
+import {
+  calculateProjectProgress,
+  calculateSpecializedModulesSummary,
+  formatTL,
+  SYNTHETIC_SPECIALIZED_MODULES,
+} from '../utils/rotaryLogic';
 import { ProjectVisualArtwork } from './RotaryArtwork';
 
 interface ProjectsTabProps {
@@ -62,6 +67,7 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({
   const [newVisualTheme, setNewVisualTheme] = useState<GalataProject['visualTheme']>('school');
 
   const isBoardLeader = activeRole === 'baskan' || activeRole === 'sekreter';
+  const specializedSummary = calculateSpecializedModulesSummary(SYNTHETIC_SPECIALIZED_MODULES);
 
   const openSupportModal = (project: GalataProject) => {
     setSelectedProject(project);
@@ -404,6 +410,137 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({
               </div>
             );
           })}
+        </div>
+      </section>
+
+      {/* Issue #51 Synthetic Pilot Module: Kermes, GALATART ve RYLA Özel Modülleri */}
+      <section
+        aria-labelledby="specialized-modules-heading"
+        data-testid="specialized-modules-panel"
+        className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 space-y-5 shadow-xs"
+      >
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-4">
+          <div>
+            <div className="text-xs font-semibold text-[#0C3C7C]">
+              Galata İmzalı Özel Programlar · Sentetik Pilot Modülleri (#51)
+            </div>
+            <h2
+              id="specialized-modules-heading"
+              className="font-serif-display text-xl sm:text-2xl font-bold text-slate-900 mt-0.5"
+            >
+              Kermes, GALATART ve RYLA Operasyon Modülleri
+            </h2>
+            <p className="text-xs text-slate-600 mt-1">
+              Stant doluluğu, çağdaş sanat eser bağış payları ve RYLA liderlik akademisi kontenjan takibi (sentetik pilot verisi).
+            </p>
+          </div>
+          <div className="sm:text-right shrink-0">
+            <div className="text-xs text-slate-500">Birleşik Net Etki & Burs Fonu</div>
+            <div className="text-lg font-bold font-mono-num text-[#0C3C7C]">
+              {formatTL(specializedSummary.combinedNetImpactFundTL)}
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          {/* KERMES */}
+          <div className="p-4 rounded-2xl border border-slate-200 bg-slate-50/70 flex flex-col justify-between gap-3 text-xs">
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="font-mono-num font-bold text-[#0C3C7C]">KERMES</span>
+                <span className="text-[11px] font-semibold text-slate-600">Galata Rum Okulu</span>
+              </div>
+              <h3 className="font-serif-display text-lg font-bold text-slate-900">
+                Galata Bahar Kermesi & Tasarım Pazarı
+              </h3>
+            </div>
+            <div className="p-3 rounded-xl bg-white border border-slate-200 space-y-1.5">
+              <div className="flex justify-between">
+                <span className="text-slate-500">Stant Doluluğu:</span>
+                <span className="font-mono-num font-bold text-slate-900">
+                  {SYNTHETIC_SPECIALIZED_MODULES.kermes.allocatedStalls}/{SYNTHETIC_SPECIALIZED_MODULES.kermes.totalStalls} Stant (%{specializedSummary.kermesFillPercent})
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-500">Bağışlanan Tasarım Ürün:</span>
+                <span className="font-mono-num font-semibold text-[#0C3C7C]">
+                  {SYNTHETIC_SPECIALIZED_MODULES.kermes.donatedProductItems} Adet
+                </span>
+              </div>
+              <div className="flex justify-between pt-1 border-t border-slate-100">
+                <span className="text-slate-500">Beklenen Stant Geliri:</span>
+                <span className="font-mono-num font-bold text-emerald-700">
+                  {formatTL(SYNTHETIC_SPECIALIZED_MODULES.kermes.expectedStallRevenueTL)}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* GALATART */}
+          <div className="p-4 rounded-2xl border border-slate-200 bg-slate-50/70 flex flex-col justify-between gap-3 text-xs">
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="font-mono-num font-bold text-[#0C3C7C]">GALATART</span>
+                <span className="text-[11px] font-semibold text-slate-600">Tophane-i Amire</span>
+              </div>
+              <h3 className="font-serif-display text-lg font-bold text-slate-900">
+                GALATART Çağdaş Sanat Sergisi & Müzayede
+              </h3>
+            </div>
+            <div className="p-3 rounded-xl bg-white border border-slate-200 space-y-1.5">
+              <div className="flex justify-between">
+                <span className="text-slate-500">Koleksiyoner Devri:</span>
+                <span className="font-mono-num font-bold text-slate-900">
+                  {SYNTHETIC_SPECIALIZED_MODULES.galatart.soldArtworksCount}/{SYNTHETIC_SPECIALIZED_MODULES.galatart.curatedArtworksCount} Eser
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-500">Kulüp Burs Komisyonu:</span>
+                <span className="font-mono-num font-semibold text-[#0C3C7C]">
+                  %{SYNTHETIC_SPECIALIZED_MODULES.galatart.clubCommissionPercent}
+                </span>
+              </div>
+              <div className="flex justify-between pt-1 border-t border-slate-100">
+                <span className="text-slate-500">Net Burs Fonu Payı:</span>
+                <span className="font-mono-num font-bold text-emerald-700">
+                  {formatTL(specializedSummary.galatartNetCommissionTL)}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* RYLA */}
+          <div className="p-4 rounded-2xl border border-slate-200 bg-slate-50/70 flex flex-col justify-between gap-3 text-xs">
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="font-mono-num font-bold text-[#0C3C7C]">RYLA</span>
+                <span className="text-[11px] font-semibold text-slate-600">UR 2420. Bölge</span>
+              </div>
+              <h3 className="font-serif-display text-lg font-bold text-slate-900">
+                Gençlik Liderlik Akademisi & Kampı
+              </h3>
+            </div>
+            <div className="p-3 rounded-xl bg-white border border-slate-200 space-y-1.5">
+              <div className="flex justify-between">
+                <span className="text-slate-500">Onaylanan Bursiyer:</span>
+                <span className="font-mono-num font-bold text-slate-900">
+                  {SYNTHETIC_SPECIALIZED_MODULES.ryla.approvedScholars}/{SYNTHETIC_SPECIALIZED_MODULES.ryla.totalQuota} Lider (%{specializedSummary.rylaFillPercent})
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-500">Yedek Liste Adayı:</span>
+                <span className="font-mono-num font-semibold text-[#0C3C7C]">
+                  {SYNTHETIC_SPECIALIZED_MODULES.ryla.waitlistedCandidates} Aday
+                </span>
+              </div>
+              <div className="flex justify-between pt-1 border-t border-slate-100">
+                <span className="text-slate-500">Sponsorlu Kamp Bütçesi:</span>
+                <span className="font-mono-num font-bold text-emerald-700">
+                  {formatTL(SYNTHETIC_SPECIALIZED_MODULES.ryla.totalSponsoredBudgetTL)}
+                </span>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 

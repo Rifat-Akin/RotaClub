@@ -518,20 +518,28 @@ export function extractP256CoordinatesFromSpkiDer(spkiDer: Buffer): {
   };
 }
 
-// Official Apple WebAuthn Root CA (CN=Apple WebAuthn Root CA, OU=Certification Authority, O=Apple Inc., C=US)
-const APPLE_WEBAUTHN_ROOT_CA_PEM = [
+/**
+ * Official Apple Inc. "Apple WebAuthn Root CA" certificate (from https://www.apple.com/certificateauthority/Apple_WebAuthn_Root_CA.pem)
+ * - Subject / Issuer: CN = Apple WebAuthn Root CA, O = Apple Inc., ST = California
+ * - Serial Number: 68:1d:01:6c:7a:3c:e3:02:25:a5:01:94:28:47:57:71 (681D016C7A3CE30225A5019428475771)
+ * - Validity: Mar 18 18:21:32 2020 GMT -> Mar 15 00:00:00 2045 GMT
+ * - Public Key Algorithm: id-ecPublicKey (NIST P-384 / secp384r1), ecdsa-with-SHA384
+ * - Basic Constraints: critical, CA:TRUE
+ */
+export const APPLE_WEBAUTHN_ROOT_CA_PEM = [
   '-----BEGIN CERTIFICATE-----',
-  'MIIB4TCCAYegAwIBAgIRAMJ92+r58B4wCgYIKoZIzj0EAwMwXjELMAkGA1UEBhMC',
-  'VVMxEzARBgNVBAoMCkFwcGxlIEluYy4xIjAgBgNVBAsMGUNlcnRpZmljYXRpb24g',
-  'QXV0aG9yaXR5MRYwFAYDVQQDDA1BcHBsZSBXZWIgQ0EwHhcNMjAwNDE1MTczNDEy',
-  'WhcNMzAwNDEzMTczNDEyWjBeMQswCQYDVQQGEwJVUzETMBEGA1UECgwKQXBwbGUg',
-  'SW5jLjEiMCAGA1UECwwZQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkxFjAUBgNVBAMM',
-  'DUFwcGxlIFdlYiBDQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABG9uK2B1mE2F',
-  'kP6zH4d0d6bL+b4c7p7P6Q3w5J0X9g7m1t2V3y4z5A6B7C8D9E0F1G2H3I4J5K6L',
-  '7M8N9O0P1Q2jQjBAMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMB0G',
-  'A1UdDgQWBBQ1234567890abcdef1234567890TAKBggqhkjOPQQDAwNIADBFAiEA',
-  '1234567890abcdef1234567890abcdef1234567890cCIQD1234567890abcdef1',
-  '234567890abcdef1234567890g==',
+  'MIICEjCCAZmgAwIBAgIQaB0BbHo84wIlpQGUKEdXcTAKBggqhkjOPQQDAzBLMR8w',
+  'HQYDVQQDDBZBcHBsZSBXZWJBdXRobiBSb290IENBMRMwEQYDVQQKDApBcHBsZSBJ',
+  'bmMuMRMwEQYDVQQIDApDYWxpZm9ybmlhMB4XDTIwMDMxODE4MjEzMloXDTQ1MDMx',
+  'NTAwMDAwMFowSzEfMB0GA1UEAwwWQXBwbGUgV2ViQXV0aG4gUm9vdCBDQTETMBEG',
+  'A1UECgwKQXBwbGUgSW5jLjETMBEGA1UECAwKQ2FsaWZvcm5pYTB2MBAGByqGSM49',
+  'AgEGBSuBBAAiA2IABCJCQ2pTVhzjl4Wo6IhHtMSAzO2cv+H9DQKev3//fG59G11k',
+  'xu9eI0/7o6V5uShBpe1u6l6mS19S1FEh6yGljnZAJ+2GNP1mi/YK2kSXIuTHjxA/',
+  'pcoRf7XkOtO4o1qlcaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUJtdk',
+  '2cV4wlpn0afeaxLQG2PxxtcwDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49BAMDA2cA',
+  'MGQCMFrZ+9DsJ1PW9hfNdBywZDsWDbWFp28it1d/5w2RPkRX3Bbn/UbDTNLx7Jr3',
+  'jAGGiQIwHFj+dJZYUJR786osByBelJYsVZd2GbHQu209b5RCmGQ21gpSAk9QZW4B',
+  '1bWeT0vT',
   '-----END CERTIFICATE-----',
 ].join('\n');
 
@@ -547,6 +555,26 @@ const APPLE_ATTESTATION_NONCE_OID_DER = Buffer.from(
   'hex'
 );
 
+function readAsn1DerLength(
+  buf: Buffer,
+  offset: number
+): { length: number; nextOffset: number } | null {
+  if (offset >= buf.length) return null;
+  const first = buf[offset];
+  if ((first & 0x80) === 0) {
+    return { length: first, nextOffset: offset + 1 };
+  }
+  const numBytes = first & 0x7f;
+  if (numBytes === 0 || numBytes > 3 || offset + 1 + numBytes > buf.length) {
+    return null;
+  }
+  let len = 0;
+  for (let i = 0; i < numBytes; i++) {
+    len = (len << 8) | buf[offset + 1 + i];
+  }
+  return { length: len, nextOffset: offset + 1 + numBytes };
+}
+
 function extractFidoAaguidFromCertDer(certDer: Buffer): Buffer | null {
   const idx = certDer.indexOf(FIDO_AAGUID_OID_DER);
   if (idx === -1) return null;
@@ -557,15 +585,17 @@ function extractFidoAaguidFromCertDer(certDer: Buffer): Buffer | null {
     const boolLen = certDer[pos + 1] ?? 0;
     pos += 2 + boolLen;
   }
-  // Outer OCTET STRING (0x04 0x12) wrapping inner OCTET STRING (0x04 0x10 <16-byte AAGUID>)
+  if (pos >= certDer.length || certDer[pos] !== 0x04) return null;
+  const outerLen = readAsn1DerLength(certDer, pos + 1);
+  if (!outerLen) return null;
+  pos = outerLen.nextOffset;
+  // Inner OCTET STRING (0x04 0x10 <16-byte AAGUID>)
   if (
-    pos + 20 <= certDer.length &&
+    pos + 18 <= certDer.length &&
     certDer[pos] === 0x04 &&
-    certDer[pos + 1] === 0x12 &&
-    certDer[pos + 2] === 0x04 &&
-    certDer[pos + 3] === 0x10
+    certDer[pos + 1] === 0x10
   ) {
-    return certDer.subarray(pos + 4, pos + 20);
+    return certDer.subarray(pos + 2, pos + 18);
   }
   return null;
 }
@@ -579,33 +609,51 @@ function extractAppleNonceFromCertDer(certDer: Buffer): Buffer | null {
     const boolLen = certDer[pos + 1] ?? 0;
     pos += 2 + boolLen;
   }
-  if (pos + 2 > certDer.length || certDer[pos] !== 0x04) return null;
-  const extValLen = certDer[pos + 1];
-  const extSlice = certDer.subarray(pos + 2, pos + 2 + extValLen);
+  if (pos >= certDer.length || certDer[pos] !== 0x04) return null;
+  const outerLen = readAsn1DerLength(certDer, pos + 1);
+  if (
+    !outerLen ||
+    outerLen.nextOffset + outerLen.length > certDer.length
+  ) {
+    return null;
+  }
+  const extSlice = certDer.subarray(
+    outerLen.nextOffset,
+    outerLen.nextOffset + outerLen.length
+  );
   const octetMarker = Buffer.from([0x04, 0x20]);
   const markerIdx = extSlice.indexOf(octetMarker);
   if (markerIdx === -1 || markerIdx + 2 + 32 > extSlice.length) return null;
   return extSlice.subarray(markerIdx + 2, markerIdx + 34);
 }
 
-function loadTrustedWebAuthnRootCerts(
+export function loadTrustedWebAuthnRootCerts(
   extraRootPems?: string[]
 ): crypto.X509Certificate[] {
-  const candidates: string[] = [APPLE_WEBAUTHN_ROOT_CA_PEM];
+  // Strictly parse and cryptographically self-verify the built-in official Apple WebAuthn Root CA (no silent catch!)
+  const officialAppleRoot = new crypto.X509Certificate(
+    APPLE_WEBAUTHN_ROOT_CA_PEM
+  );
+  if (
+    !officialAppleRoot.ca ||
+    !officialAppleRoot.verify(officialAppleRoot.publicKey)
+  ) {
+    throw new Error(
+      'FATAL_WEBAUTHN_TRUST_STORE: Official Apple WebAuthn Root CA failed self-verification.'
+    );
+  }
+
+  const parsed: crypto.X509Certificate[] = [officialAppleRoot];
+  const extraCandidates: string[] = [];
   if (process.env.ROTACLUB_WEBAUTHN_TRUSTED_ROOT_PEM) {
-    candidates.push(process.env.ROTACLUB_WEBAUTHN_TRUSTED_ROOT_PEM);
+    extraCandidates.push(process.env.ROTACLUB_WEBAUTHN_TRUSTED_ROOT_PEM);
   }
   if (Array.isArray(extraRootPems)) {
-    candidates.push(...extraRootPems);
+    extraCandidates.push(...extraRootPems);
   }
-  const parsed: crypto.X509Certificate[] = [];
-  for (const pem of candidates) {
+  for (const pem of extraCandidates) {
     if (!pem || !pem.trim()) continue;
-    try {
-      parsed.push(new crypto.X509Certificate(pem));
-    } catch {
-      // Ignore unparseable root PEM entry
-    }
+    parsed.push(new crypto.X509Certificate(pem));
   }
   return parsed;
 }
