@@ -3306,17 +3306,18 @@ export class AtomicMultiTenantStore {
     return { ok: true, state: this.state.tenants[clubId] };
   }
 
-  public appendAuditEntry(params: {
-    clubId: string;
-    actorName: string;
-    actorRole: ClubRole;
-    module: AuditLogEntry['module'];
-    action: string;
-    detail: string;
-    timestamp: string;
-  }): ChainedAuditLogEntry {
-    const tenant = this.getTenantState(params.clubId);
-    const ledger = tenant.auditLedger || [];
+  private buildChainedAuditEntry(
+    ledger: ChainedAuditLogEntry[],
+    params: {
+      clubId: string;
+      actorName: string;
+      actorRole: ClubRole;
+      module: AuditLogEntry['module'];
+      action: string;
+      detail: string;
+      timestamp: string;
+    }
+  ): ChainedAuditLogEntry {
     const latestEntry =
       ledger.length > 0
         ? [...ledger].sort((a, b) => b.sequenceNo - a.sequenceNo)[0]
@@ -3340,26 +3341,73 @@ export class AtomicMultiTenantStore {
       prevHash,
     };
     const entryHash = computeAuditHash(partial);
-    const fullEntry: ChainedAuditLogEntry = { ...partial, entryHash };
+    return { ...partial, entryHash };
+  }
 
-    tenant.auditLedger = [fullEntry, ...ledger];
-    tenant.updatedAt = new Date().toISOString();
-    this.state.updatedAt = tenant.updatedAt;
-    this.atomicWriteToDisk(this.state);
-    return fullEntry;
+  public appendAuditEntry(params: {
+    clubId: string;
+    actorName: string;
+    actorRole: ClubRole;
+    module: AuditLogEntry['module'];
+    action: string;
+    detail: string;
+    timestamp: string;
+  }): ChainedAuditLogEntry {
+    const tenant = this.getTenantState(params.clubId);
+    const ledger = tenant.auditLedger || [];
+    const fullEntry = this.buildChainedAuditEntry(ledger, params);
+
+    const rollbackLedger = [...ledger];
+    const prevTenantUpdatedAt = tenant.updatedAt;
+    const prevStateUpdatedAt = this.state.updatedAt;
+
+    try {
+      tenant.auditLedger = [fullEntry, ...ledger];
+      tenant.updatedAt = new Date().toISOString();
+      this.state.updatedAt = tenant.updatedAt;
+      this.atomicWriteToDisk(this.state);
+      return fullEntry;
+    } catch (err) {
+      tenant.auditLedger = rollbackLedger;
+      tenant.updatedAt = prevTenantUpdatedAt;
+      this.state.updatedAt = prevStateUpdatedAt;
+      throw err;
+    }
   }
 
   /**
-   * Mandatory Compare-And-Swap (CAS) Tenant Update with Atomic Rollback Protection (#13, #14, #18, #19)
+   * Mandatory Compare-And-Swap (CAS) Tenant Update with Single-Transaction Atomic Audit & Rollback Protection (#13, #14, #18, #19, ADR-0001)
    * Requires an explicit integer expectedRevision matching current.revision before mutating state.
-   * Clones pre-transaction state and rolls back in-memory state if updater or disk persistence fails.
+   * When atomicAudit is provided, appends the SHA-256 hash-chained audit record inside the SAME transaction
+   * and single atomic disk write, rolling back both state and audit chain if updater or persistence fails.
    */
   public updateTenant(
     clubId: string,
     updater: (current: TenantClubDatabaseState) => TenantClubDatabaseState,
-    expectedRevision: number
+    expectedRevision: number,
+    atomicAudit?:
+      | {
+          actorName: string;
+          actorRole: ClubRole;
+          module: AuditLogEntry['module'];
+          action: string;
+          detail: string;
+          timestamp: string;
+        }
+      | ((updatedState: TenantClubDatabaseState) => {
+          actorName: string;
+          actorRole: ClubRole;
+          module: AuditLogEntry['module'];
+          action: string;
+          detail: string;
+          timestamp: string;
+        })
   ):
-    | { ok: true; state: TenantClubDatabaseState }
+    | {
+        ok: true;
+        state: TenantClubDatabaseState;
+        auditEntry?: ChainedAuditLogEntry;
+      }
     | {
         ok: false;
         reason: 'REVISION_REQUIRED' | 'REVISION_CONFLICT';
@@ -3390,15 +3438,32 @@ export class AtomicMultiTenantStore {
     const previousDbUpdatedAt = this.state.updatedAt;
 
     try {
-      const preservedAuditLedger = current.auditLedger;
+      const preservedAuditLedger = [...(current.auditLedger || [])];
       const updated = updater(JSON.parse(JSON.stringify(current)));
-      updated.auditLedger = preservedAuditLedger;
       updated.revision = (current.revision || 1) + 1;
       updated.updatedAt = new Date().toISOString();
+
+      let appendedAuditEntry: ChainedAuditLogEntry | undefined;
+      if (atomicAudit) {
+        const resolvedAudit =
+          typeof atomicAudit === 'function' ? atomicAudit(updated) : atomicAudit;
+        appendedAuditEntry = this.buildChainedAuditEntry(preservedAuditLedger, {
+          clubId,
+          ...resolvedAudit,
+        });
+        updated.auditLedger = [appendedAuditEntry, ...preservedAuditLedger];
+      } else {
+        updated.auditLedger = preservedAuditLedger;
+      }
+
       this.state.tenants[clubId] = updated;
       this.state.updatedAt = updated.updatedAt;
       this.atomicWriteToDisk(this.state);
-      return { ok: true, state: updated };
+      return {
+        ok: true,
+        state: updated,
+        ...(appendedAuditEntry ? { auditEntry: appendedAuditEntry } : {}),
+      };
     } catch (err) {
       this.state.tenants[clubId] = rollbackSnapshot;
       this.state.updatedAt = previousDbUpdatedAt;

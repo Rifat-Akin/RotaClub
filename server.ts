@@ -1773,7 +1773,17 @@ export function createPilotExpressApp(
               : m
           ),
         }),
-        tenant.revision
+        tenant.revision,
+        {
+          actorName: `${user.fullName} (${user.rotaryId})`,
+          actorRole: user.role,
+          module: 'Yönetim & Güvenlik',
+          action: `Üyelik Yaşam Döngüsü Güncellendi: ${targetMember.fullName} (${validation.currentStatus} -> ${targetStatus})`,
+          detail: `${targetMember.fullName} (${targetMember.rotaryId}) üyelik statüsü "${validation.currentStatus}" durumundan "${targetStatus}" durumuna geçirildi. Gerekçe: ${String(
+            reason
+          ).trim()}`,
+          timestamp: nowStr,
+        }
       );
 
       if (!casResult.ok) {
@@ -1783,18 +1793,6 @@ export function createPilotExpressApp(
         });
         return;
       }
-
-      store.appendAuditEntry({
-        clubId: authorizedClubId,
-        actorName: `${user.fullName} (${user.rotaryId})`,
-        actorRole: user.role,
-        module: 'Yönetim & Güvenlik',
-        action: `Üyelik Yaşam Döngüsü Güncellendi: ${targetMember.fullName} (${validation.currentStatus} -> ${targetStatus})`,
-        detail: `${targetMember.fullName} (${targetMember.rotaryId}) üyelik statüsü "${validation.currentStatus}" durumundan "${targetStatus}" durumuna geçirildi. Gerekçe: ${String(
-          reason
-        ).trim()}`,
-        timestamp: nowStr,
-      });
 
       const updatedMember = casResult.state.members.find(
         (m) => m.id === cleanMemberId
@@ -2090,7 +2088,15 @@ export function createPilotExpressApp(
               treasuryLedger: [newLedgerEntry, ...curr.treasuryLedger],
             };
           },
-          tenant.revision
+          tenant.revision,
+          {
+            actorName: `${user.fullName} (${user.rotaryId})`,
+            actorRole: user.role,
+            module: 'Saymanlık & Kasa',
+            action: `Banka Mutabakatlı Tahsilat Onayı (${canonicalRef})`,
+            detail: `${payment.memberName} (${payment.amount} TL) ödemesi banka ekstresiyle eşleştirildi ve mükerrer kayıt korumasıyla kasa defterine işlendi.`,
+            timestamp: formatNowTR(),
+          }
         );
 
         if (!casResult.ok) {
@@ -2100,16 +2106,6 @@ export function createPilotExpressApp(
           });
           return;
         }
-
-        store.appendAuditEntry({
-          clubId: authorizedClubId,
-          actorName: `${user.fullName} (${user.rotaryId})`,
-          actorRole: user.role,
-          module: 'Saymanlık & Kasa',
-          action: `Banka Mutabakatlı Tahsilat Onayı (${canonicalRef})`,
-          detail: `${payment.memberName} (${payment.amount} TL) ödemesi banka ekstresiyle eşleştirildi ve mükerrer kayıt korumasıyla kasa defterine işlendi.`,
-          timestamp: formatNowTR(),
-        });
 
         res.json({
           ok: true,
@@ -2232,7 +2228,15 @@ export function createPilotExpressApp(
             ...curr,
             treasuryLedger: [newEntry, ...curr.treasuryLedger],
           }),
-          tenant.revision
+          tenant.revision,
+          {
+            actorName: `${user.fullName} (${user.rotaryId})`,
+            actorRole: user.role,
+            module: 'Saymanlık & Kasa',
+            action: `Sunucu Doğrulamalı Gider Kaydı (${canonicalRef})`,
+            detail: `${newEntry.title} (${newEntry.counterparty} · ${newEntry.amount} TL) mükerrer belge kontrolüyle kasa defterine işlendi.`,
+            timestamp: formatNowTR(),
+          }
         );
 
         if (!casResult.ok) {
@@ -2242,16 +2246,6 @@ export function createPilotExpressApp(
           });
           return;
         }
-
-        store.appendAuditEntry({
-          clubId: authorizedClubId,
-          actorName: `${user.fullName} (${user.rotaryId})`,
-          actorRole: user.role,
-          module: 'Saymanlık & Kasa',
-          action: `Sunucu Doğrulamalı Gider Kaydı (${canonicalRef})`,
-          detail: `${newEntry.title} (${newEntry.counterparty} · ${newEntry.amount} TL) mükerrer belge kontrolüyle kasa defterine işlendi.`,
-          timestamp: formatNowTR(),
-        });
 
         res.json({
           ok: true,
@@ -2383,7 +2377,17 @@ export function createPilotExpressApp(
             financialItems: nextFinancialItems,
           };
         },
-        tenant.revision
+        tenant.revision,
+        {
+          actorName: `${user.fullName} (${user.rotaryId})`,
+          actorRole: user.role,
+          module: 'Saymanlık & Kasa',
+          action: `Sunucu Yönetimli Tekil Tahakkuk (${safeCategory}: ${numAmount} TL)`,
+          detail: `Aktif kulüp üyelerinin "${safeCategory}" cari bakiyesine "${String(
+            rawDesc
+          ).trim()}" kalemi tekil işlem anahtarıyla (${canonicalIdempotencyKey}) tahakkuk ettirildi (Onur üyeleri ve ayrılan üyeler muaf tutuldu).`,
+          timestamp: formatNowTR(),
+        }
       );
 
       if (!casResult.ok) {
@@ -2393,18 +2397,6 @@ export function createPilotExpressApp(
         });
         return;
       }
-
-      store.appendAuditEntry({
-        clubId: authorizedClubId,
-        actorName: `${user.fullName} (${user.rotaryId})`,
-        actorRole: user.role,
-        module: 'Saymanlık & Kasa',
-        action: `Sunucu Yönetimli Tekil Tahakkuk (${safeCategory}: ${numAmount} TL)`,
-        detail: `Aktif kulüp üyelerinin "${safeCategory}" cari bakiyesine "${String(
-          rawDesc
-        ).trim()}" kalemi tekil işlem anahtarıyla (${canonicalIdempotencyKey}) tahakkuk ettirildi (Onur üyeleri ve ayrılan üyeler muaf tutuldu).`,
-        timestamp: formatNowTR(),
-      });
 
       res.json({
         ok: true,
@@ -2707,7 +2699,15 @@ export function createPilotExpressApp(
               },
             };
           },
-          tenant.revision
+          tenant.revision,
+          {
+            actorName: `${user.fullName} (${user.rotaryId})`,
+            actorRole: user.role,
+            module: 'QR Yoklama & Make-up',
+            action: `Sunucu Doğrulamalı Masa QR Yoklama (Toplantı #${targetMeetingNo})`,
+            detail: `${user.fullName} (${user.rotaryId}) Toplantı #${targetMeetingNo} salon giriş yoklamasını kısa ömürlü imzalı QR kodu ile doğruladı (+%2 katılım).`,
+            timestamp: formatNowTR(),
+          }
         );
 
         if (!casResult.ok) {
@@ -2717,16 +2717,6 @@ export function createPilotExpressApp(
           });
           return;
         }
-
-        store.appendAuditEntry({
-          clubId: authorizedClubId,
-          actorName: `${user.fullName} (${user.rotaryId})`,
-          actorRole: user.role,
-          module: 'QR Yoklama & Make-up',
-          action: `Sunucu Doğrulamalı Masa QR Yoklama (Toplantı #${targetMeetingNo})`,
-          detail: `${user.fullName} (${user.rotaryId}) Toplantı #${targetMeetingNo} salon giriş yoklamasını kısa ömürlü imzalı QR kodu ile doğruladı (+%2 katılım).`,
-          timestamp: formatNowTR(),
-        });
 
         res.json({
           ok: true,
@@ -2857,6 +2847,8 @@ export function createPilotExpressApp(
         return;
       }
 
+      const entryModeLabel =
+        mode === 'offline_sync' ? 'Çevrimdışı Senkronizasyon' : 'Yetkili Manuel';
       const casResult = store.updateTenant(
         authorizedClubId,
         (curr) => {
@@ -2872,7 +2864,15 @@ export function createPilotExpressApp(
             },
           };
         },
-        tenant.revision
+        tenant.revision,
+        {
+          actorName: `${user.fullName} (${user.rotaryId})`,
+          actorRole: user.role,
+          module: 'QR Yoklama & Make-up',
+          action: `${entryModeLabel} Yoklama Kaydı (Toplantı #${targetMeetingNo})`,
+          detail: `${targetMemberName} (${cleanMemberId}) için ${user.fullName} tarafından manuel/çevrimdışı yoklama işlendi. Gerekçe: ${cleanReason}`,
+          timestamp: formatNowTR(),
+        }
       );
 
       if (!casResult.ok) {
@@ -2882,18 +2882,6 @@ export function createPilotExpressApp(
         });
         return;
       }
-
-      const entryModeLabel =
-        mode === 'offline_sync' ? 'Çevrimdışı Senkronizasyon' : 'Yetkili Manuel';
-      store.appendAuditEntry({
-        clubId: authorizedClubId,
-        actorName: `${user.fullName} (${user.rotaryId})`,
-        actorRole: user.role,
-        module: 'QR Yoklama & Make-up',
-        action: `${entryModeLabel} Yoklama Kaydı (Toplantı #${targetMeetingNo})`,
-        detail: `${targetMemberName} (${cleanMemberId}) için ${user.fullName} tarafından manuel/çevrimdışı yoklama işlendi. Gerekçe: ${cleanReason}`,
-        timestamp: formatNowTR(),
-      });
 
       res.json({
         ok: true,
@@ -3054,7 +3042,19 @@ export function createPilotExpressApp(
               : m
           ),
         }),
-        tenant.revision
+        tenant.revision,
+        {
+          actorName: `${user.fullName} (${user.rotaryId})`,
+          actorRole: user.role,
+          module: 'LCV & Kuver',
+          action: `LCV Hatırlatma Kuyruğu İşlendi (Toplantı #${targetMeetingNo})`,
+          detail: `Toplantı #${targetMeetingNo} (${meetingObj.venue}) için ${batch.queuedItems.length} üye taslak kuyruğa eklendi (Dış gönderim: ${
+            tenant.outboundMessagingEnabled ? 'Açık' : 'Kapalı'
+          }, Opt-out atlanan: ${batch.skippedOptOutMembers.length}, Mükerrer atlanan: ${
+            batch.skippedCooldownMembers.length
+          }).`,
+          timestamp: formatNowTR(),
+        }
       );
 
       if (!casResult.ok) {
@@ -3064,20 +3064,6 @@ export function createPilotExpressApp(
         });
         return;
       }
-
-      store.appendAuditEntry({
-        clubId: authorizedClubId,
-        actorName: `${user.fullName} (${user.rotaryId})`,
-        actorRole: user.role,
-        module: 'LCV & Kuver',
-        action: `LCV Hatırlatma Kuyruğu İşlendi (Toplantı #${targetMeetingNo})`,
-        detail: `Toplantı #${targetMeetingNo} (${meetingObj.venue}) için ${batch.queuedItems.length} üye taslak kuyruğa eklendi (Dış gönderim: ${
-          tenant.outboundMessagingEnabled ? 'Açık' : 'Kapalı'
-        }, Opt-out atlanan: ${batch.skippedOptOutMembers.length}, Mükerrer atlanan: ${
-          batch.skippedCooldownMembers.length
-        }).`,
-        timestamp: formatNowTR(),
-      });
 
       res.json({
         ok: true,
@@ -3165,7 +3151,17 @@ export function createPilotExpressApp(
               : m
           ),
         }),
-        tenant.revision
+        tenant.revision,
+        {
+          actorName: `${user.fullName} (${user.rotaryId})`,
+          actorRole: user.role,
+          module: 'LCV & Kuver',
+          action: `LCV İletişim ve Opt-Out Tercihi Güncellendi (${effectiveMemberId})`,
+          detail: `Üye (${effectiveMemberId}) LCV hatırlatma tercihi güncellendi: Opt-out=${String(
+            reminderOptOut
+          )}, Kanal=${nextChannel || 'Mevcut'}.`,
+          timestamp: formatNowTR(),
+        }
       );
 
       if (!casResult.ok) {
@@ -3175,18 +3171,6 @@ export function createPilotExpressApp(
         });
         return;
       }
-
-      store.appendAuditEntry({
-        clubId: authorizedClubId,
-        actorName: `${user.fullName} (${user.rotaryId})`,
-        actorRole: user.role,
-        module: 'LCV & Kuver',
-        action: `LCV İletişim ve Opt-Out Tercihi Güncellendi (${effectiveMemberId})`,
-        detail: `Üye (${effectiveMemberId}) LCV hatırlatma tercihi güncellendi: Opt-out=${String(
-          reminderOptOut
-        )}, Kanal=${nextChannel || 'Mevcut'}.`,
-        timestamp: formatNowTR(),
-      });
 
       res.json({
         ok: true,
@@ -3380,7 +3364,15 @@ export function createPilotExpressApp(
             ...(curr.verifiedGuestAttendances || []),
           ],
         }),
-        tenant.revision
+        tenant.revision,
+        {
+          actorName: `${user.fullName} (${user.rotaryId})`,
+          actorRole: user.role,
+          module: 'QR Yoklama & Make-up',
+          action: `Misafir Rotaryen Salon Yoklaması Doğrulandı (Toplantı #${targetMeetingNo})`,
+          detail: `${cleanGuestName} (${cleanGuestClub}) için Toplantı #${targetMeetingNo} misafir katılımı (${safeMethod}: ${cleanEvidence}) doğrulandı.`,
+          timestamp: nowStr,
+        }
       );
 
       if (!casResult.ok) {
@@ -3390,16 +3382,6 @@ export function createPilotExpressApp(
         });
         return;
       }
-
-      store.appendAuditEntry({
-        clubId: authorizedClubId,
-        actorName: `${user.fullName} (${user.rotaryId})`,
-        actorRole: user.role,
-        module: 'QR Yoklama & Make-up',
-        action: `Misafir Rotaryen Salon Yoklaması Doğrulandı (Toplantı #${targetMeetingNo})`,
-        detail: `${cleanGuestName} (${cleanGuestClub}) için Toplantı #${targetMeetingNo} misafir katılımı (${safeMethod}: ${cleanEvidence}) doğrulandı.`,
-        timestamp: nowStr,
-      });
 
       res.json({
         ok: true,
@@ -3793,7 +3775,15 @@ export function createPilotExpressApp(
               : c
           ),
         }),
-        tenant.revision
+        tenant.revision,
+        {
+          actorName: `${user.fullName} (${user.rotaryId})`,
+          actorRole: user.role,
+          module: 'QR Yoklama & Make-up',
+          action: `Misafir Katılım Belgesi Onaylandı & Aktifleştirildi (${activeVerificationCode})`,
+          detail: `${targetCard.guestName} (${targetCard.guestClub}) adına düzenlenen Toplantı #${targetCard.meetingNo} katılım belgesi misafir yoklama kaydı (${matchedGuestAttendance.id}) ve kanıtıyla (${cleanEvidence}) aktifleştirildi.`,
+          timestamp: nowStr,
+        }
       );
 
       if (!casResult.ok) {
@@ -3803,16 +3793,6 @@ export function createPilotExpressApp(
         });
         return;
       }
-
-      store.appendAuditEntry({
-        clubId: authorizedClubId,
-        actorName: `${user.fullName} (${user.rotaryId})`,
-        actorRole: user.role,
-        module: 'QR Yoklama & Make-up',
-        action: `Misafir Katılım Belgesi Onaylandı & Aktifleştirildi (${activeVerificationCode})`,
-        detail: `${targetCard.guestName} (${targetCard.guestClub}) adına düzenlenen Toplantı #${targetCard.meetingNo} katılım belgesi misafir yoklama kaydı (${matchedGuestAttendance.id}) ve kanıtıyla (${cleanEvidence}) aktifleştirildi.`,
-        timestamp: nowStr,
-      });
 
       const approvedCertificate = (casResult.state.guestMakeupCards || []).find(
         (c) => c.id === targetCard.id
@@ -3909,7 +3889,15 @@ export function createPilotExpressApp(
               : c
           ),
         }),
-        tenant.revision
+        tenant.revision,
+        {
+          actorName: `${user.fullName} (${user.rotaryId})`,
+          actorRole: user.role,
+          module: 'QR Yoklama & Make-up',
+          action: `Misafir Katılım Belgesi İptal Edildi (${targetCard.verificationCode})`,
+          detail: `${targetCard.guestName} (${targetCard.guestClub}) adına düzenlenen ${targetCard.verificationCode} kodlu belge iptal edildi. Gerekçe: ${cleanReason}`,
+          timestamp: nowStr,
+        }
       );
 
       if (!casResult.ok) {
@@ -3919,16 +3907,6 @@ export function createPilotExpressApp(
         });
         return;
       }
-
-      store.appendAuditEntry({
-        clubId: authorizedClubId,
-        actorName: `${user.fullName} (${user.rotaryId})`,
-        actorRole: user.role,
-        module: 'QR Yoklama & Make-up',
-        action: `Misafir Katılım Belgesi İptal Edildi (${targetCard.verificationCode})`,
-        detail: `${targetCard.guestName} (${targetCard.guestClub}) adına düzenlenen ${targetCard.verificationCode} kodlu belge iptal edildi. Gerekçe: ${cleanReason}`,
-        timestamp: nowStr,
-      });
 
       res.json({
         ok: true,
@@ -4386,28 +4364,42 @@ export function createPilotExpressApp(
         return;
       }
 
-      // Issue #39 Fix: Block direct client mutation of member debt balances via /api/pilot/sync
-      if (Array.isArray(incomingPatch.members) && isFinanceAdmin) {
+      // Issue #24-#26 & #39 Fix: Block direct client mutation of member debt balances OR membership lifecycle status via /api/pilot/sync
+      if (Array.isArray(incomingPatch.members)) {
         for (const incMember of incomingPatch.members) {
           if (!incMember || typeof incMember.id !== 'string') continue;
           const existing = currentTenant.members.find(
             (m) => m.id === incMember.id
           );
           if (existing) {
-            const duesChanged =
-              typeof incMember.duesBalance === 'number' &&
-              incMember.duesBalance !== existing.duesBalance;
-            const mealChanged =
-              typeof incMember.mealBalance === 'number' &&
-              incMember.mealBalance !== existing.mealBalance;
-            const foundChanged =
-              typeof incMember.foundationBalance === 'number' &&
-              incMember.foundationBalance !== existing.foundationBalance;
-            if (duesChanged || mealChanged || foundChanged) {
+            if (isFinanceAdmin) {
+              const duesChanged =
+                typeof incMember.duesBalance === 'number' &&
+                incMember.duesBalance !== existing.duesBalance;
+              const mealChanged =
+                typeof incMember.mealBalance === 'number' &&
+                incMember.mealBalance !== existing.mealBalance;
+              const foundChanged =
+                typeof incMember.foundationBalance === 'number' &&
+                incMember.foundationBalance !== existing.foundationBalance;
+              if (duesChanged || mealChanged || foundChanged) {
+                res.status(422).json({
+                  error: 'DIRECT_LEDGER_MUTATION_FORBIDDEN',
+                  message:
+                    'Muhasebe bütünlüğü koruması (#39): Üye cari borç bakiyeleri /api/pilot/sync üzerinden doğrudan değiştirilemez; yalnızca banka mutabakatı (/api/pilot/reconcile-payment) veya toplu tahakkuk (/api/pilot/accrue-dues) ile güncellenebilir.',
+                });
+                return;
+              }
+            }
+            const existingLifecycle = existing.membershipStatus || 'Aktif';
+            if (
+              typeof incMember.membershipStatus === 'string' &&
+              incMember.membershipStatus !== existingLifecycle
+            ) {
               res.status(422).json({
-                error: 'DIRECT_LEDGER_MUTATION_FORBIDDEN',
+                error: 'LIFECYCLE_ENDPOINT_REQUIRED',
                 message:
-                  'Muhasebe bütünlüğü koruması (#39): Üye cari borç bakiyeleri /api/pilot/sync üzerinden doğrudan değiştirilemez; yalnızca banka mutabakatı (/api/pilot/reconcile-payment) veya toplu tahakkuk (/api/pilot/accrue-dues) ile güncellenebilir.',
+                  'Üyelik yaşam döngüsü bütünlüğü (#24-#26): Üye statüsü (Aday, Aktif, İzinli, Onur Üyesi, İstifa/Nakil) /api/pilot/sync üzerinden doğrudan değiştirilemez; borç kapısı ve karar geçmişi doğrulaması için /api/pilot/member-lifecycle uç noktası kullanılmalıdır.',
               });
               return;
             }
@@ -4877,10 +4869,15 @@ export function createPilotExpressApp(
                     weddingAnniversary:
                       incMember.weddingAnniversary ??
                       existing.weddingAnniversary,
-                    // Member debt balances are strictly server-managed (#39)
+                    // Member debt balances & lifecycle transitions are strictly server-managed (#24-#26, #39)
                     duesBalance: existing.duesBalance,
                     mealBalance: existing.mealBalance,
                     foundationBalance: existing.foundationBalance,
+                    membershipStatus: existing.membershipStatus,
+                    leaveStartDate: existing.leaveStartDate,
+                    leaveEndDate: existing.leaveEndDate,
+                    leaveReason: existing.leaveReason,
+                    lifecycleHistory: existing.lifecycleHistory,
                   };
                 })
               : curr.members.map((existingMember) => {
@@ -5354,7 +5351,28 @@ export function createPilotExpressApp(
             members: sanitizedMembers,
           };
         },
-        expectedRevision
+        expectedRevision,
+        (updatedState) => {
+          const changedKeys = Object.keys(incomingPatch);
+          const effectiveAction =
+            auditEvent?.action?.trim() ||
+            `Sunucu Veri Senkronizasyonu (Rev #${updatedState.revision})`;
+          const effectiveDetail =
+            auditEvent?.detail?.trim() ||
+            `${user.fullName} tarafından [${
+              changedKeys.join(', ') || 'state'
+            }] alanları güncellendi.`;
+          const effectiveModule: AuditLogEntry['module'] =
+            auditEvent?.module || 'Yönetim & Güvenlik';
+          return {
+            actorName: `${user.fullName} (${user.rotaryId})`,
+            actorRole: user.role,
+            module: effectiveModule,
+            action: effectiveAction,
+            detail: effectiveDetail,
+            timestamp: formatNowTR(),
+          };
+        }
       );
 
       if (!casResult.ok) {
@@ -5368,29 +5386,6 @@ export function createPilotExpressApp(
       }
 
       const updatedTenant = casResult.state;
-      const changedKeys = Object.keys(incomingPatch);
-
-      const effectiveAction =
-        auditEvent?.action?.trim() ||
-        `Sunucu Veri Senkronizasyonu (Rev #${updatedTenant.revision})`;
-      const effectiveDetail =
-        auditEvent?.detail?.trim() ||
-        `${user.fullName} tarafından [${
-          changedKeys.join(', ') || 'state'
-        }] alanları güncellendi.`;
-      const effectiveModule: AuditLogEntry['module'] =
-        auditEvent?.module || 'Yönetim & Güvenlik';
-
-      store.appendAuditEntry({
-        clubId: authorizedClubId,
-        actorName: `${user.fullName} (${user.rotaryId})`,
-        actorRole: user.role,
-        module: effectiveModule,
-        action: effectiveAction,
-        detail: effectiveDetail,
-        timestamp: formatNowTR(),
-      });
-
       const ledger = store.getAuditLedger(authorizedClubId);
       const redacted = redactStateForRole(updatedTenant, ledger, user);
       res.json({

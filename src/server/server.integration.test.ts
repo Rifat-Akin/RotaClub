@@ -287,7 +287,8 @@ async function withTestServer(
   fn: (
     baseUrl: string,
     tmpDbFile: string,
-    setServerTimeIso: (iso: string) => void
+    setServerTimeIso: (iso: string) => void,
+    store: ReturnType<typeof createPilotExpressApp>['store']
   ) => Promise<void>
 ) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rotaclub-test-'));
@@ -296,7 +297,7 @@ async function withTestServer(
   const setServerTimeIso = (iso: string) => {
     currentServerDate = new Date(iso);
   };
-  const { app } = createPilotExpressApp(tmpDbFile, {
+  const { app, store } = createPilotExpressApp(tmpDbFile, {
     trustedWebAuthnRootPems: [TRUSTED_TEST_ROOT_CA.pem],
     clock: () => (currentServerDate ? new Date(currentServerDate.getTime()) : new Date()),
   });
@@ -310,7 +311,7 @@ async function withTestServer(
   const baseUrl = `http://127.0.0.1:${port}`;
 
   try {
-    await fn(baseUrl, tmpDbFile, setServerTimeIso);
+    await fn(baseUrl, tmpDbFile, setServerTimeIso, store);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -3787,7 +3788,7 @@ test('Independent Security Audit Regression (#32, #35, #36): Certificate approva
 });
 
 test('Issues #13/#14/#18/#19, #24-#26, #27/#28/#34, & #38-#44: Relational DB Health, Member Lifecycle Exit Debt Gate, Per-Meeting Attendance Metrics, and Bulk Accrual Exemptions', async () => {
-  await withTestServer(async (baseUrl) => {
+  await withTestServer(async (baseUrl, _tmpDbFile, _setServerTimeIso, store) => {
     const sekreterSession = await loginRole(
       baseUrl,
       'TR-2420-81024',
@@ -3952,10 +3953,88 @@ test('Issues #13/#14/#18/#19, #24-#26, #27/#28/#34, & #38-#44: Relational DB Hea
     );
     assert.equal(honoraryMetric.attendancePercentage, 100);
     assert.equal(honoraryMetric.meetsRotary60PercentRule, true);
+
+    // 5. AGENTS.md Invariant #4 & #24-#26 Negative Test: Attempting to mutate membershipStatus via generic /api/pilot/sync MUST fail with 422 LIFECYCLE_ENDPOINT_REQUIRED
+    const bypassLifecycleViaSyncRes = await fetch(
+      `${baseUrl}/api/pilot/sync`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sekreterSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          expectedRevision: accrualBody.revision,
+          state: {
+            members: accrualBody.state.members.map(
+              (m: { id: string; membershipStatus?: string }) =>
+                m.id === 'm-rifat'
+                  ? { ...m, membershipStatus: 'İstifa / Ayrıldı' }
+                  : m
+            ),
+          },
+        }),
+      }
+    );
+    assert.equal(bypassLifecycleViaSyncRes.status, 422);
+    const bypassLifecycleBody = await bypassLifecycleViaSyncRes.json();
+    assert.equal(bypassLifecycleBody.error, 'LIFECYCLE_ENDPOINT_REQUIRED');
+
+    // 6. ADR-0001 Single-Transaction State + Audit Rollback Test:
+    // If an updater or persistence step throws inside store.updateTenant(..., atomicAudit),
+    // BOTH the state mutation AND the hash-chained audit record must roll back atomically!
+    const preFailTenant = store.getTenantState('club-galata');
+    const preFailRevision = preFailTenant.revision;
+    const preFailAuditLen = store.getAuditLedger('club-galata').length;
+
+    assert.throws(() => {
+      store.updateTenant(
+        'club-galata',
+        () => {
+          throw new Error('SIMULATED_TRANSACTION_FAILURE');
+        },
+        preFailRevision,
+        {
+          actorName: 'Rollback Test Actor',
+          actorRole: 'baskan',
+          module: 'Yönetim & Güvenlik',
+          action: 'Should Roll Back Atomically',
+          detail: 'Should never persist on transaction failure',
+          timestamp: '24 Ekim 2026 · 15:00',
+        }
+      );
+    }, /SIMULATED_TRANSACTION_FAILURE/);
+
+    const postFailTenant = store.getTenantState('club-galata');
+    const postFailAuditLedger = store.getAuditLedger('club-galata');
+    assert.equal(postFailTenant.revision, preFailRevision);
+    assert.equal(postFailAuditLedger.length, preFailAuditLen);
+
+    // Verify canonical PostgreSQL DDL artifact src/server/postgresSchema.sql exists and defines all relational tables
+    const ddlSql = fs.readFileSync(
+      path.join(process.cwd(), 'src', 'server', 'postgresSchema.sql'),
+      'utf-8'
+    );
+    for (const tableName of [
+      'rotary_clubs',
+      'rotary_members',
+      'weekly_meetings',
+      'meeting_rsvps',
+      'meeting_attendances',
+      'verified_guest_attendances',
+      'makeup_submissions',
+      'guest_makeup_certificates',
+      'financial_line_items',
+      'treasury_ledger',
+      'chained_audit_ledger',
+    ]) {
+      assert.equal(
+        ddlSql.includes(`CREATE TABLE IF NOT EXISTS ${tableName}`),
+        true,
+        `Missing table ${tableName} in src/server/postgresSchema.sql`
+      );
+    }
   });
 });
-
-
-
-
 
