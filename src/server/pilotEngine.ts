@@ -2545,6 +2545,7 @@ export class AtomicMultiTenantStore {
   private bootstrapTokenFile: string;
   private runtimeBootstrapToken: string | null = null;
   private state: MultiTenantDatabaseFile;
+  private writeFailureHook: (() => void) | null = null;
 
   constructor(customDbFile?: string) {
     this.dbDir = customDbFile
@@ -2751,6 +2752,14 @@ export class AtomicMultiTenantStore {
     return parsed as unknown as MultiTenantDatabaseFile;
   }
 
+  public setWriteFailureHook(hook: (() => void) | null): void {
+    this.writeFailureHook = hook;
+  }
+
+  public getDbFilePath(): string {
+    return this.dbFile;
+  }
+
   private atomicWriteToDisk(nextState: MultiTenantDatabaseFile): void {
     if (!fs.existsSync(this.dbDir)) {
       fs.mkdirSync(this.dbDir, { recursive: true });
@@ -2766,7 +2775,21 @@ export class AtomicMultiTenantStore {
     } finally {
       fs.closeSync(fd);
     }
-    fs.renameSync(tmpFile, this.dbFile);
+    try {
+      if (this.writeFailureHook) {
+        this.writeFailureHook();
+      }
+      fs.renameSync(tmpFile, this.dbFile);
+    } catch (err) {
+      try {
+        if (fs.existsSync(tmpFile)) {
+          fs.unlinkSync(tmpFile);
+        }
+      } catch {
+        // Ignore temp file cleanup error
+      }
+      throw err;
+    }
   }
 
   public getAccounts(): PilotUserAccount[] {
@@ -3277,33 +3300,49 @@ export class AtomicMultiTenantStore {
     }
 
     const current = this.getTenantState(clubId);
+    const rollbackSnapshot: TenantClubDatabaseState = JSON.parse(
+      JSON.stringify(current)
+    );
+    const previousDbUpdatedAt = this.state.updatedAt;
+
     // Preserve whichever audit chain is longer/current so audit history can never be truncated
     const preservedAudit =
       current.auditLedger.length >= incomingAudit.length
-        ? current.auditLedger
-        : incomingAudit;
+        ? [...current.auditLedger]
+        : [...incomingAudit];
 
-    const restored: TenantClubDatabaseState = {
-      ...backupPayload.tenantState,
-      clubId,
-      revision: current.revision + 1,
-      updatedAt: new Date().toISOString(),
-      auditLedger: preservedAudit,
-    };
-    this.state.tenants[clubId] = restored;
-    this.appendAuditEntry({
-      clubId,
-      actorName: `${actor.fullName} (${actor.rotaryId})`,
-      actorRole: actor.role,
-      module: 'Yönetim & Güvenlik',
-      action: `Kulüp Yedeğinden Veri Geri Yükleme Tamamlandı (Rev #${restored.revision})`,
-      detail: `SHA-256 checksum (${computedChecksum.slice(
-        0,
-        12
-      )}...) doğrulanarak operasyonel durum geri yüklendi.`,
-      timestamp,
-    });
-    return { ok: true, state: this.state.tenants[clubId] };
+    try {
+      const nextRevision = (current.revision || 1) + 1;
+      const restoreAuditEntry = this.buildChainedAuditEntry(preservedAudit, {
+        clubId,
+        actorName: `${actor.fullName} (${actor.rotaryId})`,
+        actorRole: actor.role,
+        module: 'Yönetim & Güvenlik',
+        action: `Kulüp Yedeğinden Veri Geri Yükleme Tamamlandı (Rev #${nextRevision})`,
+        detail: `SHA-256 checksum (${computedChecksum.slice(
+          0,
+          12
+        )}...) doğrulanarak operasyonel durum geri yüklendi.`,
+        timestamp,
+      });
+
+      const restored: TenantClubDatabaseState = {
+        ...JSON.parse(JSON.stringify(backupPayload.tenantState)),
+        clubId,
+        revision: nextRevision,
+        updatedAt: new Date().toISOString(),
+        auditLedger: [restoreAuditEntry, ...preservedAudit],
+      };
+
+      this.state.tenants[clubId] = restored;
+      this.state.updatedAt = restored.updatedAt;
+      this.atomicWriteToDisk(this.state);
+      return { ok: true, state: this.state.tenants[clubId] };
+    } catch (err) {
+      this.state.tenants[clubId] = rollbackSnapshot;
+      this.state.updatedAt = previousDbUpdatedAt;
+      throw err;
+    }
   }
 
   private buildChainedAuditEntry(
@@ -3473,7 +3512,7 @@ export class AtomicMultiTenantStore {
 
   /**
    * Resets a specific tenant's operational demo data while strictly preserving
-   * that tenant's immutable audit ledger (#18, #70).
+   * that tenant's immutable audit ledger in a single atomic transaction (#18, #19, #70).
    */
   public resetTenantOperationalData(
     clubId: string,
@@ -3481,26 +3520,42 @@ export class AtomicMultiTenantStore {
     timestamp: string
   ): TenantClubDatabaseState {
     const existing = this.getTenantState(clubId);
-    const preservedLedger = [...existing.auditLedger];
-    const fresh = createTenantClubState(
-      clubId,
-      existing.clubName,
-      existing.district
+    const rollbackSnapshot: TenantClubDatabaseState = JSON.parse(
+      JSON.stringify(existing)
     );
-    fresh.revision = existing.revision + 1;
-    fresh.auditLedger = preservedLedger;
-    this.state.tenants[clubId] = fresh;
-    this.appendAuditEntry({
-      clubId,
-      actorName: `${actor.fullName} (${actor.rotaryId})`,
-      actorRole: actor.role,
-      module: 'Yönetim & Güvenlik',
-      action:
-        'Pilot Operasyonel Verisi Başlangıç Durumuna Sıfırlandı (Denetim Defteri Korundu)',
-      detail: `${existing.clubName} operasyonel tabloları sıfırlandı; SHA-256 denetim geçmişi silinmeden korundu.`,
-      timestamp,
-    });
-    return this.state.tenants[clubId];
+    const previousDbUpdatedAt = this.state.updatedAt;
+    const preservedLedger = [...existing.auditLedger];
+
+    try {
+      const fresh = createTenantClubState(
+        clubId,
+        existing.clubName,
+        existing.district
+      );
+      fresh.revision = existing.revision + 1;
+      fresh.updatedAt = new Date().toISOString();
+
+      const resetAuditEntry = this.buildChainedAuditEntry(preservedLedger, {
+        clubId,
+        actorName: `${actor.fullName} (${actor.rotaryId})`,
+        actorRole: actor.role,
+        module: 'Yönetim & Güvenlik',
+        action:
+          'Pilot Operasyonel Verisi Başlangıç Durumuna Sıfırlandı (Denetim Defteri Korundu)',
+        detail: `${existing.clubName} operasyonel tabloları sıfırlandı; SHA-256 denetim geçmişi silinmeden korundu.`,
+        timestamp,
+      });
+
+      fresh.auditLedger = [resetAuditEntry, ...preservedLedger];
+      this.state.tenants[clubId] = fresh;
+      this.state.updatedAt = fresh.updatedAt;
+      this.atomicWriteToDisk(this.state);
+      return this.state.tenants[clubId];
+    } catch (err) {
+      this.state.tenants[clubId] = rollbackSnapshot;
+      this.state.updatedAt = previousDbUpdatedAt;
+      throw err;
+    }
   }
 }
 
@@ -3527,17 +3582,26 @@ export const POSTGRESQL_RELATIONAL_SCHEMA_V5_4 = {
 } as const;
 
 /**
- * Issue #13, #14, #18, #19: Verifies relational & transactional invariants on a tenant database state:
- * - Primary key uniqueness across members, meetings, make-ups, certificates, financial items, and treasury ledger
- * - Foreign key integrity for meetingAttendances -> members/meetings and active certificates -> verifiedGuestAttendances
- * - Non-negative financial balances on all members and positive amounts on all treasury ledger entries
- * - Cryptographic SHA-256 hash chain continuity on auditLedger
+ * Issue #13, #14, #18, #19: Verifies relational & transactional invariants on a tenant database state
+ * AND honestly reports the active runtime storage engine (distinguishing single-process JSON file CAS
+ * from a live PostgreSQL ACID connection).
  */
 export function verifyTransactionalIntegrity(
-  tenant: TenantClubDatabaseState
+  tenant: TenantClubDatabaseState,
+  runtimeOptions?: {
+    storageEngine?: 'file-json-cas' | 'postgresql-acid';
+    isPostgresqlRuntimeActive?: boolean;
+  }
 ): {
   healthy: boolean;
   schemaVersion: string;
+  storageEngine: 'file-json-cas' | 'postgresql-acid';
+  isPostgresqlRuntimeActive: boolean;
+  acidTransactionGuarantee:
+    | 'single-process-file-rename-cas'
+    | 'postgresql-serializable-acid';
+  productionDatabaseReady: boolean;
+  postgresqlMigrationStatus: 'DDL_READY_RUNTIME_PENDING' | 'CONNECTED';
   clubId: string;
   revision: number;
   violations: string[];
@@ -3552,6 +3616,10 @@ export function verifyTransactionalIntegrity(
   };
 } {
   const violations: string[] = [];
+  const isPgActive = Boolean(runtimeOptions?.isPostgresqlRuntimeActive);
+  const storageEngine =
+    runtimeOptions?.storageEngine ||
+    (isPgActive ? 'postgresql-acid' : 'file-json-cas');
 
   const memberIds = new Set<string>();
   for (const m of tenant.members || []) {
@@ -3588,18 +3656,31 @@ export function verifyTransactionalIntegrity(
     }
   }
 
-  const verifiedGuestIds = new Set(
-    (tenant.verifiedGuestAttendances || []).map((v) => v.id)
+  const verifiedGuestById = new Map(
+    (tenant.verifiedGuestAttendances || []).map((v) => [v.id, v])
   );
   for (const cert of tenant.guestMakeupCards || []) {
-    if (
-      cert.status === 'Aktif' &&
-      cert.guestAttendanceRecordId &&
-      !verifiedGuestIds.has(cert.guestAttendanceRecordId)
-    ) {
-      violations.push(
-        `BROKEN_CERT_GUEST_ATTENDANCE_FK:${cert.id}->${cert.guestAttendanceRecordId}`
-      );
+    if (cert.status === 'Aktif' && cert.guestAttendanceRecordId) {
+      const linked = verifiedGuestById.get(cert.guestAttendanceRecordId);
+      if (!linked) {
+        violations.push(
+          `BROKEN_CERT_GUEST_ATTENDANCE_FK:${cert.id}->${cert.guestAttendanceRecordId}`
+        );
+      } else if (linked.revoked) {
+        violations.push(
+          `REVOKED_CERT_GUEST_ATTENDANCE_FK:${cert.id}->${cert.guestAttendanceRecordId}`
+        );
+      } else if (
+        linked.meetingNo !== cert.meetingNo ||
+        normalizePersonName(linked.guestName) !==
+          normalizePersonName(cert.guestName) ||
+        normalizePersonName(linked.guestClub) !==
+          normalizePersonName(cert.guestClub)
+      ) {
+        violations.push(
+          `MISMATCHED_CERT_GUEST_ATTENDANCE_IDENTITY:${cert.id}->${cert.guestAttendanceRecordId}`
+        );
+      }
     }
   }
 
@@ -3613,6 +3694,15 @@ export function verifyTransactionalIntegrity(
   return {
     healthy: violations.length === 0,
     schemaVersion: POSTGRESQL_RELATIONAL_SCHEMA_V5_4.version,
+    storageEngine,
+    isPostgresqlRuntimeActive: isPgActive,
+    acidTransactionGuarantee: isPgActive
+      ? 'postgresql-serializable-acid'
+      : 'single-process-file-rename-cas',
+    productionDatabaseReady: isPgActive && violations.length === 0,
+    postgresqlMigrationStatus: isPgActive
+      ? 'CONNECTED'
+      : 'DDL_READY_RUNTIME_PENDING',
     clubId: tenant.clubId,
     revision: tenant.revision,
     violations,
@@ -3627,4 +3717,3 @@ export function verifyTransactionalIntegrity(
     },
   };
 }
-

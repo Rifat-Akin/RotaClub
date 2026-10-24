@@ -122,6 +122,10 @@ export interface VerifiedGuestAttendanceRecord {
   verifiedAt: string;
   checkinMethod: 'Salon Kayıt Masası' | 'QR Teyit' | 'Protokol Defteri';
   evidenceNote: string;
+  revoked?: boolean;
+  revokedAt?: string;
+  revokedBy?: string;
+  revocationReason?: string;
 }
 
 export interface GuestRotaryMakeupCard {
@@ -361,8 +365,9 @@ export interface RotaryMember {
   lastRemindedAtIso?: string;
   meetingRsvps?: Record<string, RsvpStatus>;
   meetingMenus?: Record<string, MenuPreference>;
-  // Issue #24-#26: Member Lifecycle Status, Leave of Absence (LOA), & Candidate Objection Window
+  // Issue #24-#26 & #34: Member Lifecycle Status, Leave of Absence (LOA), Join Date, & Candidate Objection Window
   membershipStatus?: MembershipLifecycleStatus;
+  joinDate?: string;
   leaveStartDate?: string;
   leaveEndDate?: string;
   leaveReason?: string;
@@ -434,15 +439,42 @@ export interface AuditLogEntry {
   entryHash?: string;
 }
 
+export type BoardResolutionScope =
+  | 'GENERAL_GOVERNANCE'
+  | 'DEBT_WAIVER_ON_EXIT'
+  | 'HONORARY_MEMBERSHIP'
+  | 'BUDGET_REVISION';
+
 export interface BoardResolutionItem {
   id: string;
   resolutionNo: string;
+  decisionNo?: string;
   date: string;
   title: string;
+  category?: string;
   summary: string;
   voteStatus: 'Oybirliği ile Kabul' | 'Oyçokluğu ile Kabul';
   signedBy: string;
+  // Issue #24/#26: Server-Verified Scoped Board Resolution Metadata
+  clubId?: string;
+  resolutionScope?: BoardResolutionScope;
+  targetMemberId?: string;
+  targetMemberName?: string;
+  waivedAmountTL?: number;
+  approvalStatus?: 'Taslak' | 'Onaylandı' | 'İptal Edildi';
+  approvedByMemberId?: string;
+  approvedByRole?: ClubRole;
+  approvedAtIso?: string;
+  expiresAtIso?: string;
+  consumedAtIso?: string;
+  consumedByMemberId?: string;
+  serverVerified?: boolean;
 }
 
-
-
+export interface ClubAttendancePolicy {
+  policyVersion: string;
+  minimumAttendancePercent: number;
+  termStartDate: string;
+  termEndDate: string;
+  maxMakeupsPerTerm?: number;
+}

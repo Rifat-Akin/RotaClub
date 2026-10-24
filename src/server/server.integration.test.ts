@@ -9,11 +9,14 @@ import type { Server } from 'http';
 import { createPilotExpressApp } from '../../server';
 import {
   APPLE_WEBAUTHN_ROOT_CA_PEM,
+  AtomicMultiTenantStore,
   encodeCborAttestationObject,
   encodeCborCoseEc2P256Key,
   extractP256CoordinatesFromSpkiDer,
   loadTrustedWebAuthnRootCerts,
+  verifyAuditChain,
 } from './pilotEngine';
+import { SqlRelationalVerificationEngine } from './sqlRelationalEngine';
 
 function asn1Len(len: number): Buffer {
   if (len < 0x80) return Buffer.from([len]);
@@ -3800,7 +3803,7 @@ test('Issues #13/#14/#18/#19, #24-#26, #27/#28/#34, & #38-#44: Relational DB Hea
       TEST_PINS.sayman
     );
 
-    // 1. Relational DB Health check (#13, #14, #18, #19)
+    // 1. Honest Relational DB Health check (#13, #14, #18, #19)
     const dbHealthRes = await fetch(
       `${baseUrl}/api/pilot/db-health?clubId=club-galata`,
       {
@@ -3812,13 +3815,24 @@ test('Issues #13/#14/#18/#19, #24-#26, #27/#28/#34, & #38-#44: Relational DB Hea
     assert.equal(dbHealthBody.ok, true);
     assert.equal(dbHealthBody.healthy, true);
     assert.equal(dbHealthBody.violations.length, 0);
+    assert.equal(dbHealthBody.storageEngine, 'file-json-cas');
+    assert.equal(dbHealthBody.isPostgresqlRuntimeActive, false);
+    assert.equal(
+      dbHealthBody.acidTransactionGuarantee,
+      'single-process-file-rename-cas'
+    );
+    assert.equal(dbHealthBody.productionDatabaseReady, false);
+    assert.equal(
+      dbHealthBody.postgresqlMigrationStatus,
+      'DDL_READY_RUNTIME_PENDING'
+    );
     assert.equal(
       dbHealthBody.relationalSchema.version,
       '5.4.0-relational-hardened'
     );
 
     // 2. Member Lifecycle Management (#24-#26):
-    // 2a. Member with unsettled debt (m-rifat has dues/meal balance > 0) CANNOT transition to 'İstifa / Ayrıldı' without boardDebtWaiverApproved (422 UNSETTLED_MEMBER_BALANCE_ON_EXIT)
+    // 2a. Member with unsettled debt (m-rifat has dues/meal balance > 0) CANNOT transition to 'İstifa / Ayrıldı' without a server-verified Board Resolution (422 UNSETTLED_MEMBER_BALANCE_ON_EXIT)
     const blockedExitRes = await fetch(
       `${baseUrl}/api/pilot/member-lifecycle`,
       {
@@ -3948,10 +3962,17 @@ test('Issues #13/#14/#18/#19, #24-#26, #27/#28/#34, & #38-#44: Relational DB Hea
     assert.equal(attMetricsBody.meetingNo, 1842);
     assert.equal(typeof attMetricsBody.meetingKuverSummary.totalKuver, 'number');
     assert.equal(Array.isArray(attMetricsBody.memberMetrics), true);
+    // Future meeting #1842 (which has 0 check-ins and isPast=false) is excluded from held meetings!
+    const rifatMetric = attMetricsBody.memberMetrics.find(
+      (m: { memberId: string }) => m.memberId === 'm-rifat'
+    );
+    assert.equal(rifatMetric.futureScheduledExcludedCount >= 1, true);
     const honoraryMetric = attMetricsBody.memberMetrics.find(
       (m: { memberId: string }) => m.memberId === 'm-2'
     );
-    assert.equal(honoraryMetric.attendancePercentage, 100);
+    assert.equal(honoraryMetric.isApplicable, false);
+    assert.equal(honoraryMetric.calculationStatus, 'EXEMPT_HONORARY');
+    assert.equal(honoraryMetric.attendancePercentage, null);
     assert.equal(honoraryMetric.meetsRotary60PercentRule, true);
 
     // 5. AGENTS.md Invariant #4 & #24-#26 Negative Test: Attempting to mutate membershipStatus via generic /api/pilot/sync MUST fail with 422 LIFECYCLE_ENDPOINT_REQUIRED
@@ -4010,31 +4031,836 @@ test('Issues #13/#14/#18/#19, #24-#26, #27/#28/#34, & #38-#44: Relational DB Hea
     const postFailAuditLedger = store.getAuditLedger('club-galata');
     assert.equal(postFailTenant.revision, preFailRevision);
     assert.equal(postFailAuditLedger.length, preFailAuditLen);
-
-    // Verify canonical PostgreSQL DDL artifact src/server/postgresSchema.sql exists and defines all relational tables
-    const ddlSql = fs.readFileSync(
-      path.join(process.cwd(), 'src', 'server', 'postgresSchema.sql'),
-      'utf-8'
-    );
-    for (const tableName of [
-      'rotary_clubs',
-      'rotary_members',
-      'weekly_meetings',
-      'meeting_rsvps',
-      'meeting_attendances',
-      'verified_guest_attendances',
-      'makeup_submissions',
-      'guest_makeup_certificates',
-      'financial_line_items',
-      'treasury_ledger',
-      'chained_audit_ledger',
-    ]) {
-      assert.equal(
-        ddlSql.includes(`CREATE TABLE IF NOT EXISTS ${tableName}`),
-        true,
-        `Missing table ${tableName} in src/server/postgresSchema.sql`
-      );
-    }
   });
 });
+
+test('Priorities 1, 2, 3, & 4 (#24/#26, #34, #13/#18/#19, #36): Server-Verified Board Debt Waiver Resolution, Honest Term Attendance, Single-Write Restore/Reset & SQL Relational Engine, and Guest Certificate Tamper/Revocation Defense', async () => {
+  await withTestServer(
+    async (baseUrl, tmpDbFile, setServerTimeIso, store) => {
+      setServerTimeIso('2026-10-24T12:00:00.000Z');
+
+      const uyeSession = await loginRole(
+        baseUrl,
+        'TR-2420-88412',
+        TEST_PINS.uye
+      );
+      const sekreterSession = await loginRole(
+        baseUrl,
+        'TR-2420-81024',
+        TEST_PINS.sekreter
+      );
+      const saymanSession = await loginRole(
+        baseUrl,
+        'TR-2420-79310',
+        TEST_PINS.sayman
+      );
+      const baskanSession = await loginRole(
+        baseUrl,
+        'TR-2420-74105',
+        TEST_PINS.baskan
+      );
+      const karakoyBaskanSession = await loginRole(
+        baseUrl,
+        'TR-2420-KRK-01',
+        TEST_PINS.karakoyBaskan,
+        'club-karakoy'
+      );
+
+      // =========================================================================
+      // PRIORITY 1 (#24 / #26): Server-Verified Board Debt Waiver Resolution
+      // =========================================================================
+      // 1a. Client-supplied boolean boardDebtWaiverApproved: true is strictly rejected (422 UNVERIFIED_CLIENT_DEBT_WAIVER_FLAG)
+      const boolFlagBypassRes = await fetch(
+        `${baseUrl}/api/pilot/member-lifecycle`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${baskanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            targetMemberId: 'm-rifat',
+            targetStatus: 'İstifa / Ayrıldı',
+            reason: 'Boolean bayrak ile borç silme denemesi',
+            boardDebtWaiverApproved: true,
+          }),
+        }
+      );
+      assert.equal(boolFlagBypassRes.status, 422);
+      const boolFlagBypassBody = await boolFlagBypassRes.json();
+      assert.equal(
+        boolFlagBypassBody.error,
+        'UNVERIFIED_CLIENT_DEBT_WAIVER_FLAG'
+      );
+
+      // 1b. Non-existent / forged boardResolutionId is rejected (422 BOARD_RESOLUTION_NOT_FOUND)
+      const forgedResIdAttempt = await fetch(
+        `${baseUrl}/api/pilot/member-lifecycle`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${baskanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            targetMemberId: 'm-rifat',
+            targetStatus: 'İstifa / Ayrıldı',
+            reason: 'Sahte karar ID ile ayrılış denemesi',
+            boardResolutionId: 'res-forged-9999',
+          }),
+        }
+      );
+      assert.equal(forgedResIdAttempt.status, 422);
+      const forgedResIdBody = await forgedResIdAttempt.json();
+      assert.equal(forgedResIdBody.error, 'BOARD_RESOLUTION_NOT_FOUND');
+
+      // 1c. RBAC on /api/pilot/board-debt-waiver-resolution: uye and sekreter are forbidden (403); only sayman or baskan can approve debt waiver
+      for (const unauthorizedToken of [
+        uyeSession.token,
+        sekreterSession.token,
+      ]) {
+        const forbiddenWaiverRes = await fetch(
+          `${baseUrl}/api/pilot/board-debt-waiver-resolution`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${unauthorizedToken}`,
+            },
+            body: JSON.stringify({
+              clubId: 'club-galata',
+              targetMemberId: 'm-rifat',
+              waivedAmountTL: 10000,
+              title: 'Yetkisiz YK Kararı',
+            }),
+          }
+        );
+        assert.equal(forbiddenWaiverRes.status, 403);
+      }
+
+      // 1d. Attempting to forge a DEBT_WAIVER_ON_EXIT resolution via generic /api/pilot/sync is blocked (422 DIRECT_BOARD_WAIVER_RESOLUTION_FORBIDDEN)
+      const currentTenant = store.getTenantState('club-galata');
+      const syncForgedWaiverRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${baskanSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          expectedRevision: currentTenant.revision,
+          state: {
+            boardResolutions: [
+              ...(currentTenant.boardResolutions || []),
+              {
+                id: 'res-sync-forged',
+                resolutionNo: 'YK-SAHTE-1',
+                date: '24 Ekim 2026',
+                title: 'Sync üzerinden sahte borç muafiyeti',
+                category: 'Tüzük & Üyelik',
+                summary: 'Sahte ibra',
+                voteStatus: 'Oybirliği ile Kabul',
+                signedBy: 'Sahte İmza',
+                clubId: 'club-galata',
+                targetMemberId: 'm-rifat',
+                resolutionScope: 'DEBT_WAIVER_ON_EXIT',
+                waivedAmountTL: 99999,
+                approvalStatus: 'Onaylandı',
+                approvedByMemberId: 'm-emre',
+                approvedByRole: 'baskan',
+              },
+            ],
+          },
+        }),
+      });
+      assert.equal(syncForgedWaiverRes.status, 422);
+      const syncForgedWaiverBody = await syncForgedWaiverRes.json();
+      assert.equal(
+        syncForgedWaiverBody.error,
+        'DIRECT_BOARD_WAIVER_RESOLUTION_FORBIDDEN'
+      );
+
+      // 1e. Create a valid waiver resolution for ANOTHER member (m-3, Levent Soydan) and verify m-rifat cannot use it (422 BOARD_RESOLUTION_MEMBER_MISMATCH)
+      const m3WaiverRes = await fetch(
+        `${baseUrl}/api/pilot/board-debt-waiver-resolution`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${saymanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            targetMemberId: 'm-3',
+            waivedAmountTL: 15000,
+            title: 'YK 2026/40 - Borç İbrası',
+          }),
+        }
+      );
+      assert.equal(m3WaiverRes.status, 201);
+      const m3WaiverBody = await m3WaiverRes.json();
+
+      const wrongMemberWaiverAttempt = await fetch(
+        `${baseUrl}/api/pilot/member-lifecycle`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${baskanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            targetMemberId: 'm-rifat',
+            targetStatus: 'İstifa / Ayrıldı',
+            reason: 'Başka üyenin YK kararını kullanma denemesi',
+            boardResolutionId: m3WaiverBody.resolution.id,
+          }),
+        }
+      );
+      assert.equal(wrongMemberWaiverAttempt.status, 422);
+      const wrongMemberWaiverBody = await wrongMemberWaiverAttempt.json();
+      assert.equal(
+        wrongMemberWaiverBody.error,
+        'BOARD_RESOLUTION_MEMBER_MISMATCH'
+      );
+
+      // 1f. Create a waiver resolution in ANOTHER club (club-karakoy) and verify club-galata cannot use it
+      const karakoyTenant = store.getTenantState('club-karakoy');
+      const karakoyMemberId = karakoyTenant.members[0].id;
+      const karakoyWaiverRes = await fetch(
+        `${baseUrl}/api/pilot/board-debt-waiver-resolution`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${karakoyBaskanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-karakoy',
+            targetMemberId: karakoyMemberId,
+            waivedAmountTL: 15000,
+            title: 'Karaköy YK Kararı',
+          }),
+        }
+      );
+      assert.equal(karakoyWaiverRes.status, 201);
+      const karakoyWaiverBody = await karakoyWaiverRes.json();
+
+      const crossClubWaiverAttempt = await fetch(
+        `${baseUrl}/api/pilot/member-lifecycle`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${baskanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            targetMemberId: 'm-rifat',
+            targetStatus: 'İstifa / Ayrıldı',
+            reason: 'Başka kulübün YK kararını kullanma denemesi',
+            boardResolutionId: karakoyWaiverBody.resolution.id,
+          }),
+        }
+      );
+      assert.equal(crossClubWaiverAttempt.status, 422);
+
+      // 1g. Create an EXPIRED waiver resolution for m-rifat and verify it is rejected (422 BOARD_RESOLUTION_EXPIRED)
+      const shortLivedWaiverRes = await fetch(
+        `${baseUrl}/api/pilot/board-debt-waiver-resolution`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${baskanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            targetMemberId: 'm-rifat',
+            waivedAmountTL: 20000,
+            title: 'YK 2026/41 - Kısa Süreli Borç İbrası',
+            expiresInHours: 1,
+          }),
+        }
+      );
+      assert.equal(shortLivedWaiverRes.status, 201);
+      const shortLivedWaiverBody = await shortLivedWaiverRes.json();
+
+      // Advance server clock by 3 hours past expiry
+      setServerTimeIso('2026-10-24T15:00:00.000Z');
+      const expiredWaiverAttempt = await fetch(
+        `${baseUrl}/api/pilot/member-lifecycle`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${baskanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            targetMemberId: 'm-rifat',
+            targetStatus: 'İstifa / Ayrıldı',
+            reason: 'Süresi geçmiş YK kararı ile ayrılış denemesi',
+            boardResolutionId: shortLivedWaiverBody.resolution.id,
+          }),
+        }
+      );
+      assert.equal(expiredWaiverAttempt.status, 422);
+      const expiredWaiverBody = await expiredWaiverAttempt.json();
+      assert.equal(expiredWaiverBody.error, 'BOARD_RESOLUTION_EXPIRED');
+
+      // 1h. Create a valid, sufficient waiver resolution for m-rifat, execute exit transition,
+      // verify debt is zeroed & resolution is marked consumed, and verify replay fails!
+      const validRifatWaiverRes = await fetch(
+        `${baseUrl}/api/pilot/board-debt-waiver-resolution`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${baskanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            targetMemberId: 'm-rifat',
+            waivedAmountTL: 25000,
+            title: 'YK 2026/42 - Rifat Akın Tam Borç İbrası ve İstifa Onayı',
+            expiresInHours: 48,
+          }),
+        }
+      );
+      assert.equal(validRifatWaiverRes.status, 201);
+      const validRifatWaiverBody = await validRifatWaiverRes.json();
+
+      const validExitRes = await fetch(
+        `${baseUrl}/api/pilot/member-lifecycle`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sekreterSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            targetMemberId: 'm-rifat',
+            targetStatus: 'İstifa / Ayrıldı',
+            reason: 'YK 2026/42 sayılı borç ibrası kararı ile ayrılış',
+            boardResolutionId: validRifatWaiverBody.resolution.id,
+          }),
+        }
+      );
+      assert.equal(validExitRes.status, 200);
+      const validExitBody = await validExitRes.json();
+      assert.equal(validExitBody.member.membershipStatus, 'İstifa / Ayrıldı');
+      assert.equal(validExitBody.member.duesBalance, 0);
+      assert.equal(validExitBody.member.mealBalance, 0);
+      const consumedRes = validExitBody.state.boardResolutions.find(
+        (r: { id: string }) => r.id === validRifatWaiverBody.resolution.id
+      );
+      assert.equal(Boolean(consumedRes.consumedAtIso), true);
+
+      // Re-activate m-rifat and add debt to verify the consumed resolution CANNOT be replayed (422 BOARD_RESOLUTION_ALREADY_CONSUMED)
+      await fetch(`${baseUrl}/api/pilot/member-lifecycle`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${baskanSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          targetMemberId: 'm-rifat',
+          targetStatus: 'Aktif',
+          reason: 'Test amaçlı yeniden aktivasyon',
+        }),
+      });
+      await fetch(`${baseUrl}/api/pilot/bulk-accrual`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${saymanSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          category: 'Dönem Aidatı',
+          amount: 1000,
+          period: 'Aralık 2026 Test Aidatı',
+          description: 'Test Tahakkuku',
+        }),
+      });
+      const replayWaiverAttempt = await fetch(
+        `${baseUrl}/api/pilot/member-lifecycle`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${baskanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            targetMemberId: 'm-rifat',
+            targetStatus: 'İstifa / Ayrıldı',
+            reason: 'Tüketilmiş YK kararını tekrar kullanma denemesi',
+            boardResolutionId: validRifatWaiverBody.resolution.id,
+          }),
+        }
+      );
+      assert.equal(replayWaiverAttempt.status, 422);
+      const replayWaiverBody = await replayWaiverAttempt.json();
+      assert.equal(replayWaiverBody.error, 'BOARD_RESOLUTION_ALREADY_CONSUMED');
+
+      // =========================================================================
+      // PRIORITY 2 (#34): Honest Term Attendance, Zero-Meeting INSUFFICIENT_DATA, Date-Bounded Leave & Policy Config
+      // =========================================================================
+      // 2a. Transition m-4 (Emre Karaca) to 'İzinli (Muaf)' for 18 Ekim 2026 - 25 Ekim 2026
+      // Held past meetings in Galata: #1839 (06 Ekim), #1840 (13 Ekim), #1841 (20 Ekim). Only #1841 falls in [18 Ekim, 25 Ekim]!
+      const m4LeaveRes = await fetch(`${baseUrl}/api/pilot/member-lifecycle`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sekreterSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          targetMemberId: 'm-4',
+          targetStatus: 'İzinli (Muaf)',
+          reason: '18-25 Ekim tıbbi izin',
+          leaveStartDate: '18 Ekim 2026',
+          leaveEndDate: '25 Ekim 2026',
+        }),
+      });
+      assert.equal(m4LeaveRes.status, 200);
+
+      // Ensure m-4 is not checked in to #1841 so #1841 is counted as leave-exempt
+      const galataBeforeMetrics = store.getTenantState('club-galata');
+      store.updateTenant(
+        'club-galata',
+        (prev) => ({
+          ...prev,
+          meetingAttendances: {
+            ...(prev.meetingAttendances || {}),
+            '1841': ((prev.meetingAttendances || {})['1841'] || []).filter(
+              (id) => id !== 'm-4'
+            ),
+          },
+        }),
+        galataBeforeMetrics.revision
+      );
+
+      const customPolicyMetricsRes = await fetch(
+        `${baseUrl}/api/pilot/attendance-metrics?clubId=club-galata&meetingNo=1842&policyVersion=ROTARY-CLUB-CUSTOM-2026&minimumAttendancePercent=70&maxMakeupsPerTerm=2`,
+        {
+          headers: { Authorization: `Bearer ${sekreterSession.token}` },
+        }
+      );
+      assert.equal(customPolicyMetricsRes.status, 200);
+      const customPolicyMetricsBody = await customPolicyMetricsRes.json();
+      assert.equal(
+        customPolicyMetricsBody.policy.policyVersion,
+        'ROTARY-CLUB-CUSTOM-2026'
+      );
+      assert.equal(customPolicyMetricsBody.policy.minimumAttendancePercent, 70);
+      assert.equal(customPolicyMetricsBody.policy.maxMakeupsPerTerm, 2);
+
+      const m4Metric = customPolicyMetricsBody.memberMetrics.find(
+        (m: { memberId: string }) => m.memberId === 'm-4'
+      );
+      // Out of 2 held past meetings (13 Ekim #1840, 20 Ekim #1841), only 20 Ekim (#1841) is exempted by leave window; 1 meeting (#1840) remains obligatory!
+      assert.equal(m4Metric.heldMeetingsCount, 2);
+      assert.equal(m4Metric.exemptMeetingsCount, 1);
+      assert.equal(m4Metric.obligatoryMeetingsCount, 1);
+      assert.equal(m4Metric.isApplicable, true);
+
+      // 2b. Query with a narrow term window where 0 meetings have been held -> must return INSUFFICIENT_DATA & null percentage (NOT 100%)
+      const zeroMeetingMetricsRes = await fetch(
+        `${baseUrl}/api/pilot/attendance-metrics?clubId=club-galata&termStartDate=01%20Temmuz%202026&termEndDate=15%20Temmuz%202026`,
+        {
+          headers: { Authorization: `Bearer ${sekreterSession.token}` },
+        }
+      );
+      assert.equal(zeroMeetingMetricsRes.status, 200);
+      const zeroMeetingMetricsBody = await zeroMeetingMetricsRes.json();
+      const rifatZeroMetric = zeroMeetingMetricsBody.memberMetrics.find(
+        (m: { memberId: string }) => m.memberId === 'm-rifat'
+      );
+      assert.equal(rifatZeroMetric.heldMeetingsCount, 0);
+      assert.equal(rifatZeroMetric.calculationStatus, 'INSUFFICIENT_DATA');
+      assert.equal(rifatZeroMetric.isApplicable, false);
+      assert.equal(rifatZeroMetric.attendancePercentage, null);
+      assert.equal(rifatZeroMetric.meetsRotary60PercentRule, false);
+
+      // =========================================================================
+      // PRIORITY 4 (#36): Guest Certificate Person-Bound Attendance, Tamper & Revocation Defense
+      // =========================================================================
+      // 4a. Record a verified guest attendance for meeting #1842 via /api/pilot/guest-checkin
+      const guestCheckinRes = await fetch(
+        `${baseUrl}/api/pilot/guest-checkin`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sekreterSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            meetingNo: 1842,
+            guestName: 'Dr. Selin Demir',
+            guestClub: 'Beşiktaş Rotary Kulübü',
+            checkinMethod: 'Salon Kayıt Masası',
+            evidenceNote: 'Kayıt masası imza föyü sıra #12',
+          }),
+        }
+      );
+      assert.equal(guestCheckinRes.status, 200);
+      const guestCheckinBody = await guestCheckinRes.json();
+      const guestAttendanceId = guestCheckinBody.guestAttendanceRecord.id;
+
+      // 4b. Attempting to mutate or wipe verifiedGuestAttendances via /api/pilot/sync is strictly forbidden (422 DIRECT_GUEST_ATTENDANCE_MUTATION_FORBIDDEN)
+      const mutateGuestAttViaSyncRes = await fetch(
+        `${baseUrl}/api/pilot/sync`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sekreterSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            expectedRevision: guestCheckinBody.revision,
+            state: {
+              verifiedGuestAttendances: [],
+            },
+          }),
+        }
+      );
+      assert.equal(mutateGuestAttViaSyncRes.status, 422);
+      const mutateGuestAttViaSyncBody = await mutateGuestAttViaSyncRes.json();
+      assert.equal(
+        mutateGuestAttViaSyncBody.error,
+        'DIRECT_GUEST_ATTENDANCE_MUTATION_FORBIDDEN'
+      );
+
+      // 4c. Create a Draft guest certificate via /api/pilot/sync and notice how /sync ignores spoofed client auditEvent text
+      const latestTenantBeforeDraft = store.getTenantState('club-galata');
+      const createDraftCertRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sekreterSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          expectedRevision: latestTenantBeforeDraft.revision,
+          state: {
+            guestMakeupCards: [
+              ...(latestTenantBeforeDraft.guestMakeupCards || []),
+              {
+                id: 'gmc-selin-1842',
+                guestName: 'Dr. Selin Demir',
+                guestClub: 'Beşiktaş Rotary Kulübü',
+                guestDistrict: 'UR 2420. Bölge',
+                guestEmail: 'selin.demir@besiktasrotary.org',
+                meetingNo: 1842,
+                meetingDate: '24 Ekim 2026',
+                sentAt: '24 Ekim 2026 · 15:00',
+                verificationCode: 'DRAFT-PENDING',
+                status: 'Taslak',
+              },
+            ],
+          },
+          auditEvent: {
+            module: 'Sahte Modül',
+            action: 'CLIENT_FORGED_AUDIT_ACTION',
+            detail: 'İstemci tarafından uydurulmuş sahte denetim detayı',
+          },
+        }),
+      });
+      assert.equal(createDraftCertRes.status, 200);
+
+      // Verify Priority 3 (#13/#18): Server ignored client-supplied auditEvent text and recorded server-derived diff
+      const auditLedgerAfterSync = store.getAuditLedger('club-galata');
+      const latestSyncAudit = auditLedgerAfterSync[0];
+      assert.notEqual(latestSyncAudit.action, 'CLIENT_FORGED_AUDIT_ACTION');
+      assert.equal(
+        latestSyncAudit.action.startsWith(
+          'Sunucu Doğrulamalı Durum Güncellemesi ['
+        ),
+        true
+      );
+      assert.equal(
+        latestSyncAudit.detail.includes('guestMakeupCards'),
+        true
+      );
+
+      // 4d. Approve certificate with verified guestAttendanceRecordId
+      const approveCertRes = await fetch(
+        `${baseUrl}/api/pilot/approve-certificate`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sekreterSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            certificateId: 'gmc-selin-1842',
+            guestAttendanceRecordId: guestAttendanceId,
+            attendanceEvidence: `Salon kayıt masası doğrulaması (${guestAttendanceId})`,
+          }),
+        }
+      );
+      assert.equal(approveCertRes.status, 200);
+      const approveCertBody = await approveCertRes.json();
+      const verificationCode = approveCertBody.certificate.verificationCode;
+
+      // Verify valid certificate passes verification
+      const verifyOkRes = await fetch(
+        `${baseUrl}/api/pilot/verify-certificate?clubId=club-galata&code=${encodeURIComponent(verificationCode)}`,
+        {
+          headers: { Authorization: `Bearer ${sekreterSession.token}` },
+        }
+      );
+      assert.equal(verifyOkRes.status, 200);
+      const verifyOkBody = await verifyOkRes.json();
+      assert.equal(verifyOkBody.valid, true);
+      assert.equal(
+        verifyOkBody.certificate.guestAttendanceRecordId,
+        guestAttendanceId
+      );
+
+      // 4d-bis. Tampering with attendanceEvidence on the stored certificate invalidates HMAC (422 CERTIFICATE_INTEGRITY_MISMATCH)
+      const beforeEvidenceTamper = store.getTenantState('club-galata');
+      const originalEvidence = verifyOkBody.certificate.attendanceEvidence;
+      store.updateTenant(
+        'club-galata',
+        (prev) => ({
+          ...prev,
+          guestMakeupCards: (prev.guestMakeupCards || []).map((c) =>
+            c.id === 'gmc-selin-1842'
+              ? { ...c, attendanceEvidence: 'SONRADAN_DEGISTIRILMIS_KANIT' }
+              : c
+          ),
+        }),
+        beforeEvidenceTamper.revision
+      );
+      const verifyTamperedEvidenceRes = await fetch(
+        `${baseUrl}/api/pilot/verify-certificate?clubId=club-galata&code=${encodeURIComponent(verificationCode)}`
+      );
+      assert.equal(verifyTamperedEvidenceRes.status, 422);
+      const verifyTamperedEvidenceBody = await verifyTamperedEvidenceRes.json();
+      assert.equal(
+        verifyTamperedEvidenceBody.error,
+        'CERTIFICATE_INTEGRITY_MISMATCH'
+      );
+
+      // Restore original attendanceEvidence and test tampering with the underlying verifiedGuestAttendances identity -> 422 GUEST_ATTENDANCE_IDENTITY_MISMATCH
+      const beforeIdentityTamper = store.getTenantState('club-galata');
+      store.updateTenant(
+        'club-galata',
+        (prev) => ({
+          ...prev,
+          guestMakeupCards: (prev.guestMakeupCards || []).map((c) =>
+            c.id === 'gmc-selin-1842'
+              ? { ...c, attendanceEvidence: originalEvidence }
+              : c
+          ),
+          verifiedGuestAttendances: (prev.verifiedGuestAttendances || []).map(
+            (v) =>
+              v.id === guestAttendanceId
+                ? { ...v, guestName: 'Başka Bir Misafir' }
+                : v
+          ),
+        }),
+        beforeIdentityTamper.revision
+      );
+      const verifyIdentityMismatchRes = await fetch(
+        `${baseUrl}/api/pilot/verify-certificate?clubId=club-galata&code=${encodeURIComponent(verificationCode)}`
+      );
+      assert.equal(verifyIdentityMismatchRes.status, 422);
+      const verifyIdentityMismatchBody = await verifyIdentityMismatchRes.json();
+      assert.equal(
+        verifyIdentityMismatchBody.error,
+        'GUEST_ATTENDANCE_IDENTITY_MISMATCH'
+      );
+
+      // Restore guestName before testing official revocation via /api/pilot/revoke-guest-checkin
+      const beforeRestoreGuestName = store.getTenantState('club-galata');
+      store.updateTenant(
+        'club-galata',
+        (prev) => ({
+          ...prev,
+          verifiedGuestAttendances: (prev.verifiedGuestAttendances || []).map(
+            (v) =>
+              v.id === guestAttendanceId
+                ? { ...v, guestName: 'Dr. Selin Demir' }
+                : v
+          ),
+        }),
+        beforeRestoreGuestName.revision
+      );
+
+      // 4e. Revoke the underlying guest check-in via POST /api/pilot/revoke-guest-checkin
+      const revokeGuestRes = await fetch(
+        `${baseUrl}/api/pilot/revoke-guest-checkin`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${baskanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            guestAttendanceRecordId: guestAttendanceId,
+            reason: 'Yanlış masa kaydı nedeniyle misafir yoklaması iptal edildi',
+          }),
+        }
+      );
+      assert.equal(revokeGuestRes.status, 200);
+
+      // Now verifying the certificate MUST fail with 422 GUEST_ATTENDANCE_EVIDENCE_REVOKED
+      const verifyAfterRevokeRes = await fetch(
+        `${baseUrl}/api/pilot/verify-certificate?clubId=club-galata&code=${encodeURIComponent(verificationCode)}`
+      );
+      assert.equal(verifyAfterRevokeRes.status, 422);
+      const verifyAfterRevokeBody = await verifyAfterRevokeRes.json();
+      assert.equal(
+        verifyAfterRevokeBody.error,
+        'GUEST_ATTENDANCE_EVIDENCE_REVOKED'
+      );
+
+      // And /api/pilot/db-health must detect that an active certificate points to a revoked guest attendance!
+      const dbHealthAfterRevokeRes = await fetch(
+        `${baseUrl}/api/pilot/db-health?clubId=club-galata`,
+        {
+          headers: { Authorization: `Bearer ${sekreterSession.token}` },
+        }
+      );
+      const dbHealthAfterRevokeBody = await dbHealthAfterRevokeRes.json();
+      assert.equal(dbHealthAfterRevokeBody.healthy, false);
+      assert.equal(
+        dbHealthAfterRevokeBody.violations.some((v: string) =>
+          v.includes('REVOKED_CERT_GUEST_ATTENDANCE_FK')
+        ),
+        true
+      );
+
+      // =========================================================================
+      // PRIORITY 3 (#13 / #18 / #19): Disk Write Failure Injection, Single-Write Restore/Reset, Restart Read-Back & Real SQL Execution
+      // =========================================================================
+      // 3a. Take a verified backup snapshot before testing disk write failures and reset
+      const backupSnapshot = store.getTenantBackupSnapshot('club-galata');
+
+      // 3b. Inject disk write failure during updateTenant -> must roll back in-memory state & audit ledger
+      const preDiskFailRev = store.getTenantState('club-galata').revision;
+      const preDiskFailAuditCount = store.getAuditLedger('club-galata').length;
+      store.setWriteFailureHook(() => {
+        throw new Error('ENOSPC_SIMULATED_DISK_WRITE_FAILURE');
+      });
+      assert.throws(() => {
+        store.updateTenant(
+          'club-galata',
+          (prev) => ({ ...prev, selectedMeetingNo: 9999 }),
+          preDiskFailRev,
+          {
+            actorName: 'Disk Failure Test',
+            actorRole: 'baskan',
+            module: 'Yönetim & Güvenlik',
+            action: 'Disk Write Failure Test',
+            detail: 'Should roll back on ENOSPC',
+            timestamp: '24 Ekim 2026 · 16:00',
+          }
+        );
+      }, /ENOSPC_SIMULATED_DISK_WRITE_FAILURE/);
+      store.setWriteFailureHook(null);
+
+      assert.equal(
+        store.getTenantState('club-galata').revision,
+        preDiskFailRev
+      );
+      assert.equal(
+        store.getAuditLedger('club-galata').length,
+        preDiskFailAuditCount
+      );
+
+      // 3c. Inject disk write failure during resetTenantOperationalData -> must roll back state & audit atomically
+      const baskanActor = {
+        memberId: 'm-emre',
+        rotaryId: 'TR-2420-74105',
+        fullName: 'Rtn. Mimar Emre Karaca',
+        email: 'baskan@galatarotary.org',
+        role: 'baskan' as const,
+        clubId: 'club-galata' as const,
+        jti: 'test-jti',
+        iat: Math.floor(Date.now() / 1000),
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      };
+      store.setWriteFailureHook(() => {
+        throw new Error('EIO_SIMULATED_RESET_WRITE_FAILURE');
+      });
+      assert.throws(() => {
+        store.resetTenantOperationalData(
+          'club-galata',
+          baskanActor,
+          '24 Ekim 2026 · 16:05'
+        );
+      }, /EIO_SIMULATED_RESET_WRITE_FAILURE/);
+      store.setWriteFailureHook(null);
+      assert.equal(
+        store.getTenantState('club-galata').revision,
+        preDiskFailRev
+      );
+
+      // 3d. Restore tenant from verified backup snapshot (single-write atomic restore) and verify read-back across fresh store restart
+      const restoreRes = store.restoreTenantFromVerifiedBackup({
+        clubId: 'club-galata',
+        backupPayload: backupSnapshot,
+        actor: baskanActor,
+        timestamp: '24 Ekim 2026 · 16:10',
+      });
+      assert.equal(restoreRes.ok, true);
+      if (restoreRes.ok) {
+        assert.equal(restoreRes.state.revision, preDiskFailRev + 1);
+      }
+
+      const restartedStore = new AtomicMultiTenantStore(tmpDbFile);
+      const readBackTenant = restartedStore.getTenantState('club-galata');
+      assert.equal(readBackTenant.revision, preDiskFailRev + 1);
+      const chainVerification = verifyAuditChain(
+        readBackTenant.auditLedger,
+        'club-galata'
+      );
+      assert.equal(chainVerification.valid, true);
+
+      // 3e. Real SQL Relational Engine Verification (executes src/server/postgresSchema.sql DDL + FK + UNIQUE + CHECK + ACID ROLLBACK)
+      const sqlEngine = new SqlRelationalVerificationEngine();
+      try {
+        const schemaReport = sqlEngine.verifySchemaAndConstraints();
+        assert.equal(schemaReport.ddlLoaded, true);
+        assert.equal(schemaReport.tableCount, 11);
+        assert.equal(schemaReport.foreignKeysEnforced, true);
+        assert.equal(schemaReport.uniqueConstraintsEnforced, true);
+        assert.equal(schemaReport.checkConstraintsEnforced, true);
+        assert.equal(schemaReport.acidRollbackVerified, true);
+
+        // Migrate tenant state into real SQL tables and verify row counts match
+        const sqlMigrationCounts = sqlEngine.migrateTenantToSql(readBackTenant);
+        assert.equal(
+          sqlMigrationCounts.members,
+          readBackTenant.members.length
+        );
+        assert.equal(
+          sqlMigrationCounts.meetings,
+          readBackTenant.meetings.length
+        );
+        assert.equal(
+          sqlMigrationCounts.auditEntries,
+          readBackTenant.auditLedger.length
+        );
+      } finally {
+        sqlEngine.close();
+      }
+    }
+  );
+});
+
 

@@ -1,4 +1,6 @@
 import {
+  BoardResolutionItem,
+  ClubAttendancePolicy,
   FinancialLineItem,
   LcvReminderQueueItem,
   MakeupSubmission,
@@ -1380,89 +1382,311 @@ export function maskGuestNameForPublicVerification(fullName: string): string {
   return `${hasRtnPrefix ? 'Rtn. ' : ''}${maskedParts.join(' ')}`;
 }
 
+const TURKISH_MONTH_MAP: Record<string, number> = {
+  ocak: 0,
+  şubat: 1,
+  subat: 1,
+  mart: 2,
+  nisan: 3,
+  mayıs: 4,
+  mayis: 4,
+  haziran: 5,
+  temmuz: 6,
+  ağustos: 7,
+  agustos: 7,
+  eylül: 8,
+  eylul: 8,
+  ekim: 9,
+  kasım: 10,
+  kasim: 10,
+  aralık: 11,
+  aralik: 11,
+};
+
+/**
+ * Deterministic date parser supporting ISO-8601 ("2026-10-20"), dot/slash ("20.10.2026"),
+ * and Turkish calendar labels ("20 Ekim 2026 Salı", "13 Ekim 2026 · 19:30").
+ * Normalizes to UTC midnight (00:00:00Z) for consistent date-window comparisons (#25, #34).
+ */
+export function parseRotaryDateToEpochMs(dateStr?: string): number | null {
+  if (!dateStr || typeof dateStr !== 'string') return null;
+  const raw = dateStr.trim();
+  if (!raw) return null;
+
+  // 1. ISO YYYY-MM-DD prefix
+  const isoMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (isoMatch) {
+    const y = Number(isoMatch[1]);
+    const m = Number(isoMatch[2]) - 1;
+    const d = Number(isoMatch[3]);
+    if (m >= 0 && m <= 11 && d >= 1 && d <= 31) {
+      return Date.UTC(y, m, d);
+    }
+  }
+
+  // 2. DD.MM.YYYY or DD/MM/YYYY
+  const dmyMatch = raw.match(/^(\d{1,2})[./](\d{1,2})[./](\d{4})/);
+  if (dmyMatch) {
+    const d = Number(dmyMatch[1]);
+    const m = Number(dmyMatch[2]) - 1;
+    const y = Number(dmyMatch[3]);
+    if (m >= 0 && m <= 11 && d >= 1 && d <= 31) {
+      return Date.UTC(y, m, d);
+    }
+  }
+
+  // 3. Turkish "<day> <MonthName> <year>" anywhere in string
+  const trMatch = raw
+    .toLocaleLowerCase('tr-TR')
+    .match(/(\d{1,2})\s+([a-zçğıöşü]+)\s+(\d{4})/i);
+  if (trMatch) {
+    const d = Number(trMatch[1]);
+    const monthName = trMatch[2].toLocaleLowerCase('tr-TR');
+    const y = Number(trMatch[3]);
+    const m = TURKISH_MONTH_MAP[monthName];
+    if (m !== undefined && d >= 1 && d <= 31) {
+      return Date.UTC(y, m, d);
+    }
+  }
+
+  const fallback = Date.parse(raw);
+  if (!Number.isNaN(fallback)) {
+    const dt = new Date(fallback);
+    return Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate());
+  }
+  return null;
+}
+
+export const DEFAULT_CLUB_ATTENDANCE_POLICY: ClubAttendancePolicy = {
+  policyVersion: 'UR-2420-2026.1',
+  minimumAttendancePercent: 60,
+  termStartDate: '2026-07-01',
+  termEndDate: '2027-06-30',
+  maxMakeupsPerTerm: 12,
+};
+
+export type AttendanceCalculationStatus =
+  | 'EVALUATED'
+  | 'INSUFFICIENT_DATA'
+  | 'EXEMPT_ALL_LEAVE'
+  | 'EXEMPT_HONORARY';
+
 export interface TermAttendanceMetrics {
   memberId: string;
+  policyVersion: string;
+  minimumRequiredPercent: number;
+  calculationStatus: AttendanceCalculationStatus;
+  isApplicable: boolean;
   heldMeetingsCount: number;
+  futureScheduledExcludedCount: number;
+  cancelledExcludedCount: number;
+  preJoinExcludedMeetingsCount: number;
+  outOfTermExcludedMeetingsCount: number;
   exemptMeetingsCount: number;
   obligatoryMeetingsCount: number;
   directAttendedMeetingsCount: number;
+  approvedMakeupsCount: number;
   approvedMakeupsApplied: number;
   creditedMeetingsCount: number;
-  attendancePercentage: number;
+  attendancePercentage: number | null;
+  meetsClubAttendancePolicy: boolean | null;
   meetsRotary60PercentRule: boolean;
 }
 
 /**
+ * Checks whether a specific meeting date (`meetingDateMs`) falls within any approved
+ * leave-of-absence (LOA) window for the member (#25, #34).
+ */
+export function isMeetingDateCoveredByMemberLeave(
+  member: Pick<
+    RotaryMember,
+    'membershipStatus' | 'leaveStartDate' | 'leaveEndDate' | 'lifecycleHistory'
+  >,
+  meetingDateMs: number | null
+): boolean {
+  if (meetingDateMs === null) return false;
+
+  const checkWindow = (startStr?: string, endStr?: string): boolean => {
+    const startMs = parseRotaryDateToEpochMs(startStr);
+    const endMs = parseRotaryDateToEpochMs(endStr);
+    if (startMs === null || endMs === null || startMs > endMs) return false;
+    return meetingDateMs >= startMs && meetingDateMs <= endMs;
+  };
+
+  if (checkWindow(member.leaveStartDate, member.leaveEndDate)) {
+    return true;
+  }
+
+  if (Array.isArray(member.lifecycleHistory)) {
+    for (const h of member.lifecycleHistory) {
+      if (
+        h.toStatus === 'İzinli (Muaf)' &&
+        checkWindow(h.leaveStartDate, h.leaveEndDate)
+      ) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
  * Issue #27, #28, #34: Real meeting-by-meeting term attendance calculation.
- * Computes attendance percentage from actual held (non-cancelled) meetings,
- * verified direct meeting attendances (`meetingAttendances[String(meetingNo)]`),
- * approved make-ups bound to `memberId` (deduplicated by activity key),
- * and excused/exempt leave status (`membershipStatus === 'İzinli (Muaf)'` or `'Onur Üyesi'`).
+ * - Never counts future scheduled `'Aktif'` or `'Planlandı'` meetings with 0 check-ins as held.
+ * - Never fabricates 100% attendance when 0 meetings were held (`calculationStatus: 'INSUFFICIENT_DATA'`, `attendancePercentage: null`).
+ * - Binds leave-of-absence (`İzinli (Muaf)`) exemptions strictly to the meeting date falling within `[leaveStartDate, leaveEndDate]`.
+ * - Enforces term window (`termStartDate`..`termEndDate`), member join date (`joinDate` / `joinYear`), make-up term cap (`maxMakeupsPerTerm`), and configurable club policy version (`policyVersion`, `minimumAttendancePercent`).
  */
 export function calculateTermAttendanceMetrics(params: {
   member: Pick<
     RotaryMember,
-    'id' | 'fullName' | 'membershipStatus' | 'attendancePercent'
+    | 'id'
+    | 'fullName'
+    | 'membershipStatus'
+    | 'attendancePercent'
+    | 'joinYear'
+    | 'joinDate'
+    | 'leaveStartDate'
+    | 'leaveEndDate'
+    | 'lifecycleHistory'
   >;
   meetings: WeeklyMeeting[];
   meetingAttendances: Record<string, string[]>;
   makeupSubmissions: MakeupSubmission[];
   allMembers?: Pick<RotaryMember, 'id' | 'fullName'>[];
+  policy?: Partial<ClubAttendancePolicy>;
+  evaluationDate?: string;
 }): TermAttendanceMetrics {
   const { member, meetings, meetingAttendances, makeupSubmissions, allMembers } =
     params;
 
+  const effectivePolicy: ClubAttendancePolicy = {
+    ...DEFAULT_CLUB_ATTENDANCE_POLICY,
+    ...(params.policy || {}),
+  };
+  const termStartMs = parseRotaryDateToEpochMs(effectivePolicy.termStartDate);
+  const termEndMs = parseRotaryDateToEpochMs(effectivePolicy.termEndDate);
+  const evaluationMs = parseRotaryDateToEpochMs(params.evaluationDate);
+  const memberJoinMs = parseRotaryDateToEpochMs(member.joinDate);
+
+  let futureScheduledExcludedCount = 0;
+  let cancelledExcludedCount = 0;
+  let preJoinExcludedMeetingsCount = 0;
+  let outOfTermExcludedMeetingsCount = 0;
+  const heldMeetings: Array<{ meeting: WeeklyMeeting; meetingDateMs: number | null }> = [];
+
+  for (const m of meetings) {
+    if (m.status === 'İptal Edildi') {
+      cancelledExcludedCount += 1;
+      continue;
+    }
+
+    const meetingDateMs = parseRotaryDateToEpochMs(m.date);
+    if (
+      meetingDateMs !== null &&
+      ((termStartMs !== null && meetingDateMs < termStartMs) ||
+        (termEndMs !== null && meetingDateMs > termEndMs))
+    ) {
+      outOfTermExcludedMeetingsCount += 1;
+      continue;
+    }
+
+    const attendees = meetingAttendances[String(m.meetingNo)] || [];
+    const hasOccurred =
+      m.isPast === true ||
+      m.status === 'Tamamlandı' ||
+      attendees.length > 0;
+
+    // Issue #34 Fix: Never count a future scheduled 'Aktif' or 'Planlandı' meeting as held!
+    if (
+      !hasOccurred ||
+      (evaluationMs !== null &&
+        meetingDateMs !== null &&
+        meetingDateMs > evaluationMs &&
+        attendees.length === 0 &&
+        m.status !== 'Tamamlandı')
+    ) {
+      futureScheduledExcludedCount += 1;
+      continue;
+    }
+
+    // Exclude meetings held before the member joined the club (#34)
+    if (
+      (memberJoinMs !== null &&
+        meetingDateMs !== null &&
+        meetingDateMs < memberJoinMs) ||
+      (memberJoinMs === null &&
+        typeof member.joinYear === 'number' &&
+        meetingDateMs !== null &&
+        new Date(meetingDateMs).getUTCFullYear() < member.joinYear)
+    ) {
+      preJoinExcludedMeetingsCount += 1;
+      continue;
+    }
+
+    heldMeetings.push({ meeting: m, meetingDateMs });
+  }
+
+  const heldMeetingsCount = heldMeetings.length;
+
   if (member.membershipStatus === 'Onur Üyesi') {
     return {
       memberId: member.id,
-      heldMeetingsCount: meetings.filter((m) => m.status !== 'İptal Edildi')
-        .length,
-      exemptMeetingsCount: meetings.filter((m) => m.status !== 'İptal Edildi')
-        .length,
+      policyVersion: effectivePolicy.policyVersion,
+      minimumRequiredPercent: effectivePolicy.minimumAttendancePercent,
+      calculationStatus: 'EXEMPT_HONORARY',
+      isApplicable: false,
+      heldMeetingsCount,
+      futureScheduledExcludedCount,
+      cancelledExcludedCount,
+      preJoinExcludedMeetingsCount,
+      outOfTermExcludedMeetingsCount,
+      exemptMeetingsCount: heldMeetingsCount,
       obligatoryMeetingsCount: 0,
       directAttendedMeetingsCount: 0,
+      approvedMakeupsCount: 0,
       approvedMakeupsApplied: 0,
       creditedMeetingsCount: 0,
-      attendancePercentage: 100,
+      attendancePercentage: null,
+      meetsClubAttendancePolicy: null,
       meetsRotary60PercentRule: true,
     };
   }
 
-  // Count non-cancelled meetings that are completed, past, or already have recorded attendances
-  const heldMeetings = meetings.filter((m) => {
-    if (m.status === 'İptal Edildi') return false;
-    const attendees = meetingAttendances[String(m.meetingNo)] || [];
-    return (
-      m.isPast === true ||
-      m.status === 'Tamamlandı' ||
-      m.status === 'Aktif' ||
-      attendees.length > 0
-    );
-  });
-
-  const heldMeetingsCount = heldMeetings.length;
+  // Issue #34 Fix: When 0 meetings have been held, do NOT fabricate 100% attendance!
   if (heldMeetingsCount === 0) {
     return {
       memberId: member.id,
+      policyVersion: effectivePolicy.policyVersion,
+      minimumRequiredPercent: effectivePolicy.minimumAttendancePercent,
+      calculationStatus: 'INSUFFICIENT_DATA',
+      isApplicable: false,
       heldMeetingsCount: 0,
+      futureScheduledExcludedCount,
+      cancelledExcludedCount,
+      preJoinExcludedMeetingsCount,
+      outOfTermExcludedMeetingsCount,
       exemptMeetingsCount: 0,
       obligatoryMeetingsCount: 0,
       directAttendedMeetingsCount: 0,
+      approvedMakeupsCount: 0,
       approvedMakeupsApplied: 0,
       creditedMeetingsCount: 0,
-      attendancePercentage: member.attendancePercent || 100,
-      meetsRotary60PercentRule: (member.attendancePercent || 100) >= 60,
+      attendancePercentage: null,
+      meetsClubAttendancePolicy: null,
+      meetsRotary60PercentRule: false,
     };
   }
 
   let directAttendedMeetingsCount = 0;
   let exemptMeetingsCount = 0;
 
-  for (const m of heldMeetings) {
+  for (const { meeting: m, meetingDateMs } of heldMeetings) {
     const attendees = meetingAttendances[String(m.meetingNo)] || [];
     if (attendees.includes(member.id)) {
       directAttendedMeetingsCount += 1;
-    } else if (member.membershipStatus === 'İzinli (Muaf)') {
+    } else if (isMeetingDateCoveredByMemberLeave(member, meetingDateMs)) {
       exemptMeetingsCount += 1;
     }
   }
@@ -1472,7 +1696,31 @@ export function calculateTermAttendanceMetrics(params: {
     heldMeetingsCount - exemptMeetingsCount
   );
 
-  // Deduplicate approved make-up submissions belonging to this member
+  if (obligatoryMeetingsCount === 0) {
+    return {
+      memberId: member.id,
+      policyVersion: effectivePolicy.policyVersion,
+      minimumRequiredPercent: effectivePolicy.minimumAttendancePercent,
+      calculationStatus: 'EXEMPT_ALL_LEAVE',
+      isApplicable: false,
+      heldMeetingsCount,
+      futureScheduledExcludedCount,
+      cancelledExcludedCount,
+      preJoinExcludedMeetingsCount,
+      outOfTermExcludedMeetingsCount,
+      exemptMeetingsCount,
+      obligatoryMeetingsCount: 0,
+      directAttendedMeetingsCount,
+      approvedMakeupsCount: 0,
+      approvedMakeupsApplied: 0,
+      creditedMeetingsCount: directAttendedMeetingsCount,
+      attendancePercentage: null,
+      meetsClubAttendancePolicy: null,
+      meetsRotary60PercentRule: true,
+    };
+  }
+
+  // Deduplicate approved make-up submissions belonging to this member within the active term window
   const seenActivityKeys = new Set<string>();
   let uniqueApprovedMakeups = 0;
   for (const sub of makeupSubmissions) {
@@ -1481,6 +1729,16 @@ export function calculateTermAttendanceMetrics(params: {
       sub.memberId ||
       resolveUnambiguousLegacyMemberId(sub.memberName, allMembers);
     if (effectiveMemberId !== member.id) continue;
+
+    const subDateMs = parseRotaryDateToEpochMs(sub.date);
+    if (
+      subDateMs !== null &&
+      ((termStartMs !== null && subDateMs < termStartMs) ||
+        (termEndMs !== null && subDateMs > termEndMs))
+    ) {
+      continue;
+    }
+
     const key = buildMakeupActivityKey({
       memberId: member.id,
       date: sub.date,
@@ -1492,54 +1750,84 @@ export function calculateTermAttendanceMetrics(params: {
     uniqueApprovedMakeups += 1;
   }
 
+  const maxMakeupsCap =
+    typeof effectivePolicy.maxMakeupsPerTerm === 'number' &&
+    effectivePolicy.maxMakeupsPerTerm >= 0
+      ? effectivePolicy.maxMakeupsPerTerm
+      : uniqueApprovedMakeups;
+  const cappedMakeups = Math.min(uniqueApprovedMakeups, maxMakeupsCap);
+
   const missedMeetingsCount = Math.max(
     0,
     obligatoryMeetingsCount - directAttendedMeetingsCount
   );
-  const approvedMakeupsApplied = Math.min(
-    missedMeetingsCount,
-    uniqueApprovedMakeups
-  );
+  const approvedMakeupsApplied = Math.min(missedMeetingsCount, cappedMakeups);
   const creditedMeetingsCount =
     directAttendedMeetingsCount + approvedMakeupsApplied;
 
-  const attendancePercentage =
-    obligatoryMeetingsCount === 0
-      ? 100
-      : Math.min(
-          100,
-          Math.round((creditedMeetingsCount / obligatoryMeetingsCount) * 100)
-        );
+  const attendancePercentage = Math.min(
+    100,
+    Math.round((creditedMeetingsCount / obligatoryMeetingsCount) * 100)
+  );
+  const meetsPolicy =
+    attendancePercentage >= effectivePolicy.minimumAttendancePercent;
 
   return {
     memberId: member.id,
+    policyVersion: effectivePolicy.policyVersion,
+    minimumRequiredPercent: effectivePolicy.minimumAttendancePercent,
+    calculationStatus: 'EVALUATED',
+    isApplicable: true,
     heldMeetingsCount,
+    futureScheduledExcludedCount,
+    cancelledExcludedCount,
+    preJoinExcludedMeetingsCount,
+    outOfTermExcludedMeetingsCount,
     exemptMeetingsCount,
     obligatoryMeetingsCount,
     directAttendedMeetingsCount,
+    approvedMakeupsCount: uniqueApprovedMakeups,
     approvedMakeupsApplied,
     creditedMeetingsCount,
     attendancePercentage,
-    meetsRotary60PercentRule: attendancePercentage >= 60,
+    meetsClubAttendancePolicy: meetsPolicy,
+    meetsRotary60PercentRule: meetsPolicy,
   };
 }
 
 /**
  * Issue #24-#26: Validates a member lifecycle status transition (Candidate -> Active -> Leave -> Honorary -> Resigned/Transferred).
- * Blocks exit/resignation/transfer when the member has unsettled financial obligations unless an explicit board waiver is recorded.
+ * Strictly blocks exit/resignation/transfer when the member has unsettled financial obligations unless a
+ * server-verified, club-scoped, member-bound, unconsumed, non-expired Board Debt Waiver Resolution (`DEBT_WAIVER_ON_EXIT`)
+ * exists in `boardResolutions`. Client-supplied boolean `boardDebtWaiverApproved: true` is NEVER sufficient!
  */
 export function validateMemberLifecycleTransition(params: {
+  clubId?: string;
   member: Pick<
     RotaryMember,
-    'id' | 'fullName' | 'membershipStatus' | 'duesBalance' | 'mealBalance' | 'foundationBalance'
+    | 'id'
+    | 'fullName'
+    | 'membershipStatus'
+    | 'duesBalance'
+    | 'mealBalance'
+    | 'foundationBalance'
   >;
   targetStatus: MembershipLifecycleStatus;
   reason?: string;
   leaveStartDate?: string;
   leaveEndDate?: string;
+  boardResolutionRef?: string;
+  boardResolutionId?: string;
+  boardResolutions?: BoardResolutionItem[];
   boardDebtWaiverApproved?: boolean;
+  nowEpochMs?: number;
 }):
-  | { ok: true; currentStatus: MembershipLifecycleStatus }
+  | {
+      ok: true;
+      currentStatus: MembershipLifecycleStatus;
+      verifiedDebtWaiverResolution?: BoardResolutionItem;
+      matchedResolution?: BoardResolutionItem;
+    }
   | { ok: false; error: string; message: string } {
   const allowedStatuses: MembershipLifecycleStatus[] = [
     'Aktif',
@@ -1583,6 +1871,16 @@ export function validateMemberLifecycleTransition(params: {
           'İzinli (Muaf) statüsüne geçişte izin başlangıç (leaveStartDate) ve bitiş (leaveEndDate) tarihleri zorunludur (#25).',
       };
     }
+    const startMs = parseRotaryDateToEpochMs(params.leaveStartDate);
+    const endMs = parseRotaryDateToEpochMs(params.leaveEndDate);
+    if (startMs === null || endMs === null || startMs > endMs) {
+      return {
+        ok: false,
+        error: 'INVALID_LEAVE_DATE_RANGE',
+        message:
+          'İzin başlangıç ve bitiş tarihleri geçerli bir tarih aralığı olmalı ve başlangıç tarihi bitiş tarihinden sonra olmamalıdır (#25, #34).',
+      };
+    }
   }
 
   const totalDebt =
@@ -1590,23 +1888,132 @@ export function validateMemberLifecycleTransition(params: {
     (params.member.mealBalance || 0) +
     (params.member.foundationBalance || 0);
 
+  let verifiedDebtWaiverResolution: BoardResolutionItem | undefined;
+
   if (
     (params.targetStatus === 'İstifa / Ayrıldı' ||
       params.targetStatus === 'Nakil') &&
-    totalDebt > 0 &&
-    !params.boardDebtWaiverApproved
+    totalDebt > 0
   ) {
-    return {
-      ok: false,
-      error: 'UNSETTLED_MEMBER_BALANCE_ON_EXIT',
-      message: `Borç kapama kontrolü (#26, #38): ${params.member.fullName} üyesinin toplam ${totalDebt} TL kapanmamış cari borcu bulunmaktadır. Borç tahsil edilmeden veya açık YK borç ibra onayı (boardDebtWaiverApproved) olmadan istifa/nakil işlemi tamamlanamaz.`,
-    };
+    const cleanRef = String(
+      params.boardResolutionRef || params.boardResolutionId || ''
+    ).trim();
+    if (!cleanRef) {
+      if (params.boardDebtWaiverApproved) {
+        return {
+          ok: false,
+          error: 'UNVERIFIED_CLIENT_DEBT_WAIVER_FLAG',
+          message:
+            'Güvenlik reddi (#24, #26): İstemciden gönderilen boolean boardDebtWaiverApproved:true bayrağı tek başına borç ibra kanıtı olarak kabul edilmez; sunucuda onaylanmış YK karar referansı (boardResolutionRef) zorunludur.',
+        };
+      }
+      return {
+        ok: false,
+        error: 'UNSETTLED_MEMBER_BALANCE_ON_EXIT',
+        message: `Borç kapama kontrolü (#26, #38): ${params.member.fullName} üyesinin toplam ${totalDebt} TL kapanmamış cari borcu bulunmaktadır. Borç tahsil edilmeden veya sunucu doğrulamalı YK borç ibra kararı olmadan istifa/nakil işlemi tamamlanamaz.`,
+      };
+    }
+
+    const resolutions = Array.isArray(params.boardResolutions)
+      ? params.boardResolutions
+      : [];
+    const matchedResolution = resolutions.find(
+      (r) =>
+        r.resolutionNo === cleanRef ||
+        r.decisionNo === cleanRef ||
+        r.id === cleanRef
+    );
+
+    if (!matchedResolution) {
+      return {
+        ok: false,
+        error: 'BOARD_RESOLUTION_NOT_FOUND',
+        message: `YK borç ibra kararı bulunamadı (#24, #26): "${cleanRef}" referanslı bir Yönetim Kurulu kararı sunucu kayıtlarında mevcut değildir.`,
+      };
+    }
+
+    if (
+      params.clubId &&
+      matchedResolution.clubId &&
+      matchedResolution.clubId !== params.clubId
+    ) {
+      return {
+        ok: false,
+        error: 'BOARD_RESOLUTION_CLUB_MISMATCH',
+        message: `Kulüp kapsam hatası (#24, #26): "${cleanRef}" kararı farklı bir kulübe (${matchedResolution.clubId}) aittir.`,
+      };
+    }
+
+    if (
+      matchedResolution.serverVerified !== true ||
+      matchedResolution.approvalStatus !== 'Onaylandı' ||
+      !matchedResolution.approvedByMemberId ||
+      (matchedResolution.approvedByRole !== 'baskan' &&
+        matchedResolution.approvedByRole !== 'sayman')
+    ) {
+      return {
+        ok: false,
+        error: 'BOARD_RESOLUTION_NOT_APPROVED',
+        message: `Yetkisiz veya onaylanmamış YK kararı (#24, #26): "${cleanRef}" kararı sunucu tarafında Dönem Başkanı / Sayman yetkisiyle onaylanmış resmi bir karar değildir.`,
+      };
+    }
+
+    if (matchedResolution.targetMemberId !== params.member.id) {
+      return {
+        ok: false,
+        error: 'BOARD_RESOLUTION_MEMBER_MISMATCH',
+        message: `Üye eşleşme hatası (#24, #26): "${cleanRef}" sayılı YK kararı "${params.member.id}" üyesi için değil, "${String(
+          matchedResolution.targetMemberId || 'belirsiz'
+        )}" üyesi için düzenlenmiştir.`,
+      };
+    }
+
+    if (
+      matchedResolution.resolutionScope !== 'DEBT_WAIVER_ON_EXIT' ||
+      typeof matchedResolution.waivedAmountTL !== 'number' ||
+      matchedResolution.waivedAmountTL < totalDebt
+    ) {
+      return {
+        ok: false,
+        error: 'BOARD_RESOLUTION_SCOPE_MISMATCH',
+        message: `Karar kapsam/tutar hatası (#24, #26): "${cleanRef}" kararı DEBT_WAIVER_ON_EXIT kapsamında olmalı ve üyenin toplam açık borcunu (${totalDebt} TL) karşılamalıdır.`,
+      };
+    }
+
+    if (matchedResolution.consumedAtIso) {
+      return {
+        ok: false,
+        error: 'BOARD_RESOLUTION_ALREADY_CONSUMED',
+        message: `Mükerrer karar kullanımı engellendi (#24, #26): "${cleanRef}" sayılı YK borç ibra kararı daha önce kullanılmıştır.`,
+      };
+    }
+
+    const effectiveNowMs =
+      typeof params.nowEpochMs === 'number' ? params.nowEpochMs : Date.now();
+    const expiresMs = matchedResolution.expiresAtIso
+      ? Date.parse(matchedResolution.expiresAtIso)
+      : Number.NaN;
+    if (Number.isNaN(expiresMs) || expiresMs < effectiveNowMs) {
+      return {
+        ok: false,
+        error: 'BOARD_RESOLUTION_EXPIRED',
+        message: `Süresi geçmiş YK kararı (#24, #26): "${cleanRef}" sayılı borç ibra kararının geçerlilik süresi (${String(
+          matchedResolution.expiresAtIso || 'belirsiz'
+        )}) dolmuştur.`,
+      };
+    }
+
+    verifiedDebtWaiverResolution = matchedResolution;
   }
 
   return {
     ok: true,
     currentStatus: params.member.membershipStatus || 'Aktif',
+    ...(verifiedDebtWaiverResolution
+      ? {
+          verifiedDebtWaiverResolution,
+          matchedResolution: verifiedDebtWaiverResolution,
+        }
+      : {}),
   };
 }
-
-

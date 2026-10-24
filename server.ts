@@ -26,7 +26,9 @@ import {
 } from './src/server/pilotEngine';
 import {
   AuditLogEntry,
+  BoardResolutionItem,
   CertificateApprovalHistoryEntry,
+  ClubAttendancePolicy,
   ClubRole,
   FinancialLineItem,
   GuestRotaryMakeupCard,
@@ -45,6 +47,7 @@ import {
   buildMakeupActivityKey,
   calculateMeetingKuverSummary,
   calculateTermAttendanceMetrics,
+  DEFAULT_CLUB_ATTENDANCE_POLICY,
   evaluateLcvReminderBatch,
   getIstanbulHourFromEpochMs,
   hasDuplicateInMakeupBatch,
@@ -54,6 +57,7 @@ import {
   SERVER_LCV_REMINDER_COOLDOWN_MS,
   validateMemberLifecycleTransition,
 } from './src/utils/rotaryLogic';
+import { SqlRelationalVerificationEngine } from './src/server/sqlRelationalEngine';
 
 const PORT = 3000;
 
@@ -1648,6 +1652,48 @@ export function createPilotExpressApp(
         tenant.selectedMeetingNo
       );
 
+      const policyOverride: Partial<ClubAttendancePolicy> = {};
+      if (
+        typeof req.query.policyVersion === 'string' &&
+        req.query.policyVersion.trim()
+      ) {
+        policyOverride.policyVersion = req.query.policyVersion.trim();
+      }
+      if (
+        typeof req.query.termStartDate === 'string' &&
+        req.query.termStartDate.trim()
+      ) {
+        policyOverride.termStartDate = req.query.termStartDate.trim();
+      }
+      if (
+        typeof req.query.termEndDate === 'string' &&
+        req.query.termEndDate.trim()
+      ) {
+        policyOverride.termEndDate = req.query.termEndDate.trim();
+      }
+      if (req.query.minimumAttendancePercent !== undefined) {
+        const parsedMin = Number(req.query.minimumAttendancePercent);
+        if (Number.isFinite(parsedMin) && parsedMin > 0 && parsedMin <= 100) {
+          policyOverride.minimumAttendancePercent = parsedMin;
+        }
+      }
+      if (req.query.maxMakeupsPerTerm !== undefined) {
+        const parsedCap = Number(req.query.maxMakeupsPerTerm);
+        if (Number.isInteger(parsedCap) && parsedCap >= 0) {
+          policyOverride.maxMakeupsPerTerm = parsedCap;
+        }
+      }
+
+      const effectivePolicy: ClubAttendancePolicy = {
+        ...DEFAULT_CLUB_ATTENDANCE_POLICY,
+        ...policyOverride,
+      };
+      const evaluationDateParam =
+        typeof req.query.evaluationDate === 'string' &&
+        req.query.evaluationDate.trim()
+          ? req.query.evaluationDate.trim()
+          : getServerNow().toISOString();
+
       const memberMetrics = tenant.members.map((m) =>
         calculateTermAttendanceMetrics({
           member: m,
@@ -1655,6 +1701,8 @@ export function createPilotExpressApp(
           meetingAttendances: tenant.meetingAttendances || {},
           makeupSubmissions: tenant.makeupSubmissions || [],
           allMembers: tenant.members,
+          policy: effectivePolicy,
+          evaluationDate: evaluationDateParam,
         })
       );
 
@@ -1662,8 +1710,197 @@ export function createPilotExpressApp(
         ok: true,
         clubId: authorizedClubId,
         meetingNo: targetMeetingNo,
+        policy: effectivePolicy,
+        policyApplied: effectivePolicy,
         meetingKuverSummary,
         memberMetrics,
+      });
+    }
+  );
+
+  // 6d-0. Narrow Server-Verified Board Debt Waiver Resolution Command (#24, #26)
+  // Only Treasurer ('sayman') or President ('baskan') can issue an official, club+member+scope+expiry bound debt waiver resolution.
+  app.post(
+    '/api/pilot/board-debt-waiver-resolution',
+    requireServerRole(['sayman', 'baskan']),
+    (req: AuthenticatedRequest, res) => {
+      const user = req.authUser!;
+      const {
+        clubId,
+        targetMemberId,
+        decisionNo,
+        resolutionNo,
+        title,
+        waivedAmountTL,
+        reason,
+        summary,
+        expiresAtIso,
+        expiresInHours,
+      } = req.body || {};
+
+      const authorizedClubId = verifyTenantBoundary(
+        user,
+        typeof clubId === 'string' ? clubId.trim() : undefined,
+        store,
+        res
+      );
+      if (!authorizedClubId) return;
+
+      const cleanMemberId =
+        typeof targetMemberId === 'string' ? targetMemberId.trim() : '';
+      const rawDecisionNo =
+        typeof decisionNo === 'string' && decisionNo.trim()
+          ? decisionNo.trim()
+          : typeof resolutionNo === 'string' && resolutionNo.trim()
+          ? resolutionNo.trim()
+          : typeof title === 'string' && title.trim()
+          ? `YK-${crypto.randomUUID().slice(0, 6).toUpperCase()}`
+          : '';
+      const cleanDecisionNo = rawDecisionNo.trim();
+      const cleanReason =
+        typeof reason === 'string' && reason.trim()
+          ? reason.trim()
+          : typeof summary === 'string' && summary.trim()
+          ? summary.trim()
+          : typeof title === 'string' && title.trim()
+          ? title.trim()
+          : '';
+      const numWaived = Number(waivedAmountTL);
+
+      if (!cleanMemberId || !cleanDecisionNo || cleanDecisionNo.length < 4) {
+        res.status(422).json({
+          error: 'INVALID_BOARD_RESOLUTION_DATA',
+          message:
+            'YK borç feragat kararı için geçerli targetMemberId ve en az 4 karakterlik karar numarası (decisionNo) zorunludur (#24, #26).',
+        });
+        return;
+      }
+
+      if (!Number.isFinite(numWaived) || numWaived <= 0) {
+        res.status(422).json({
+          error: 'INVALID_WAIVED_AMOUNT',
+          message:
+            'YK borç feragat tutarı (waivedAmountTL) 0’dan büyük geçerli bir sayı olmalıdır (#24, #26).',
+        });
+        return;
+      }
+
+      if (cleanReason.length < 6) {
+        res.status(422).json({
+          error: 'REASON_REQUIRED',
+          message:
+            'YK borç feragat kararı için en az 6 karakterlik resmi gerekçe (reason/title) zorunludur (#24, #26).',
+        });
+        return;
+      }
+
+      const tenant = store.getTenantState(authorizedClubId);
+      const targetMember = tenant.members.find((m) => m.id === cleanMemberId);
+      if (!targetMember) {
+        res.status(404).json({
+          error: 'MEMBER_NOT_FOUND',
+          message: `Üye bulunamadı (#24, #26): "${cleanMemberId}" kimliğine sahip üye "${authorizedClubId}" kulüp listesinde yer almıyor.`,
+        });
+        return;
+      }
+
+      const duplicateDecision = (tenant.boardResolutions || []).some(
+        (r) =>
+          normalizeBankRef(r.decisionNo || r.resolutionNo || '') ===
+            normalizeBankRef(cleanDecisionNo) ||
+          normalizeBankRef(r.id) === normalizeBankRef(cleanDecisionNo)
+      );
+      if (duplicateDecision) {
+        res.status(409).json({
+          error: 'DUPLICATE_BOARD_RESOLUTION',
+          message: `Mükerrer YK kararı (#24, #26): "${cleanDecisionNo}" sayılı Yönetim Kurulu kararı defterde zaten kayıtlıdır.`,
+        });
+        return;
+      }
+
+      const serverNow = getServerNow();
+      let effectiveExpiresAtIso: string;
+      if (typeof expiresAtIso === 'string' && expiresAtIso.trim()) {
+        const parsedExp = Date.parse(expiresAtIso.trim());
+        if (Number.isNaN(parsedExp)) {
+          res.status(422).json({
+            error: 'INVALID_EXPIRES_AT',
+            message: 'Geçersiz expiresAtIso tarih formatı (#24, #26).',
+          });
+          return;
+        }
+        effectiveExpiresAtIso = new Date(parsedExp).toISOString();
+      } else {
+        const ttlHours =
+          typeof expiresInHours === 'number' && Number.isFinite(expiresInHours)
+            ? Math.max(1, Math.min(720, expiresInHours))
+            : 72;
+        effectiveExpiresAtIso = new Date(
+          serverNow.getTime() + ttlHours * 60 * 60 * 1000
+        ).toISOString();
+      }
+
+      const nowStr = formatNowTR();
+      const newResolution: BoardResolutionItem = {
+        id: `res-waiver-${crypto.randomUUID().slice(0, 8)}`,
+        resolutionNo: cleanDecisionNo,
+        decisionNo: cleanDecisionNo,
+        date: nowStr.split(' · ')[0] || '23 Ekim 2026',
+        title:
+          typeof title === 'string' && title.trim()
+            ? title.trim()
+            : `${targetMember.fullName} — Ayrılış / Nakil Açık Bakiye İbra & Feragat Kararı`,
+        category: 'Üyelik',
+        summary: cleanReason,
+        voteStatus: 'Oybirliği ile Kabul',
+        signedBy: `${user.fullName} (${user.role.toUpperCase()})`,
+        clubId: authorizedClubId,
+        resolutionScope: 'DEBT_WAIVER_ON_EXIT',
+        targetMemberId: cleanMemberId,
+        targetMemberName: targetMember.fullName,
+        waivedAmountTL: numWaived,
+        approvalStatus: 'Onaylandı',
+        approvedByMemberId: user.memberId,
+        approvedByRole: user.role,
+        approvedAtIso: serverNow.toISOString(),
+        expiresAtIso: effectiveExpiresAtIso,
+        serverVerified: true,
+      };
+
+      const casResult = store.updateTenant(
+        authorizedClubId,
+        (curr) => ({
+          ...curr,
+          boardResolutions: [newResolution, ...(curr.boardResolutions || [])],
+        }),
+        tenant.revision,
+        {
+          actorName: `${user.fullName} (${user.rotaryId})`,
+          actorRole: user.role,
+          module: 'Yönetim & Güvenlik',
+          action: `YK Borç Feragat Kararı Onaylandı (${cleanDecisionNo})`,
+          detail: `${targetMember.fullName} (${cleanMemberId}) için ${numWaived} TL kapsamlı "${cleanDecisionNo}" sayılı YK ayrılış borç feragat kararı sunucu doğrulamalı olarak kaydedildi (Geçerlilik: ${effectiveExpiresAtIso}).`,
+          timestamp: nowStr,
+        }
+      );
+
+      if (!casResult.ok) {
+        res.status(409).json({
+          error: 'REVISION_CONFLICT',
+          currentRevision: casResult.currentRevision,
+        });
+        return;
+      }
+
+      res.status(201).json({
+        ok: true,
+        revision: casResult.state.revision,
+        resolution: newResolution,
+        state: redactStateForRole(
+          casResult.state,
+          store.getAuditLedger(authorizedClubId),
+          user
+        ),
       });
     }
   );
@@ -1682,6 +1919,7 @@ export function createPilotExpressApp(
         leaveStartDate,
         leaveEndDate,
         boardResolutionRef,
+        boardResolutionId,
         boardDebtWaiverApproved,
       } = req.body || {};
 
@@ -1705,14 +1943,26 @@ export function createPilotExpressApp(
         return;
       }
 
+      const effectiveResolutionRef =
+        typeof boardResolutionRef === 'string' && boardResolutionRef.trim()
+          ? boardResolutionRef.trim()
+          : typeof boardResolutionId === 'string' && boardResolutionId.trim()
+          ? boardResolutionId.trim()
+          : undefined;
+
+      const serverNow = getServerNow();
       const validation = validateMemberLifecycleTransition({
         member: targetMember,
+        clubId: authorizedClubId,
         targetStatus: targetStatus as MembershipLifecycleStatus,
         reason: typeof reason === 'string' ? reason : undefined,
         leaveStartDate:
           typeof leaveStartDate === 'string' ? leaveStartDate : undefined,
         leaveEndDate:
           typeof leaveEndDate === 'string' ? leaveEndDate : undefined,
+        boardResolutionRef: effectiveResolutionRef,
+        boardResolutions: tenant.boardResolutions || [],
+        nowEpochMs: serverNow.getTime(),
         boardDebtWaiverApproved: Boolean(boardDebtWaiverApproved),
       });
 
@@ -1725,6 +1975,7 @@ export function createPilotExpressApp(
       }
 
       const nowStr = formatNowTR();
+      const matchedWaiverResolution = validation.matchedResolution;
       const historyEntry: MemberLifecycleHistoryEntry = {
         timestamp: nowStr,
         fromStatus: validation.currentStatus,
@@ -1735,8 +1986,15 @@ export function createPilotExpressApp(
         reason: String(reason).trim(),
         ...(leaveStartDate ? { leaveStartDate: String(leaveStartDate).trim() } : {}),
         ...(leaveEndDate ? { leaveEndDate: String(leaveEndDate).trim() } : {}),
-        ...(boardResolutionRef
-          ? { boardResolutionRef: String(boardResolutionRef).trim() }
+        ...(matchedWaiverResolution
+          ? {
+              boardResolutionRef:
+                matchedWaiverResolution.decisionNo ||
+                matchedWaiverResolution.resolutionNo ||
+                matchedWaiverResolution.id,
+            }
+          : effectiveResolutionRef
+          ? { boardResolutionRef: effectiveResolutionRef }
           : {}),
       };
 
@@ -1744,11 +2002,36 @@ export function createPilotExpressApp(
         authorizedClubId,
         (curr) => ({
           ...curr,
+          boardResolutions: matchedWaiverResolution
+            ? (curr.boardResolutions || []).map((r) =>
+                r.id === matchedWaiverResolution.id
+                  ? {
+                      ...r,
+                      consumedAtIso: serverNow.toISOString(),
+                      consumedByMemberId: user.memberId,
+                    }
+                  : r
+              )
+            : curr.boardResolutions,
+          overdueMembers: matchedWaiverResolution
+            ? (curr.overdueMembers || []).filter(
+                (o) =>
+                  normalizePersonName(o.memberName) !==
+                  normalizePersonName(targetMember.fullName)
+              )
+            : curr.overdueMembers,
           members: curr.members.map((m) =>
             m.id === cleanMemberId
               ? {
                   ...m,
                   membershipStatus: targetStatus as MembershipLifecycleStatus,
+                  ...(matchedWaiverResolution
+                    ? {
+                        duesBalance: 0,
+                        mealBalance: 0,
+                        foundationBalance: 0,
+                      }
+                    : {}),
                   leaveStartDate:
                     targetStatus === 'İzinli (Muaf)'
                       ? String(leaveStartDate).trim()
@@ -1779,9 +2062,11 @@ export function createPilotExpressApp(
           actorRole: user.role,
           module: 'Yönetim & Güvenlik',
           action: `Üyelik Yaşam Döngüsü Güncellendi: ${targetMember.fullName} (${validation.currentStatus} -> ${targetStatus})`,
-          detail: `${targetMember.fullName} (${targetMember.rotaryId}) üyelik statüsü "${validation.currentStatus}" durumundan "${targetStatus}" durumuna geçirildi. Gerekçe: ${String(
-            reason
-          ).trim()}`,
+          detail: `${targetMember.fullName} (${targetMember.rotaryId}) üyelik statüsü "${validation.currentStatus}" durumundan "${targetStatus}" durumuna geçirildi.${
+            matchedWaiverResolution
+              ? ` [YK Borç Feragat Kararı Kullanıldı: ${matchedWaiverResolution.decisionNo}]`
+              : ''
+          } Gerekçe: ${String(reason).trim()}`,
           timestamp: nowStr,
         }
       );
@@ -1802,6 +2087,9 @@ export function createPilotExpressApp(
         ok: true,
         revision: casResult.state.revision,
         member: updatedMember,
+        consumedBoardResolution: matchedWaiverResolution
+          ? matchedWaiverResolution.decisionNo
+          : undefined,
         state: redactStateForRole(
           casResult.state,
           store.getAuditLedger(authorizedClubId),
@@ -3197,6 +3485,7 @@ export function createPilotExpressApp(
       issuedByMemberId?: string;
       approvedByMemberId?: string;
       guestAttendanceRecordId?: string;
+      attendanceEvidence?: string;
       status?: 'Taslak' | 'Aktif' | 'İptal Edildi';
       schemaVersion?: number;
     }
@@ -3211,11 +3500,15 @@ export function createPilotExpressApp(
       card.status === 'Aktif' && card.guestAttendanceRecordId
         ? `:${card.guestAttendanceRecordId}`
         : '';
+    const evidencePart =
+      card.status === 'Aktif' && card.attendanceEvidence
+        ? `:${normalizePersonName(card.attendanceEvidence)}`
+        : '';
     const district = card.guestDistrict || 'UR 2420. Bölge';
     const digest = crypto
       .createHmac('sha256', getServerSecret())
       .update(
-        `RotaclubGuestCertificate:v${version}:${clubId}:${card.id}:${card.meetingNo}:${card.guestName}:${card.guestClub}:${district}:${card.meetingDate}:${issuer}${approver}${guestAttRef}`
+        `RotaclubGuestCertificate:v${version}:${clubId}:${card.id}:${card.meetingNo}:${card.guestName}:${card.guestClub}:${district}:${card.meetingDate}:${issuer}${approver}${guestAttRef}${evidencePart}`
       )
       .digest('hex')
       .slice(0, 16)
@@ -3316,6 +3609,7 @@ export function createPilotExpressApp(
       const existingRecord = (tenant.verifiedGuestAttendances || []).find(
         (v) =>
           v.meetingNo === targetMeetingNo &&
+          !v.revoked &&
           normalizePersonName(v.guestName) ===
             normalizePersonName(cleanGuestName) &&
           normalizePersonName(v.guestClub) ===
@@ -3388,6 +3682,98 @@ export function createPilotExpressApp(
         idempotentReplay: false,
         revision: casResult.state.revision,
         guestAttendanceRecord: newRecord,
+        state: redactStateForRole(
+          casResult.state,
+          store.getAuditLedger(authorizedClubId),
+          user
+        ),
+      });
+    }
+  );
+
+  // Issue #36: Revoke a Guest Attendance Check-in Record (Secretary / President only)
+  // If a guest attendance record is revoked, any certificate relying on it immediately fails verification!
+  app.post(
+    '/api/pilot/revoke-guest-checkin',
+    requireServerRole(['sekreter', 'baskan']),
+    (req: AuthenticatedRequest, res) => {
+      const user = req.authUser!;
+      const { clubId, guestAttendanceRecordId, reason } = req.body || {};
+      const authorizedClubId = verifyTenantBoundary(
+        user,
+        typeof clubId === 'string' ? clubId.trim() : undefined,
+        store,
+        res
+      );
+      if (!authorizedClubId) return;
+
+      const cleanRecordId =
+        typeof guestAttendanceRecordId === 'string'
+          ? guestAttendanceRecordId.trim()
+          : '';
+      const cleanReason = typeof reason === 'string' ? reason.trim() : '';
+      if (!cleanRecordId || cleanReason.length < 5) {
+        res.status(422).json({
+          error: 'INVALID_GUEST_CHECKIN_REVOCATION',
+          message:
+            'Misafir yoklama kaydı iptali (#36) için geçerli guestAttendanceRecordId ve en az 5 karakterlik iptal gerekçesi (reason) zorunludur.',
+        });
+        return;
+      }
+
+      const tenant = store.getTenantState(authorizedClubId);
+      const targetRecord = (tenant.verifiedGuestAttendances || []).find(
+        (v) => v.id === cleanRecordId
+      );
+      if (!targetRecord) {
+        res.status(404).json({
+          error: 'GUEST_ATTENDANCE_RECORD_NOT_FOUND',
+          message: 'İptal edilecek misafir yoklama kaydı bulunamadı (#36).',
+        });
+        return;
+      }
+
+      const nowStr = formatNowTR();
+      const casResult = store.updateTenant(
+        authorizedClubId,
+        (curr) => ({
+          ...curr,
+          verifiedGuestAttendances: (curr.verifiedGuestAttendances || []).map(
+            (v) =>
+              v.id === cleanRecordId
+                ? {
+                    ...v,
+                    revoked: true,
+                    revokedAt: nowStr,
+                    revokedBy: `${user.fullName} (${user.role})`,
+                    revocationReason: cleanReason,
+                  }
+                : v
+          ),
+        }),
+        tenant.revision,
+        {
+          actorName: `${user.fullName} (${user.rotaryId})`,
+          actorRole: user.role,
+          module: 'QR Yoklama & Make-up',
+          action: `Misafir Salon Yoklama Kaydı İptal Edildi (${cleanRecordId})`,
+          detail: `${targetRecord.guestName} (${targetRecord.guestClub}) adına kayıtlı Toplantı #${targetRecord.meetingNo} misafir yoklama kanıtı iptal edildi. Gerekçe: ${cleanReason}`,
+          timestamp: nowStr,
+        }
+      );
+
+      if (!casResult.ok) {
+        res.status(409).json({
+          error: 'REVISION_CONFLICT',
+          currentRevision: casResult.currentRevision,
+        });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        revision: casResult.state.revision,
+        revokedGuestAttendanceRecordId: cleanRecordId,
         state: redactStateForRole(
           casResult.state,
           store.getAuditLedger(authorizedClubId),
@@ -3501,39 +3887,6 @@ export function createPilotExpressApp(
       return;
     }
 
-    // Security Audit (#36): Any v1+ active certificate must have verified approval gate metadata, approval history, AND a matching guest-specific attendance record
-    if (card.schemaVersion) {
-      const hasApprovedHistory =
-        Array.isArray(card.approvalHistory) &&
-        card.approvalHistory.some((h) => h.action === 'ONAYLANDI');
-      const linkedGuestAttendance = (
-        tenant.verifiedGuestAttendances || []
-      ).find(
-        (v) =>
-          (card.guestAttendanceRecordId &&
-            v.id === card.guestAttendanceRecordId) ||
-          (v.meetingNo === card.meetingNo &&
-            normalizePersonName(v.guestName) ===
-              normalizePersonName(card.guestName) &&
-            normalizePersonName(v.guestClub) ===
-              normalizePersonName(card.guestClub))
-      );
-      if (
-        !card.approvedByMemberId ||
-        !card.attendanceEvidence ||
-        !hasApprovedHistory ||
-        !linkedGuestAttendance
-      ) {
-        res.status(422).json({
-          valid: false,
-          error: 'CERTIFICATE_NOT_APPROVED',
-          message:
-            'Belge onay kapısı eksik (#36): Sertifikanın kişi/toplantı bazlı doğrulanmış misafir katılım kanıtı ve yetkili onay geçmişi bulunmamaktadır.',
-        });
-        return;
-      }
-    }
-
     // Re-verify HMAC against current stored fields for all v1+ server-issued certificates (#36)
     if (
       card.schemaVersion ||
@@ -3551,6 +3904,65 @@ export function createPilotExpressApp(
           error: 'CERTIFICATE_INTEGRITY_MISMATCH',
           message:
             'Belge bütünlük hatası (#36): Sertifika içeriği düzenlendikten sonra değiştirilmiş veya imza doğrulaması başarısız.',
+        });
+        return;
+      }
+    }
+
+    // Security Audit (#36): Any v1+ active certificate must have verified approval gate metadata, approval history, AND a valid, non-revoked, identity-matched guest attendance record
+    if (card.schemaVersion) {
+      const hasApprovedHistory =
+        Array.isArray(card.approvalHistory) &&
+        card.approvalHistory.some((h) => h.action === 'ONAYLANDI');
+      if (
+        !card.approvedByMemberId ||
+        !card.attendanceEvidence ||
+        !hasApprovedHistory
+      ) {
+        res.status(422).json({
+          valid: false,
+          error: 'CERTIFICATE_NOT_APPROVED',
+          message:
+            'Belge onay kapısı eksik (#36): Sertifikanın kişi/toplantı bazlı doğrulanmış misafir katılım kanıtı ve yetkili onay geçmişi bulunmamaktadır.',
+        });
+        return;
+      }
+
+      const linkedGuestAttendance = (
+        tenant.verifiedGuestAttendances || []
+      ).find((v) => v.id === card.guestAttendanceRecordId);
+
+      if (!linkedGuestAttendance) {
+        res.status(422).json({
+          valid: false,
+          error: 'GUEST_ATTENDANCE_EVIDENCE_MISSING',
+          message:
+            'Misafir katılım kanıtı doğrulaması başarısız (#36): Belgeye bağlı kişi bazlı salon yoklama kaydı (guestAttendanceRecordId) bulunamadı veya silinmiş.',
+        });
+        return;
+      }
+
+      if (linkedGuestAttendance.revoked) {
+        res.status(422).json({
+          valid: false,
+          error: 'GUEST_ATTENDANCE_EVIDENCE_REVOKED',
+          message: `Misafir katılım kanıtı iptal edilmiş (#36): Bu sertifikanın dayandığı salon giriş yoklama kaydı (${linkedGuestAttendance.id}) iptal edildiğinden sertifika geçersizdir.`,
+        });
+        return;
+      }
+
+      if (
+        linkedGuestAttendance.meetingNo !== card.meetingNo ||
+        normalizePersonName(linkedGuestAttendance.guestName) !==
+          normalizePersonName(card.guestName) ||
+        normalizePersonName(linkedGuestAttendance.guestClub) !==
+          normalizePersonName(card.guestClub)
+      ) {
+        res.status(422).json({
+          valid: false,
+          error: 'GUEST_ATTENDANCE_IDENTITY_MISMATCH',
+          message:
+            'Misafir kimlik/toplantı tutarsızlığı (#36): Sertifikadaki misafir kimliği veya toplantı numarası ile salon yoklama kaydındaki veriler eşleşmiyor.',
         });
         return;
       }
@@ -3726,6 +4138,14 @@ export function createPilotExpressApp(
         res.status(422).json({
           error: 'GUEST_ATTENDANCE_NOT_VERIFIED',
           message: `Misafir bazlı katılım doğrulaması eksik (#36): Toplantı #${targetCard.meetingNo} genel yoklaması açık olsa dahi "${targetCard.guestName}" (${targetCard.guestClub}) adlı misafir için doğrulanmış salon giriş / misafir yoklama kaydı (/api/pilot/guest-checkin) bulunmamaktadır.`,
+        });
+        return;
+      }
+
+      if (matchedGuestAttendance.revoked) {
+        res.status(422).json({
+          error: 'GUEST_ATTENDANCE_EVIDENCE_REVOKED',
+          message: `Misafir katılım kanıtı iptal edilmiş (#36): "${targetCard.guestName}" (${targetCard.guestClub}) adlı misafirin yoklama kaydı (${matchedGuestAttendance.id}) iptal edildiğinden katılım belgesi onaylanamaz.`,
         });
         return;
       }
@@ -4345,6 +4765,66 @@ export function createPilotExpressApp(
                 'Sertifika onay kapısı zorunludur (#36): Yeni katılım belgeleri yalnızca "Taslak" olarak oluşturulabilir ve doğrulanmış toplantı/katılım kanıtıyla "/api/pilot/approve-certificate" uç noktasından aktifleştirilebilir.',
             });
             return;
+          }
+        }
+      }
+
+      // Issue #36 Fix: Block direct client mutation of verifiedGuestAttendances via /api/pilot/sync
+      if ('verifiedGuestAttendances' in incomingPatch) {
+        res.status(422).json({
+          error: 'DIRECT_GUEST_ATTENDANCE_MUTATION_FORBIDDEN',
+          message:
+            'Misafir yoklama kanıt bütünlüğü (#36): Doğrulanmış misafir katılım kayıtları (verifiedGuestAttendances) /api/pilot/sync üzerinden doğrudan eklenemez, değiştirilemez veya silinemez; /api/pilot/guest-checkin ve /api/pilot/revoke-guest-checkin uç noktaları zorunludur.',
+        });
+        return;
+      }
+
+      // Issue #24 / #26 Fix: Block direct client forging or mutation of server-verified board debt waiver resolutions via /api/pilot/sync
+      if (Array.isArray(incomingPatch.boardResolutions)) {
+        const existingResById = new Map(
+          (currentTenant.boardResolutions || []).map((r) => [r.id, r])
+        );
+        for (const incRes of incomingPatch.boardResolutions) {
+          if (!incRes || typeof incRes.id !== 'string') continue;
+          const existingRes = existingResById.get(incRes.id);
+          if (!existingRes) {
+            if (
+              incRes.resolutionScope === 'DEBT_WAIVER_ON_EXIT' ||
+              incRes.serverVerified === true ||
+              typeof incRes.waivedAmountTL === 'number' ||
+              typeof incRes.targetMemberId === 'string'
+            ) {
+              res.status(422).json({
+                error: 'DIRECT_BOARD_WAIVER_RESOLUTION_FORBIDDEN',
+                message:
+                  'YK borç feragat kararı bütünlüğü (#24, #26): Ayrılış borç feragat kararları /api/pilot/sync üzerinden doğrudan oluşturulamaz; yalnızca Sayman veya Başkan tarafından /api/pilot/board-debt-waiver-resolution uç noktasından onaylanabilir.',
+              });
+              return;
+            }
+          } else if (
+            existingRes.serverVerified ||
+            existingRes.resolutionScope === 'DEBT_WAIVER_ON_EXIT'
+          ) {
+            const tampered =
+              incRes.decisionNo !== existingRes.decisionNo ||
+              incRes.clubId !== existingRes.clubId ||
+              incRes.resolutionScope !== existingRes.resolutionScope ||
+              incRes.targetMemberId !== existingRes.targetMemberId ||
+              incRes.waivedAmountTL !== existingRes.waivedAmountTL ||
+              incRes.approvalStatus !== existingRes.approvalStatus ||
+              incRes.approvedByMemberId !== existingRes.approvedByMemberId ||
+              incRes.approvedByRole !== existingRes.approvedByRole ||
+              incRes.expiresAtIso !== existingRes.expiresAtIso ||
+              incRes.consumedAtIso !== existingRes.consumedAtIso ||
+              incRes.serverVerified !== existingRes.serverVerified;
+            if (tampered) {
+              res.status(422).json({
+                error: 'IMMUTABLE_BOARD_WAIVER_RESOLUTION',
+                message:
+                  'YK borç feragat kararı bütünlüğü (#24, #26): Sunucu onaylı YK borç feragat kararları /api/pilot/sync üzerinden değiştirilemez.',
+              });
+              return;
+            }
           }
         }
       }
@@ -5255,8 +5735,41 @@ export function createPilotExpressApp(
                 : curr.ritualSteps,
             guestMakeupCards: sanitizedGuestMakeupCards,
             boardResolutions:
-              isBoardAdmin && incomingPatch.boardResolutions
-                ? incomingPatch.boardResolutions
+              isBoardAdmin && Array.isArray(incomingPatch.boardResolutions)
+                ? (() => {
+                    const existingServerVerified = (
+                      curr.boardResolutions || []
+                    ).filter(
+                      (r) =>
+                        r.serverVerified ||
+                        r.resolutionScope === 'DEBT_WAIVER_ON_EXIT'
+                    );
+                    const existingServerVerifiedIds = new Set(
+                      existingServerVerified.map((r) => r.id)
+                    );
+                    const sanitizedGeneric = incomingPatch.boardResolutions
+                      .filter(
+                        (r: { id?: string }) =>
+                          r &&
+                          typeof r.id === 'string' &&
+                          !existingServerVerifiedIds.has(r.id)
+                      )
+                      .map((r: BoardResolutionItem) => ({
+                        id: r.id,
+                        resolutionNo: r.resolutionNo || r.decisionNo || r.id,
+                        decisionNo: r.decisionNo || r.resolutionNo || r.id,
+                        date: r.date,
+                        title: r.title,
+                        category: r.category,
+                        summary: r.summary || r.title,
+                        voteStatus: r.voteStatus || 'Oybirliği ile Kabul',
+                        signedBy: r.signedBy,
+                        clubId: authorizedClubId,
+                        resolutionScope: 'GENERAL_GOVERNANCE' as const,
+                        serverVerified: false,
+                      }));
+                    return [...existingServerVerified, ...sanitizedGeneric];
+                  })()
                 : curr.boardResolutions,
             kvkkMaskPhone:
               isBoardAdmin && typeof incomingPatch.kvkkMaskPhone === 'boolean'
@@ -5353,23 +5866,71 @@ export function createPilotExpressApp(
         },
         expectedRevision,
         (updatedState) => {
-          const changedKeys = Object.keys(incomingPatch);
-          const effectiveAction =
-            auditEvent?.action?.trim() ||
-            `Sunucu Veri Senkronizasyonu (Rev #${updatedState.revision})`;
-          const effectiveDetail =
-            auditEvent?.detail?.trim() ||
-            `${user.fullName} tarafından [${
-              changedKeys.join(', ') || 'state'
-            }] alanları güncellendi.`;
-          const effectiveModule: AuditLogEntry['module'] =
-            auditEvent?.module || 'Yönetim & Güvenlik';
+          // Security Audit (#18): NEVER trust client-supplied auditEvent.action, auditEvent.detail, or auditEvent.module!
+          // Derive module, action, and detail strictly on the server from the actual mutated state fields.
+          const candidateKeys = Object.keys(incomingPatch);
+          const actuallyMutatedKeys = candidateKeys.filter((k) => {
+            const key = k as keyof typeof updatedState;
+            return (
+              JSON.stringify(currentTenant[key]) !==
+              JSON.stringify(updatedState[key])
+            );
+          });
+          const effectiveKeys =
+            actuallyMutatedKeys.length > 0 ? actuallyMutatedKeys : candidateKeys;
+
+          let serverModule: AuditLogEntry['module'] = 'Yönetim & Güvenlik';
+          if (
+            effectiveKeys.some((k) =>
+              [
+                'rsvpStatus',
+                'menuPreference',
+                'guestNameInput',
+                'meetings',
+                'ritualSteps',
+                'speakerProposals',
+                'celebrations',
+                'firesideGroups',
+              ].includes(k)
+            )
+          ) {
+            serverModule = 'LCV & Kuver';
+          } else if (
+            effectiveKeys.some((k) =>
+              ['makeupSubmissions', 'guestMakeupCards'].includes(k)
+            )
+          ) {
+            serverModule = 'QR Yoklama & Make-up';
+          } else if (effectiveKeys.includes('paymentNotifications')) {
+            serverModule = 'Saymanlık & Kasa';
+          } else if (
+            effectiveKeys.some((k) =>
+              [
+                'projects',
+                'scholars',
+                'volunteerShifts',
+                'specializedModules',
+              ].includes(k)
+            )
+          ) {
+            serverModule = 'Projeler & Burslar';
+          }
+
+          const serverAction = `Sunucu Doğrulamalı Durum Güncellemesi [Rev #${
+            updatedState.revision
+          }: ${effectiveKeys.join(', ') || 'no-op'}]`;
+          const serverDetail = `Sunucu fark analizi (#18): ${user.fullName} (${
+            user.role
+          }) oturumu ile [${
+            actuallyMutatedKeys.join(', ') || 'değişiklik yok'
+          }] alanları doğrulandı ve kaydedildi (İstemci metni yoksayıldı).`;
+
           return {
             actorName: `${user.fullName} (${user.rotaryId})`,
             actorRole: user.role,
-            module: effectiveModule,
-            action: effectiveAction,
-            detail: effectiveDetail,
+            module: serverModule,
+            action: serverAction,
+            detail: serverDetail,
             timestamp: formatNowTR(),
           };
         }
