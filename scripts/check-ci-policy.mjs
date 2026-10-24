@@ -29,6 +29,7 @@ const REQUIRED_COMMANDS = [
   'npm run build',
   'node scripts/check-secrets.mjs --self-test',
   'node --test scripts/check-secrets.test.mjs',
+  'node --test scripts/release-preflight.test.mjs',
   'node scripts/check-secrets.mjs',
   'npm audit --omit=dev --audit-level=high',
   'node scripts/check-ci-policy.mjs --self-test',
