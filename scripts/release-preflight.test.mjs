@@ -136,4 +136,8 @@ test('release workflow is manual only, read only, pinned and non-deploying', () 
     .includes('automatic-trigger-forbidden'));
   assert.ok(validateDispatchWorkflow(source + '\n        run: docker push x/y\n')
     .includes('deployment-command-forbidden'));
+  assert.ok(validateDispatchWorkflow(source + '\n      - name: Unexpected execution\n        run: echo unsafe\n')
+    .includes('unexpected-execution-command'));
+  assert.ok(validateDispatchWorkflow(source + '\n      - name: Untrusted third-party action\n        uses: unknown-org/action@v1\n')
+    .includes('action-pinning-or-checkout-policy'));
 });
