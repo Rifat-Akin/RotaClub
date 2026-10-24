@@ -67,6 +67,9 @@ jobs:
       - name: Adversarial scanner tests (Git and no-Git exports)
         run: node --test scripts/check-secrets.test.mjs
 
+      - name: Verify read-only release gate never auto-authorizes deployment
+        run: node --test scripts/release-preflight.test.mjs
+
       - name: Scan tracked files for high-confidence secrets
         run: node scripts/check-secrets.mjs
 
