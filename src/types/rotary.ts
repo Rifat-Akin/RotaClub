@@ -110,6 +110,20 @@ export interface CertificateApprovalHistoryEntry {
   note?: string;
 }
 
+export interface VerifiedGuestAttendanceRecord {
+  id: string;
+  meetingNo: number;
+  guestName: string;
+  guestClub: string;
+  guestDistrict?: string;
+  verifiedByMemberId: string;
+  verifiedByName: string;
+  verifiedByRole: ClubRole;
+  verifiedAt: string;
+  checkinMethod: 'Salon Kayıt Masası' | 'QR Teyit' | 'Protokol Defteri';
+  evidenceNote: string;
+}
+
 export interface GuestRotaryMakeupCard {
   id: string;
   guestName: string;
@@ -130,6 +144,7 @@ export interface GuestRotaryMakeupCard {
   approvedByRole?: ClubRole;
   approvedAt?: string;
   attendanceEvidence?: string;
+  guestAttendanceRecordId?: string;
   approvalHistory?: CertificateApprovalHistoryEntry[];
   revokedAt?: string;
   revokedBy?: string;
@@ -282,6 +297,27 @@ export interface GalataProject {
   volunteers?: string[];
 }
 
+export type MembershipLifecycleStatus =
+  | 'Aktif'
+  | 'Aday'
+  | 'İzinli (Muaf)'
+  | 'Onur Üyesi'
+  | 'İstifa / Ayrıldı'
+  | 'Nakil';
+
+export interface MemberLifecycleHistoryEntry {
+  timestamp: string;
+  fromStatus: MembershipLifecycleStatus;
+  toStatus: MembershipLifecycleStatus;
+  actorId: string;
+  actorName: string;
+  actorRole: ClubRole;
+  reason: string;
+  leaveStartDate?: string;
+  leaveEndDate?: string;
+  boardResolutionRef?: string;
+}
+
 export interface RotaryMember {
   id: string;
   rotaryId: string;
@@ -318,12 +354,20 @@ export interface RotaryMember {
   rsvpStatus: RsvpStatus;
   mealPreference: MenuPreference;
   guestName?: string;
-  // Issue #32: Communication Preferences, Opt-Out & Per-Meeting RSVP Map
+  // Issue #32 & #27/#28: Communication Preferences, Opt-Out & Per-Meeting RSVP / Menu Maps
   reminderOptOut?: boolean;
   preferredReminderChannel?: ReminderChannel;
   lastRemindedMeetingNo?: number;
   lastRemindedAtIso?: string;
   meetingRsvps?: Record<string, RsvpStatus>;
+  meetingMenus?: Record<string, MenuPreference>;
+  // Issue #24-#26: Member Lifecycle Status, Leave of Absence (LOA), & Candidate Objection Window
+  membershipStatus?: MembershipLifecycleStatus;
+  leaveStartDate?: string;
+  leaveEndDate?: string;
+  leaveReason?: string;
+  candidateObjectionDeadline?: string;
+  lifecycleHistory?: MemberLifecycleHistoryEntry[];
 }
 
 export type Member = RotaryMember;

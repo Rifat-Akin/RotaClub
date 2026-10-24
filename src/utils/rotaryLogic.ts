@@ -3,6 +3,7 @@ import {
   LcvReminderQueueItem,
   MakeupSubmission,
   MemberRsvp,
+  MembershipLifecycleStatus,
   MenuPreference,
   PaymentNotification,
   ReminderChannel,
@@ -97,9 +98,117 @@ export function calculateKuverSummary(
 }
 
 /**
- * Generates RFC-4180 compliant CSV string for Pera Palace Hotel Kuver & Menu Matrix.
+ * Resolves a member's RSVP status for a specific meeting (#27, #28, #32).
+ * Uses `member.meetingRsvps[String(meetingNo)]` when present; falls back to `member.rsvpStatus`
+ * only if `selectedMeetingNo` matches `meetingNo` (or is omitted), otherwise defaults to `'pending'`.
  */
-export function generateKuverCsvContent(members: RotaryMember[], meetingNo: number): string {
+export function getMemberRsvpForMeeting(
+  member: Pick<RotaryMember, 'rsvpStatus' | 'meetingRsvps' | 'membershipStatus'>,
+  meetingNo: number,
+  selectedMeetingNo?: number
+): RsvpStatus {
+  if (
+    member.membershipStatus === 'İstifa / Ayrıldı' ||
+    member.membershipStatus === 'Nakil'
+  ) {
+    return 'excused';
+  }
+  const key = String(meetingNo);
+  const specific = member.meetingRsvps?.[key];
+  if (specific !== undefined) {
+    return specific;
+  }
+  if (
+    typeof selectedMeetingNo === 'number' &&
+    selectedMeetingNo !== meetingNo
+  ) {
+    return 'pending';
+  }
+  return member.rsvpStatus;
+}
+
+/**
+ * Resolves a member's menu preference for a specific meeting (#27, #28).
+ */
+export function getMemberMenuForMeeting(
+  member: Pick<RotaryMember, 'mealPreference' | 'meetingMenus'>,
+  meetingNo: number
+): MenuPreference {
+  const key = String(meetingNo);
+  return member.meetingMenus?.[key] || member.mealPreference || 'Standart';
+}
+
+/**
+ * Calculates per-meeting Kuver & Menu summary directly from the club member roster (#27, #28).
+ * Excludes resigned/transferred members (`İstifa / Ayrıldı`, `Nakil`) from active headcount.
+ */
+export function calculateMeetingKuverSummary(
+  members: RotaryMember[],
+  meetingNo: number,
+  selectedMeetingNo?: number
+): KuverSummaryResult {
+  let attendingMembers = 0;
+  let spousesCount = 0;
+  let guestsCount = 0;
+  let excusedMembers = 0;
+  let pendingMembers = 0;
+
+  const menuBreakdown: Record<MenuPreference, number> = {
+    Standart: 0,
+    Vejetaryen: 0,
+    Balık: 0,
+  };
+
+  for (const m of members) {
+    if (
+      m.membershipStatus === 'İstifa / Ayrıldı' ||
+      m.membershipStatus === 'Nakil'
+    ) {
+      continue;
+    }
+    const status = getMemberRsvpForMeeting(m, meetingNo, selectedMeetingNo);
+    const menu = getMemberMenuForMeeting(m, meetingNo);
+
+    if (status === 'excused') {
+      excusedMembers += 1;
+      continue;
+    }
+    if (status === 'pending') {
+      pendingMembers += 1;
+      continue;
+    }
+
+    attendingMembers += 1;
+    menuBreakdown[menu] = (menuBreakdown[menu] || 0) + 1;
+
+    if (status === 'with_spouse') {
+      spousesCount += 1;
+      menuBreakdown[menu] += 1;
+    } else if (status === 'with_guest') {
+      guestsCount += 1;
+      menuBreakdown[menu] += 1;
+    }
+  }
+
+  return {
+    attendingMembers,
+    spousesCount,
+    guestsCount,
+    excusedMembers,
+    pendingMembers,
+    totalKuver: attendingMembers + spousesCount + guestsCount,
+    menuBreakdown,
+  };
+}
+
+/**
+ * Generates RFC-4180 compliant CSV string for Pera Palace Hotel Kuver & Menu Matrix (#27, #28).
+ */
+export function generateKuverCsvContent(
+  members: RotaryMember[],
+  meetingNo: number,
+  selectedMeetingNo?: number
+): string {
   const headers = [
     'Rotary ID',
     'Üye Adı Soyadı',
@@ -117,24 +226,32 @@ export function generateKuverCsvContent(members: RotaryMember[], meetingNo: numb
     pending: 'Yanıt Bekleniyor',
   };
 
-  const rows = members.map((m) => {
+  const activeMembers = members.filter(
+    (m) =>
+      m.membershipStatus !== 'İstifa / Ayrıldı' &&
+      m.membershipStatus !== 'Nakil'
+  );
+
+  const rows = activeMembers.map((m) => {
+    const rsvp = getMemberRsvpForMeeting(m, meetingNo, selectedMeetingNo);
+    const menu = getMemberMenuForMeeting(m, meetingNo);
     const kuverCount =
-      m.rsvpStatus === 'with_spouse' || m.rsvpStatus === 'with_guest'
+      rsvp === 'with_spouse' || rsvp === 'with_guest'
         ? 2
-        : m.rsvpStatus === 'attending'
+        : rsvp === 'attending'
         ? 1
         : 0;
     const companion =
-      m.rsvpStatus === 'with_spouse'
+      rsvp === 'with_spouse'
         ? m.spouseName || 'Eşi'
-        : m.rsvpStatus === 'with_guest'
+        : rsvp === 'with_guest'
         ? m.guestName || 'Konuğu'
         : '-';
     return [
       m.rotaryId,
       m.fullName,
-      statusLabels[m.rsvpStatus],
-      m.rsvpStatus === 'excused' || m.rsvpStatus === 'pending' ? '-' : m.mealPreference,
+      statusLabels[rsvp],
+      rsvp === 'excused' || rsvp === 'pending' ? '-' : menu,
       companion,
       String(kuverCount),
     ]
@@ -178,7 +295,10 @@ export function generateMembersFinanceCsvContent(members: RotaryMember[]): strin
 }
 
 /**
- * Applies a bulk accrual (Toplu Tahakkuk / Borçlandırma) to all members by category.
+ * Applies a bulk accrual (Toplu Tahakkuk / Borçlandırma) to eligible active members by category (#24-#26, #38-#44).
+ * Honorary ('Onur Üyesi'), Resigned ('İstifa / Ayrıldı'), Transferred ('Nakil'), and Candidate ('Aday') members
+ * are exempt from mandatory dues/kuver accruals. Members on approved leave ('İzinli (Muaf)') are exempt from
+ * mandatory meal/kuver ('Toplantı Kuver Bakiyesi') accruals.
  */
 export function applyBulkMemberAccrual(
   members: RotaryMember[],
@@ -187,6 +307,18 @@ export function applyBulkMemberAccrual(
 ): RotaryMember[] {
   if (amount <= 0) return members;
   return members.map((m) => {
+    const status = m.membershipStatus || 'Aktif';
+    if (
+      status === 'Onur Üyesi' ||
+      status === 'İstifa / Ayrıldı' ||
+      status === 'Nakil' ||
+      status === 'Aday'
+    ) {
+      return m;
+    }
+    if (status === 'İzinli (Muaf)' && category === 'Toplantı Kuver Bakiyesi') {
+      return m;
+    }
     if (category === 'Dönem Aidatı') {
       return { ...m, duesBalance: m.duesBalance + amount };
     }
@@ -1137,6 +1269,14 @@ export function evaluateLcvReminderBatch(params: {
 
   const meetingKey = String(params.meetingNo);
   const pendingMembers = params.members.filter((m) => {
+    const lifecycle = m.membershipStatus || 'Aktif';
+    if (
+      lifecycle === 'İstifa / Ayrıldı' ||
+      lifecycle === 'Nakil' ||
+      lifecycle === 'Aday'
+    ) {
+      return false;
+    }
     const specificRsvp = m.meetingRsvps?.[meetingKey];
     if (specificRsvp !== undefined) {
       return specificRsvp === 'pending';
@@ -1239,4 +1379,234 @@ export function maskGuestNameForPublicVerification(fullName: string): string {
     .map((part) => `${part.charAt(0)}***`);
   return `${hasRtnPrefix ? 'Rtn. ' : ''}${maskedParts.join(' ')}`;
 }
+
+export interface TermAttendanceMetrics {
+  memberId: string;
+  heldMeetingsCount: number;
+  exemptMeetingsCount: number;
+  obligatoryMeetingsCount: number;
+  directAttendedMeetingsCount: number;
+  approvedMakeupsApplied: number;
+  creditedMeetingsCount: number;
+  attendancePercentage: number;
+  meetsRotary60PercentRule: boolean;
+}
+
+/**
+ * Issue #27, #28, #34: Real meeting-by-meeting term attendance calculation.
+ * Computes attendance percentage from actual held (non-cancelled) meetings,
+ * verified direct meeting attendances (`meetingAttendances[String(meetingNo)]`),
+ * approved make-ups bound to `memberId` (deduplicated by activity key),
+ * and excused/exempt leave status (`membershipStatus === 'İzinli (Muaf)'` or `'Onur Üyesi'`).
+ */
+export function calculateTermAttendanceMetrics(params: {
+  member: Pick<
+    RotaryMember,
+    'id' | 'fullName' | 'membershipStatus' | 'attendancePercent'
+  >;
+  meetings: WeeklyMeeting[];
+  meetingAttendances: Record<string, string[]>;
+  makeupSubmissions: MakeupSubmission[];
+  allMembers?: Pick<RotaryMember, 'id' | 'fullName'>[];
+}): TermAttendanceMetrics {
+  const { member, meetings, meetingAttendances, makeupSubmissions, allMembers } =
+    params;
+
+  if (member.membershipStatus === 'Onur Üyesi') {
+    return {
+      memberId: member.id,
+      heldMeetingsCount: meetings.filter((m) => m.status !== 'İptal Edildi')
+        .length,
+      exemptMeetingsCount: meetings.filter((m) => m.status !== 'İptal Edildi')
+        .length,
+      obligatoryMeetingsCount: 0,
+      directAttendedMeetingsCount: 0,
+      approvedMakeupsApplied: 0,
+      creditedMeetingsCount: 0,
+      attendancePercentage: 100,
+      meetsRotary60PercentRule: true,
+    };
+  }
+
+  // Count non-cancelled meetings that are completed, past, or already have recorded attendances
+  const heldMeetings = meetings.filter((m) => {
+    if (m.status === 'İptal Edildi') return false;
+    const attendees = meetingAttendances[String(m.meetingNo)] || [];
+    return (
+      m.isPast === true ||
+      m.status === 'Tamamlandı' ||
+      m.status === 'Aktif' ||
+      attendees.length > 0
+    );
+  });
+
+  const heldMeetingsCount = heldMeetings.length;
+  if (heldMeetingsCount === 0) {
+    return {
+      memberId: member.id,
+      heldMeetingsCount: 0,
+      exemptMeetingsCount: 0,
+      obligatoryMeetingsCount: 0,
+      directAttendedMeetingsCount: 0,
+      approvedMakeupsApplied: 0,
+      creditedMeetingsCount: 0,
+      attendancePercentage: member.attendancePercent || 100,
+      meetsRotary60PercentRule: (member.attendancePercent || 100) >= 60,
+    };
+  }
+
+  let directAttendedMeetingsCount = 0;
+  let exemptMeetingsCount = 0;
+
+  for (const m of heldMeetings) {
+    const attendees = meetingAttendances[String(m.meetingNo)] || [];
+    if (attendees.includes(member.id)) {
+      directAttendedMeetingsCount += 1;
+    } else if (member.membershipStatus === 'İzinli (Muaf)') {
+      exemptMeetingsCount += 1;
+    }
+  }
+
+  const obligatoryMeetingsCount = Math.max(
+    0,
+    heldMeetingsCount - exemptMeetingsCount
+  );
+
+  // Deduplicate approved make-up submissions belonging to this member
+  const seenActivityKeys = new Set<string>();
+  let uniqueApprovedMakeups = 0;
+  for (const sub of makeupSubmissions) {
+    if (sub.status !== 'Onaylandı') continue;
+    const effectiveMemberId =
+      sub.memberId ||
+      resolveUnambiguousLegacyMemberId(sub.memberName, allMembers);
+    if (effectiveMemberId !== member.id) continue;
+    const key = buildMakeupActivityKey({
+      memberId: member.id,
+      date: sub.date,
+      targetClubOrEvent: sub.targetClubOrEvent,
+      activityType: sub.activityType,
+    });
+    if (seenActivityKeys.has(key)) continue;
+    seenActivityKeys.add(key);
+    uniqueApprovedMakeups += 1;
+  }
+
+  const missedMeetingsCount = Math.max(
+    0,
+    obligatoryMeetingsCount - directAttendedMeetingsCount
+  );
+  const approvedMakeupsApplied = Math.min(
+    missedMeetingsCount,
+    uniqueApprovedMakeups
+  );
+  const creditedMeetingsCount =
+    directAttendedMeetingsCount + approvedMakeupsApplied;
+
+  const attendancePercentage =
+    obligatoryMeetingsCount === 0
+      ? 100
+      : Math.min(
+          100,
+          Math.round((creditedMeetingsCount / obligatoryMeetingsCount) * 100)
+        );
+
+  return {
+    memberId: member.id,
+    heldMeetingsCount,
+    exemptMeetingsCount,
+    obligatoryMeetingsCount,
+    directAttendedMeetingsCount,
+    approvedMakeupsApplied,
+    creditedMeetingsCount,
+    attendancePercentage,
+    meetsRotary60PercentRule: attendancePercentage >= 60,
+  };
+}
+
+/**
+ * Issue #24-#26: Validates a member lifecycle status transition (Candidate -> Active -> Leave -> Honorary -> Resigned/Transferred).
+ * Blocks exit/resignation/transfer when the member has unsettled financial obligations unless an explicit board waiver is recorded.
+ */
+export function validateMemberLifecycleTransition(params: {
+  member: Pick<
+    RotaryMember,
+    'id' | 'fullName' | 'membershipStatus' | 'duesBalance' | 'mealBalance' | 'foundationBalance'
+  >;
+  targetStatus: MembershipLifecycleStatus;
+  reason?: string;
+  leaveStartDate?: string;
+  leaveEndDate?: string;
+  boardDebtWaiverApproved?: boolean;
+}):
+  | { ok: true; currentStatus: MembershipLifecycleStatus }
+  | { ok: false; error: string; message: string } {
+  const allowedStatuses: MembershipLifecycleStatus[] = [
+    'Aktif',
+    'Aday',
+    'İzinli (Muaf)',
+    'Onur Üyesi',
+    'İstifa / Ayrıldı',
+    'Nakil',
+  ];
+  if (!allowedStatuses.includes(params.targetStatus)) {
+    return {
+      ok: false,
+      error: 'INVALID_LIFECYCLE_STATUS',
+      message: `Geçersiz üyelik yaşam döngüsü durumu (#24-#26): "${String(
+        params.targetStatus
+      )}".`,
+    };
+  }
+
+  const cleanReason = String(params.reason || '').trim();
+  if (cleanReason.length < 5) {
+    return {
+      ok: false,
+      error: 'LIFECYCLE_REASON_REQUIRED',
+      message:
+        'Üyelik durumu değişikliği için en az 5 karakterlik YK karar/gerekçe açıklaması (reason) zorunludur (#24-#26).',
+    };
+  }
+
+  if (params.targetStatus === 'İzinli (Muaf)') {
+    if (
+      !params.leaveStartDate ||
+      !String(params.leaveStartDate).trim() ||
+      !params.leaveEndDate ||
+      !String(params.leaveEndDate).trim()
+    ) {
+      return {
+        ok: false,
+        error: 'LEAVE_DETAILS_REQUIRED',
+        message:
+          'İzinli (Muaf) statüsüne geçişte izin başlangıç (leaveStartDate) ve bitiş (leaveEndDate) tarihleri zorunludur (#25).',
+      };
+    }
+  }
+
+  const totalDebt =
+    (params.member.duesBalance || 0) +
+    (params.member.mealBalance || 0) +
+    (params.member.foundationBalance || 0);
+
+  if (
+    (params.targetStatus === 'İstifa / Ayrıldı' ||
+      params.targetStatus === 'Nakil') &&
+    totalDebt > 0 &&
+    !params.boardDebtWaiverApproved
+  ) {
+    return {
+      ok: false,
+      error: 'UNSETTLED_MEMBER_BALANCE_ON_EXIT',
+      message: `Borç kapama kontrolü (#26, #38): ${params.member.fullName} üyesinin toplam ${totalDebt} TL kapanmamış cari borcu bulunmaktadır. Borç tahsil edilmeden veya açık YK borç ibra onayı (boardDebtWaiverApproved) olmadan istifa/nakil işlemi tamamlanamaz.`,
+    };
+  }
+
+  return {
+    ok: true,
+    currentStatus: params.member.membershipStatus || 'Aktif',
+  };
+}
+
 

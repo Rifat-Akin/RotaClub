@@ -1374,6 +1374,34 @@ export default function App() {
       return;
     }
     try {
+      const targetCard = guestMakeupCards.find(
+        (c) => c.id === cardId || c.verificationCode === cardId
+      );
+      let guestAttendanceRecordId = targetCard?.guestAttendanceRecordId;
+
+      if (targetCard && !guestAttendanceRecordId) {
+        const checkinRes = await fetch('/api/pilot/guest-checkin', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            clubId: activeTenantClubId,
+            meetingNo: targetCard.meetingNo,
+            guestName: targetCard.guestName,
+            guestClub: targetCard.guestClub,
+            guestDistrict: targetCard.guestDistrict,
+            checkinMethod: 'Salon Kayıt Masası',
+            evidenceNote: attendanceEvidence,
+          }),
+        });
+        const checkinData = await checkinRes.json().catch(() => ({}));
+        if (checkinRes.ok && checkinData?.guestAttendanceRecord?.id) {
+          guestAttendanceRecordId = checkinData.guestAttendanceRecord.id;
+        }
+      }
+
       const res = await fetch('/api/pilot/approve-certificate', {
         method: 'POST',
         headers: {
@@ -1384,6 +1412,7 @@ export default function App() {
           clubId: activeTenantClubId,
           certificateId: cardId,
           attendanceEvidence,
+          ...(guestAttendanceRecordId ? { guestAttendanceRecordId } : {}),
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -1391,7 +1420,7 @@ export default function App() {
         showToast(
           `Belge Onayı Reddedildi (${res.status})`,
           data?.message ||
-            'Katılım belgesi onaylanamadı. Toplantı yoklama kaydının mevcut olduğundan emin olunuz.'
+            'Katılım belgesi onaylanamadı. Misafir salon yoklama kaydının mevcut olduğundan emin olunuz.'
         );
         return;
       }
@@ -1402,7 +1431,7 @@ export default function App() {
       showToast(
         'Misafir Katılım Belgesi Onaylandı & Aktifleştirildi (#36)',
         data?.message ||
-          'Belge sunucu onay kapısından geçerek resmi doğrulamaya açıldı.'
+          'Belge kişi ve toplantı bazlı yoklama kanıtıyla sunucu onay kapısından geçerek resmi doğrulamaya açıldı.'
       );
     } catch {
       showToast('Bağlantı Hatası', 'Belge onay servisine ulaşılamadı.');

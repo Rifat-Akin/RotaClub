@@ -3494,6 +3494,96 @@ test('Pilot Modules (#29, #46, #51, #32, #33, #35, #36): Server enforces LCV loc
     const missingEvidenceBody = await missingEvidenceApproveCertRes.json();
     assert.equal(missingEvidenceBody.error, 'ATTENDANCE_EVIDENCE_REQUIRED');
 
+    // 12b-4. Security Audit (#36): Even though club members (m-rifat, m-canan) are checked into Meeting #1842,
+    // attempting to approve Rtn. Hakan Çelik's certificate BEFORE recording his specific guest attendance MUST fail with 422 GUEST_ATTENDANCE_NOT_VERIFIED!
+    const approveWithoutGuestCheckinRes = await fetch(
+      `${baseUrl}/api/pilot/approve-certificate`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sekreterSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          certificateId: 'gmk-server-verified-36',
+          attendanceEvidence:
+            'Toplantı #1842 salon yoklama listesi ve misafir defteri teyidi',
+        }),
+      }
+    );
+    assert.equal(approveWithoutGuestCheckinRes.status, 422);
+    const approveWithoutGuestCheckinBody =
+      await approveWithoutGuestCheckinRes.json();
+    assert.equal(
+      approveWithoutGuestCheckinBody.error,
+      'GUEST_ATTENDANCE_NOT_VERIFIED'
+    );
+
+    // Recording a different guest's attendance for Meeting #1842 still does NOT allow approving Rtn. Hakan Çelik's certificate!
+    const otherGuestCheckinRes = await fetch(
+      `${baseUrl}/api/pilot/guest-checkin`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sekreterSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          meetingNo: 1842,
+          guestName: 'Rtn. Başka Misafir',
+          guestClub: 'Farklı Rotary Kulübü',
+          checkinMethod: 'Salon Kayıt Masası',
+          evidenceNote: 'Salon giriş defteri sıra #1',
+        }),
+      }
+    );
+    assert.equal(otherGuestCheckinRes.status, 200);
+
+    const approveWithWrongGuestRes = await fetch(
+      `${baseUrl}/api/pilot/approve-certificate`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sekreterSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          certificateId: 'gmk-server-verified-36',
+          attendanceEvidence:
+            'Toplantı #1842 salon yoklama listesi ve misafir defteri teyidi',
+        }),
+      }
+    );
+    assert.equal(approveWithWrongGuestRes.status, 422);
+    const approveWithWrongGuestBody = await approveWithWrongGuestRes.json();
+    assert.equal(
+      approveWithWrongGuestBody.error,
+      'GUEST_ATTENDANCE_NOT_VERIFIED'
+    );
+
+    // Now record verified guest attendance specifically for Rtn. Hakan Çelik (Kadıköy Rotary Kulübü) at Meeting #1842
+    const hakanCheckinRes = await fetch(`${baseUrl}/api/pilot/guest-checkin`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${sekreterSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        meetingNo: 1842,
+        guestName: 'Rtn. Hakan Çelik',
+        guestClub: 'Kadıköy Rotary Kulübü',
+        checkinMethod: 'Salon Kayıt Masası',
+        evidenceNote: 'Toplantı #1842 misafir kayıt defteri sıra #2 imzalı',
+      }),
+    });
+    assert.equal(hakanCheckinRes.status, 200);
+    const hakanCheckinBody = await hakanCheckinRes.json();
+    assert.ok(hakanCheckinBody.guestAttendanceRecord?.id);
+
     const approveCertRes = await fetch(
       `${baseUrl}/api/pilot/approve-certificate`,
       {
@@ -3515,6 +3605,10 @@ test('Pilot Modules (#29, #46, #51, #32, #33, #35, #36): Server enforces LCV loc
     const issuedCert = approveCertBody.certificate;
     assert.equal(issuedCert.status, 'Aktif');
     assert.equal(issuedCert.approvedByMemberId, sekreterSession.user.memberId);
+    assert.equal(
+      issuedCert.guestAttendanceRecordId,
+      hakanCheckinBody.guestAttendanceRecord.id
+    );
     assert.equal(
       issuedCert.attendanceEvidence,
       'Toplantı #1842 salon yoklama listesi ve misafir defteri teyidi'
@@ -3691,6 +3785,176 @@ test('Independent Security Audit Regression (#32, #35, #36): Certificate approva
     );
   });
 });
+
+test('Issues #13/#14/#18/#19, #24-#26, #27/#28/#34, & #38-#44: Relational DB Health, Member Lifecycle Exit Debt Gate, Per-Meeting Attendance Metrics, and Bulk Accrual Exemptions', async () => {
+  await withTestServer(async (baseUrl) => {
+    const sekreterSession = await loginRole(
+      baseUrl,
+      'TR-2420-81024',
+      TEST_PINS.sekreter
+    );
+    const saymanSession = await loginRole(
+      baseUrl,
+      'TR-2420-79310',
+      TEST_PINS.sayman
+    );
+
+    // 1. Relational DB Health check (#13, #14, #18, #19)
+    const dbHealthRes = await fetch(
+      `${baseUrl}/api/pilot/db-health?clubId=club-galata`,
+      {
+        headers: { Authorization: `Bearer ${sekreterSession.token}` },
+      }
+    );
+    assert.equal(dbHealthRes.status, 200);
+    const dbHealthBody = await dbHealthRes.json();
+    assert.equal(dbHealthBody.ok, true);
+    assert.equal(dbHealthBody.healthy, true);
+    assert.equal(dbHealthBody.violations.length, 0);
+    assert.equal(
+      dbHealthBody.relationalSchema.version,
+      '5.4.0-relational-hardened'
+    );
+
+    // 2. Member Lifecycle Management (#24-#26):
+    // 2a. Member with unsettled debt (m-rifat has dues/meal balance > 0) CANNOT transition to 'İstifa / Ayrıldı' without boardDebtWaiverApproved (422 UNSETTLED_MEMBER_BALANCE_ON_EXIT)
+    const blockedExitRes = await fetch(
+      `${baseUrl}/api/pilot/member-lifecycle`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sekreterSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          targetMemberId: 'm-rifat',
+          targetStatus: 'İstifa / Ayrıldı',
+          reason: 'Şehir değişikliği nedeniyle ayrılma talebi',
+        }),
+      }
+    );
+    assert.equal(blockedExitRes.status, 422);
+    const blockedExitBody = await blockedExitRes.json();
+    assert.equal(blockedExitBody.error, 'UNSETTLED_MEMBER_BALANCE_ON_EXIT');
+
+    // 2b. Transition to 'İzinli (Muaf)' without leaveStartDate / leaveEndDate fails with 422 LEAVE_DETAILS_REQUIRED
+    const blockedLeaveRes = await fetch(
+      `${baseUrl}/api/pilot/member-lifecycle`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sekreterSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          targetMemberId: 'm-2',
+          targetStatus: 'İzinli (Muaf)',
+          reason: 'Akademik izin talebi',
+        }),
+      }
+    );
+    assert.equal(blockedLeaveRes.status, 422);
+    const blockedLeaveBody = await blockedLeaveRes.json();
+    assert.equal(blockedLeaveBody.error, 'LEAVE_DETAILS_REQUIRED');
+
+    // 2c. Valid transition of m-2 (Nazlı Denizmen, 0 debt) to 'Onur Üyesi' succeeds and records lifecycleHistory
+    const honoraryTransitionRes = await fetch(
+      `${baseUrl}/api/pilot/member-lifecycle`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sekreterSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          targetMemberId: 'm-2',
+          targetStatus: 'Onur Üyesi',
+          reason: 'YK 2026/18 sayılı kararı ile Onur Üyeliğine yükseltildi',
+          boardResolutionRef: 'YK-2026-18',
+        }),
+      }
+    );
+    assert.equal(honoraryTransitionRes.status, 200);
+    const honoraryTransitionBody = await honoraryTransitionRes.json();
+    assert.equal(honoraryTransitionBody.member.membershipStatus, 'Onur Üyesi');
+    assert.equal(
+      honoraryTransitionBody.member.lifecycleHistory.length >= 1,
+      true
+    );
+
+    // 3. Treasury Bulk Accrual Exemptions & Duplicate Period Protection (#38-#44):
+    // Accruing 'Dönem Aidatı' charges active members (e.g. m-rifat) but exempts 'Onur Üyesi' (m-2)
+    const beforeRifatDues = honoraryTransitionBody.state.members.find(
+      (m: { id: string }) => m.id === 'm-rifat'
+    ).duesBalance;
+    const accrualRes = await fetch(`${baseUrl}/api/pilot/bulk-accrual`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${saymanSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        category: 'Dönem Aidatı',
+        amount: 6000,
+        period: 'Kasım 2026 Dönem Aidatı',
+        description: 'Kasım 2026 2. Taksit Aidat Tahakkuku',
+      }),
+    });
+    assert.equal(accrualRes.status, 200);
+    const accrualBody = await accrualRes.json();
+    const afterRifat = accrualBody.state.members.find(
+      (m: { id: string }) => m.id === 'm-rifat'
+    );
+    const afterHonorary = accrualBody.state.members.find(
+      (m: { id: string }) => m.id === 'm-2'
+    );
+    assert.equal(afterRifat.duesBalance, beforeRifatDues + 6000);
+    assert.equal(afterHonorary.duesBalance, 0); // Honorary member exempt!
+
+    // Duplicate bulk accrual for the same period & title is blocked with 409 DUPLICATE_ACCRUAL_IDEMPOTENCY / DUPLICATE_PERIOD_ACCRUAL
+    const dupAccrualRes = await fetch(`${baseUrl}/api/pilot/bulk-accrual`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${saymanSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        category: 'Dönem Aidatı',
+        amount: 6000,
+        period: 'Kasım 2026 Dönem Aidatı',
+        description: 'Kasım 2026 2. Taksit Aidat Tahakkuku',
+      }),
+    });
+    assert.equal(dupAccrualRes.status, 409);
+    const dupAccrualBody = await dupAccrualRes.json();
+    assert.equal(dupAccrualBody.code, 'DUPLICATE_PERIOD_ACCRUAL');
+
+    // 4. Per-Meeting LCV & Real Term Attendance Metrics Endpoint (#27, #28, #34)
+    const attMetricsRes = await fetch(
+      `${baseUrl}/api/pilot/attendance-metrics?clubId=club-galata&meetingNo=1842`,
+      {
+        headers: { Authorization: `Bearer ${sekreterSession.token}` },
+      }
+    );
+    assert.equal(attMetricsRes.status, 200);
+    const attMetricsBody = await attMetricsRes.json();
+    assert.equal(attMetricsBody.ok, true);
+    assert.equal(attMetricsBody.meetingNo, 1842);
+    assert.equal(typeof attMetricsBody.meetingKuverSummary.totalKuver, 'number');
+    assert.equal(Array.isArray(attMetricsBody.memberMetrics), true);
+    const honoraryMetric = attMetricsBody.memberMetrics.find(
+      (m: { memberId: string }) => m.memberId === 'm-2'
+    );
+    assert.equal(honoraryMetric.attendancePercentage, 100);
+    assert.equal(honoraryMetric.meetsRotary60PercentRule, true);
+  });
+});
+
 
 
 
