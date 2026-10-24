@@ -1,4 +1,4 @@
-name: RotaClub CI — Güvenlik, RBAC, Entegrasyon Testleri & Build
+name: RotaClub CI - Typecheck, Tests, Build and Security
 
 on:
   push:
@@ -6,30 +6,57 @@ on:
   pull_request:
     branches: [main, master, develop]
 
+permissions:
+  contents: read
+
 jobs:
   verify-rotaclub:
-    name: TypeScript, Birim & Sunucu RBAC Entegrasyon Testleri
+    name: Typecheck, Unit/API Tests and Build
     runs-on: ubuntu-latest
-
+    timeout-minutes: 20
     steps:
-      - name: Checkout RotaClub Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 22 LTS
+      - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
+          cache: npm
           cache-dependency-path: package-lock.json
 
-      - name: Install Dependencies (Deterministic Lockfile)
+      - name: Install locked dependencies
         run: npm ci --legacy-peer-deps
 
-      - name: TypeScript Strict Typecheck (npm run lint)
+      - name: Typecheck (npm run lint is tsc --noEmit)
         run: npm run lint
 
-      - name: Run Unit & Server RBAC / Audit Hash-Chain Integration Tests (npm test)
+      - name: Unit and API integration regression tests
         run: npm test
 
-      - name: Verify Production Frontend Build (npm run build)
+      - name: Build frontend bundle
         run: npm run build
+
+  security-baseline:
+    name: Secret Scan and Production Dependency Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Verify secret scanner detects planted fixtures
+        run: node scripts/check-secrets.mjs --self-test
+
+      - name: Scan tracked files for high-confidence secrets
+        run: node scripts/check-secrets.mjs
+
+      - name: Audit production dependencies for high or critical advisories
+        run: npm audit --omit=dev --audit-level=high

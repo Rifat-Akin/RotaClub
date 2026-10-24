@@ -1,22 +1,39 @@
-## RotaClub PR Özeti
+## Purpose / issue
+- Related existing issue(s): #
+- Scope and base SHA:
+- Writer / file ownership confirmed:
+- Current state: IMPLEMENTED / CI_PASS / STAGING_VERIFIED / PILOT_ACCEPTED
 
-- **İlgili GitHub Issue / Epic:** Closes #
-- **Etkilenen Alan (Epic):**
-  - [ ] #2 Altyapı, Güvenlik, Veritabanı, KVKK
-  - [ ] #3 Üyelik, Giriş, Yetkilendirme (RBAC)
-  - [ ] #4 Toplantılar, LCV, Kuver, Tutanak
-  - [ ] #5 QR Yoklama, Make-up, Sertifikalar
-  - [ ] #6 Saymanlık ve Muhasebe
-  - [ ] #7 Yönetim Kurulu, Komiteler, Dönem Devri
-  - [ ] #8 Projeler, Burslar, Gönüllüler
-  - [ ] #9 Bildirimler ve Entegrasyonlar
-  - [ ] #10 Mobil PWA, Tasarım ve Erişilebilirlik
-  - [ ] #11 Çoklu Kulüp (Multi-Tenant) Genişleme
+## Changes
+- Product or API behavior:
+- Files/modules changed:
+- Data/schema migration and backward compatibility:
 
-## Kabul Kriterleri & Doğrulama Kontrol Listesi
+## Verification (include exact GitHub Actions run URL)
+- [ ] `npm run lint` (TypeScript typecheck, not ESLint)
+- [ ] `npm test` (unit + API integration)
+- [ ] `npm run build`
+- [ ] `node scripts/check-secrets.mjs --self-test`
+- [ ] `node scripts/check-secrets.mjs`
+- [ ] `npm audit --omit=dev --audit-level=high`
+- [ ] Negative RBAC / tenant / replay and concurrency tests, where affected
+- [ ] Device/browser E2E or staging smoke, where affected
 
-- [ ] `npm test` (birim testleri) hatasız geçti.
-- [ ] `npm run lint` ve `npm run build` sıfır TypeScript/derleme hatası ile tamamlandı.
-- [ ] Yetkili işlemler (Sekreter kuver yönetimi, Sayman dekont onayı, Başkan dönem/toplantı yönetimi) sunucu tarafında rol kontrolünden (`RBAC`) geçiyor.
-- [ ] Kritik veri değişiklikleri `Denetim Geçmişi (Audit Log)` tablosuna kaydediliyor.
-- [ ] KVKK kapsamında kişisel üye verileri açıkta loglanmadı ve `.env` gizli anahtarları repoya eklenmedi.
+**Commands, results and test limitations:**
+
+## Privacy, security and real-world effect
+- [ ] No secrets, real member data, bank statements or scholarship PII committed
+- [ ] Auth/tenant/financial boundaries reviewed if touched
+- [ ] Real messages, actual payments, live data and official document activation remain disabled until separately authorized
+
+## Rollback, monitoring and release
+- Rollback steps:
+- Staging/backward-compatibility evidence:
+- Known risks / remaining HOLD items:
+- Screenshots or redacted API evidence (if UI changed):
+
+## Independent review and GitHub read-back
+- Reviewer:
+- Remote commit SHA:
+- CI URL:
+- Related acceptance issue(s) updated only after verification:
