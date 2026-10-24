@@ -153,18 +153,58 @@ const githubGet = async (resource, token) => {
   return response.json();
 };
 
+/**
+ * A branch's active ruleset is readable with repository Metadata:read.
+ * Legacy branch-protection required-checks API needs Administration:read,
+ * which the least-privilege GitHub Actions token does not normally have.
+ * An absent/malformed ruleset must NEVER be interpreted as passing.
+ */
+export function requiredStatusesFromRules(activeRules) {
+  if (!Array.isArray(activeRules)) return null;
+  const checks = activeRules
+    .filter((rule) => rule?.type === 'required_status_checks')
+    .flatMap((rule) => Array.isArray(rule.parameters?.required_status_checks)
+      ? rule.parameters.required_status_checks
+      : [])
+    .filter((item) => typeof item?.context === 'string' && item.context.trim())
+    .map((item) => ({ context: item.context }));
+  return checks.length ? { contexts: [], checks } : null;
+}
+
 export async function collectReleaseEvidence(token) {
   if (!token || typeof token !== 'string') throw new Error('GITHUB_TOKEN_REQUIRED');
   const branch = await githubGet('/branches/main', token);
   const sha = branch?.commit?.sha;
   if (!shaIsValid(sha)) throw new Error('UNTRUSTED_BRANCH_HEAD');
-  const [checkRuns, requiredStatuses, ...issues] = await Promise.all([
+  const [checkRuns, activeRules, ...issues] = await Promise.all([
     githubGet('/commits/' + sha + '/check-runs?per_page=100', token),
-    branch.protected
-      ? githubGet('/branches/main/protection/required_status_checks', token)
-      : Promise.resolve(null),
+    githubGet('/rules/branches/main?per_page=100', token),
     ...BLOCKING_ISSUES.map((n) => githubGet('/issues/' + n, token)),
   ]);
+  let requiredStatuses = requiredStatusesFromRules(activeRules);
+  const alreadyRequired = REQUIRED_CHECK_NAMES.every((name) =>
+    requiredStatuses?.checks?.some((item) => item.context === name)
+  );
+  if (branch.protected && !alreadyRequired) {
+    try {
+      const legacy = await githubGet(
+        '/branches/main/protection/required_status_checks', token
+      );
+      requiredStatuses = {
+        contexts: [
+          ...(requiredStatuses?.contexts || []),
+          ...(legacy?.contexts || []),
+        ],
+        checks: [
+          ...(requiredStatuses?.checks || []),
+          ...(legacy?.checks || []),
+        ],
+      };
+    } catch {
+      // Legacy permission denied or no classic protection: report HOLD unless
+      // the active ruleset itself establishes both required checks.
+    }
+  }
   return {
     branch, checkRuns, requiredStatuses,
     issues: Object.fromEntries(BLOCKING_ISSUES.map((n, i) => [n, issues[i]])),
