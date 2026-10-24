@@ -9,7 +9,9 @@ GitHub `main`, linked issues and CI runs are the code source of truth. Treat age
 - `src/App.tsx`, `src/components/**`: UI; `src/types/**` and `src/utils/**`: app logic and tests.
 - `.github/**`, `README.md`, `AGENTS.md`, `docs/adr/**`, `scripts/check-secrets.mjs`: CI, quality and contributor documents.
 
-For **24 October 2026 coordinated work**: Google AI Studio owns application/API/runtime and their tests; ChatGPT owns CI, security-scan and contributor-document paths. Before changing ownership or overlapping files, coordinate through the GitHub issue/PR. This temporary lane assignment must be rechecked on handoff.
+For the **24 October 2026 next-pull handoff**, Google AI Studio's next writer lane is application/API/runtime and their tests (`server.ts`, `src/**`); ChatGPT's writer lane is `.github/**`, `README.md`, `AGENTS.md`, `docs/**`, and `scripts/check-*.mjs` / release evidence scripts. As of independently reviewed application SHA `99926167584018c7261fd6dcd1da04084548185b`, no simultaneous AI Studio edit is claimed. **Always fetch fresh `main` and active PRs before acquiring a file lease.** Do not overwrite a newer writer or infer branch selection support in AI Studio without verifying its GitHub sync UI.
+
+At this SHA, application security HOLD findings are anchored in [#13](https://github.com/Rifat-Akin/RotaClub/issues/13#issuecomment-6384005197), [#70](https://github.com/Rifat-Akin/RotaClub/issues/70#issuecomment-6384004355), [#24](https://github.com/Rifat-Akin/RotaClub/issues/24#issuecomment-6384005983), [#39](https://github.com/Rifat-Akin/RotaClub/issues/39#issuecomment-6384008057) and [#34](https://github.com/Rifat-Akin/RotaClub/issues/34#issuecomment-6384007235). Real PostgreSQL and club pilot approval remain HOLD. `main` only blocks deletion/force-push; a second PR + required-check ruleset is currently **disabled** to preserve AI Studio direct sync.
 
 ## Invariants
 
