@@ -9,7 +9,7 @@ RotaClub is a **pilot-stage** club operations application, currently oriented to
 - Frontend entry: `src/App.tsx`; views: `src/components/`.
 - API: `server.ts`; authentication, tenant store, migration and audit: `src/server/pilotEngine.ts`.
 - Data currently includes synthetic fixtures in `src/data/mockGalataData.ts`.
-- `src/server/postgresSchema.sql` is a **schema artifact**. Its presence does **not** mean PostgreSQL is the active runtime store; `AtomicMultiTenantStore` remains in use. Relational migration, backup and restore are tracked in [#13](https://github.com/Rifat-Akin/RotaClub/issues/13) and [#19](https://github.com/Rifat-Akin/RotaClub/issues/19).
+- `src/server/postgresSchema.sql` is a **schema artifact**; `src/server/sqlRelationalEngine.ts` runs a **test-only/in-memory SQLite** translation for constraints and sample migration. Neither constitutes active PostgreSQL or a complete validated migration. `AtomicMultiTenantStore` remains the API store. [#13](https://github.com/Rifat-Akin/RotaClub/issues/13#issuecomment-6384005197) and [#70](https://github.com/Rifat-Akin/RotaClub/issues/70#issuecomment-6384004355) document SQL tenant FK / no-loss blockers; [#19](https://github.com/Rifat-Akin/RotaClub/issues/19) tracks off-host restore.
 - External messaging, real payments, real member invitations and official document activation must stay behind their separate approval gates.
 
 ## Local development (synthetic data only)
@@ -48,6 +48,14 @@ GitHub Actions runs the typecheck, tests, build, tracked-file secret scan and pr
 3. Keep PRs small, attach tests and a rollback strategy, and use the [PR template](.github/pull_request_template.md). Include a source SHA and links to GitHub Actions.
 4. Require independent review for authentication, multi-tenant isolation, financial state, privacy, backup and official certificates. **Do not equate local PASS with production GO.**
 5. Merge only after relevant checks and review; re-read remote `main` and the issue before claiming completion. Enable branch protection/required checks in repository settings; a workflow file alone does not enforce a protected `main`.
+
+## Current GitHub safety / writer handoff (24 October 2026)
+
+- Ruleset `25780508` is **active** for `main`: delete/force-push history rewrite forbidden.
+- Ruleset `25780663` defines mandatory PR + two required CI checks but remains **DISABLED** until the Google AI Studio GitHub integration can safely export to a separate feature branch, make a PR, merge, and pull again. Do not activate prematurely or claim mandatory reviews are already enforced.
+- GitHub secret scanning, push protection and Dependabot **security alerts** are enabled. Automatic Dependabot security-fix PRs are intentionally disabled to avoid overlapping AI Studio writes.
+- [Latest independent application-source review](https://github.com/Rifat-Akin/RotaClub/issues/76#issuecomment-6384017421) is tied to source SHA `99926167584018c7261fd6dcd1da04084548185b`. Source tests pass, but the [#70 cross-club SQL FK](https://github.com/Rifat-Akin/RotaClub/issues/70#issuecomment-6384004355), [#13 no-loss migration](https://github.com/Rifat-Akin/RotaClub/issues/13#issuecomment-6384005197), [#24/#39 debt waiver and journal](https://github.com/Rifat-Akin/RotaClub/issues/39#issuecomment-6384008057) and [#34 percentage policy](https://github.com/Rifat-Akin/RotaClub/issues/34#issuecomment-6384007235) findings remain open.
+- For the next AI Studio session: **pull current `main` before modifying application files**. Read `AGENTS.md` and the cited GitHub issue comments. Never force-push, assume ChatGPT's CI/doc files are the application-writer lane, or start a production database cutover on the basis of SQLite verification alone.
 
 ## Read-only release evidence audit (#21)
 
