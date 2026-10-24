@@ -1,0 +1,33 @@
+name: RotaClub Release Evidence Audit (NO DEPLOY)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: read
+  issues: read
+
+jobs:
+  evidence-only:
+    name: Read-only Release Preconditions (never deploy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout main at the dispatched SHA
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+
+      - name: Verify release gate negative fixtures
+        run: node --test scripts/release-preflight.test.mjs
+
+      - name: Read GitHub evidence and report HOLD or machine PASS
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/release-preflight.mjs
