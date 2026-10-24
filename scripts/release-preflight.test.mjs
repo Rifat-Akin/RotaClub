@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   CANONICAL_REPO, REQUIRED_CHECK_NAMES, evaluateReleaseEvidence,
-  validateDispatchWorkflow, markdownSummary,
+  validateDispatchWorkflow, markdownSummary, requiredStatusesFromRules,
 } from './release-preflight.mjs';
 
 const SHA = 'a'.repeat(40);
@@ -47,6 +47,44 @@ test('required checks must both be configured in branch protection', () => {
   const x = input();
   x.requiredStatuses.checks.pop();
   assert.equal(gate(evaluateReleaseEvidence(x), 'both-required-checks').pass, false);
+});
+
+test('active ruleset status checks are observable with read-only Metadata rights', () => {
+  const rules = [
+    { type: 'required_status_checks', parameters: {
+      required_status_checks: [{ context: REQUIRED_CHECK_NAMES[0], integration_id: 15368 }],
+    } },
+    { type: 'commit_message_pattern', parameters: { pattern: 'feat:' } },
+    { type: 'required_status_checks', parameters: {
+      required_status_checks: [{ context: REQUIRED_CHECK_NAMES[1] }],
+    } },
+  ];
+  const requiredStatuses = requiredStatusesFromRules(rules);
+  assert.deepEqual(requiredStatuses?.checks.map((item) => item.context),
+    REQUIRED_CHECK_NAMES);
+  const x = input();
+  x.requiredStatuses = requiredStatuses;
+  const report = evaluateReleaseEvidence(x);
+  assert.equal(report.machinePreflight, 'PASS');
+  assert.equal(report.deploymentAuthorization, 'NOT_GRANTED');
+  assert.equal(report.releaseDecision, 'NO_GO');
+});
+
+test('malformed, empty or unrelated rules never imply required checks', () => {
+  for (const rules of [undefined, null, {}, [], [
+    { type: 'required_status_checks', parameters: {} },
+  ], [
+    { type: 'required_status_checks', parameters: { required_status_checks: [] } },
+  ], [
+    { type: 'required_deployments', parameters: { required_status_checks: [
+      { context: REQUIRED_CHECK_NAMES[0] },
+    ] } },
+  ]]) {
+    assert.equal(requiredStatusesFromRules(rules), null);
+    const x = input();
+    x.requiredStatuses = requiredStatusesFromRules(rules);
+    assert.equal(evaluateReleaseEvidence(x).machinePreflight, 'HOLD');
+  }
 });
 
 test('failing or pending CI must not pass', () => {
