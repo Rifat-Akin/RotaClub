@@ -48,7 +48,7 @@ function validateWorkflow(source) {
   }
   if (!/^permissions:\s*\n[ \t]{2}contents:\s*read\s*$/m.test(source) ||
       /^\s*permissions:\s*write-all\s*$/m.test(source) ||
-      /^\s{2}(?:contents|id-token|actions|checks):\s*write\s*$/m.test(source)) {
+      /^\s+(?:contents|id-token|actions|checks|pull-requests|packages|deployments):\s*write\s*$/m.test(source)) {
     errors.push('permissions-not-read-only');
   }
 
@@ -77,10 +77,12 @@ function validateWorkflow(source) {
   }
 
   for (const command of REQUIRED_COMMANDS) {
-    // Avoid matching a line only in a YAML comment.
-    if (!source.split('\n').some((line) =>
-      !line.trimStart().startsWith('#') && line.includes(command)
-    )) {
+    // A control is required as an actual run command, not as an echo,
+    // quoted message or comment in a workflow file.
+    if (!source.split('\n').some((line) => {
+      const value = line.trim();
+      return value === command || value === 'run: ' + command;
+    })) {
       errors.push('required-control-missing');
     }
   }
@@ -119,6 +121,11 @@ function selfTest(cleanSource) {
     'unknown-org/setup-node@' + PINNED_ACTIONS.get('actions/setup-node'),
     'untrusted-action-ref'
   );
+  rejectMutation('run: npm test', 'run: echo npm test',
+    'required-control-missing');
+  rejectMutation('  security-baseline:\n',
+    '  security-baseline:\n    permissions:\n      contents: write\n',
+    'permissions-not-read-only');
 
   console.log('CI_POLICY_SELF_TEST=PASS NEGATIVE_FIXTURES=' + count);
 }
