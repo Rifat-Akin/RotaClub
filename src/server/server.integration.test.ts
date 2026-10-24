@@ -2133,7 +2133,31 @@ test('Issue #76 v5.3 Audit: Zero-env one-time initial admin activation flow, har
         'CROSS_TENANT_BOOTSTRAP_FORBIDDEN'
       );
 
-      // Claim initial admin bootstrap once with verified one-time ownership token (strictly club-galata accounts only)
+      // Issue #76 Negative Test: Attempting to bulk-activate other club members (sekreterPin, saymanPin, uyePin) during initial admin bootstrap is rejected with 422 BULK_MEMBER_BOOTSTRAP_FORBIDDEN
+      const bulkBootstrapAttemptRes = await fetch(
+        `${baseUrl}/api/auth/bootstrap-claim`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            bootstrapToken: ownerBootstrapToken,
+            rotaryId: 'TR-2420-74105',
+            email: 'baskan@galatarotary.org',
+            baskanPin: 'GalataFirstAdmin#2026',
+            sekreterPin: 'GalataFirstSek#2026',
+            saymanPin: 'GalataFirstSay#2026',
+            uyePin: 'GalataFirstUye#2026',
+          }),
+        }
+      );
+      assert.equal(bulkBootstrapAttemptRes.status, 422);
+      const bulkBootstrapAttemptBody = await bulkBootstrapAttemptRes.json();
+      assert.equal(
+        bulkBootstrapAttemptBody.error,
+        'BULK_MEMBER_BOOTSTRAP_FORBIDDEN'
+      );
+
+      // Claim initial admin bootstrap once with verified one-time ownership token (strictly founding President TR-2420-74105 only)
       const claimRes = await fetch(`${baseUrl}/api/auth/bootstrap-claim`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2142,9 +2166,6 @@ test('Issue #76 v5.3 Audit: Zero-env one-time initial admin activation flow, har
           rotaryId: 'TR-2420-74105',
           email: 'baskan@galatarotary.org',
           baskanPin: 'GalataFirstAdmin#2026',
-          sekreterPin: 'GalataFirstSek#2026',
-          saymanPin: 'GalataFirstSay#2026',
-          uyePin: 'GalataFirstUye#2026',
         }),
       });
       assert.equal(claimRes.status, 201);
@@ -2153,13 +2174,21 @@ test('Issue #76 v5.3 Audit: Zero-env one-time initial admin activation flow, har
       assert.ok(claimBody.token);
       assert.equal(claimBody.user.role, 'baskan');
 
-      // Verify other clubs' accounts (Karaköy, Maçka, District) were NOT activated by Galata's initial bootstrap (#70)
+      // Verify other Galata accounts AND other clubs' accounts were NOT bulk-activated by initial bootstrap (#76, #70)
+      const sekreterAccAfterBootstrap = bootstrapStore
+        .getAccounts()
+        .find((a) => a.rotaryId === 'TR-2420-81024');
+      const rifatAccAfterBootstrap = bootstrapStore
+        .getAccounts()
+        .find((a) => a.rotaryId === 'TR-2420-88412');
       const karakoyAccAfterBootstrap = bootstrapStore
         .getAccounts()
         .find((a) => a.rotaryId === 'TR-2420-KRK-01');
       const mackaAccAfterBootstrap = bootstrapStore
         .getAccounts()
         .find((a) => a.rotaryId === 'TR-2420-MCK-01');
+      assert.equal(sekreterAccAfterBootstrap?.activated, false);
+      assert.equal(rifatAccAfterBootstrap?.activated, false);
       assert.equal(karakoyAccAfterBootstrap?.activated, false);
       assert.equal(mackaAccAfterBootstrap?.activated, false);
 
@@ -2208,24 +2237,131 @@ test('Issue #76 v5.3 Audit: Zero-env one-time initial admin activation flow, har
       const secondClaimBody = await secondClaimRes.json();
       assert.equal(secondClaimBody.error, 'BOOTSTRAP_ALREADY_CLAIMED');
 
-      // Activated President can also provision/activate another account in their OWN club via /api/auth/admin-provision-pin
-      const provRes = await fetch(`${baseUrl}/api/auth/admin-provision-pin`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${claimBody.token}`,
-        },
-        body: JSON.stringify({
-          identifier: 'TR-2420-88412',
-          newPin: 'RifatAdminSet#2026',
-        }),
-      });
-      assert.equal(provRes.status, 200);
+      // Issue #76 Negative Test: Activated President CANNOT directly set another member's PIN via /api/auth/admin-provision-pin (must use one-time personal invitation flow)
+      const directAdminPinOnOtherRes = await fetch(
+        `${baseUrl}/api/auth/admin-provision-pin`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${claimBody.token}`,
+          },
+          body: JSON.stringify({
+            identifier: 'TR-2420-88412',
+            newPin: 'RifatAdminSet#2026',
+          }),
+        }
+      );
+      assert.equal(directAdminPinOnOtherRes.status, 422);
+      const directAdminPinOnOtherBody = await directAdminPinOnOtherRes.json();
+      assert.equal(
+        directAdminPinOnOtherBody.error,
+        'PERSONAL_INVITATION_FLOW_REQUIRED'
+      );
+
+      // Issue #76 Positive & Negative Tests: One-Time Personal Member Invitation Flow (/api/auth/issue-member-invite -> /api/auth/claim-member-invite)
+      const crossClubInviteRes = await fetch(
+        `${baseUrl}/api/auth/issue-member-invite`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${claimBody.token}`,
+          },
+          body: JSON.stringify({
+            targetIdentifier: 'TR-2420-KRK-01',
+          }),
+        }
+      );
+      assert.equal(crossClubInviteRes.status, 403);
+
+      const issueInviteRes = await fetch(
+        `${baseUrl}/api/auth/issue-member-invite`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${claimBody.token}`,
+          },
+          body: JSON.stringify({
+            targetIdentifier: 'TR-2420-88412',
+            expiresInHours: 24,
+          }),
+        }
+      );
+      assert.equal(issueInviteRes.status, 201);
+      const issueInviteBody = await issueInviteRes.json();
+      assert.equal(issueInviteBody.ok, true);
+      assert.equal(
+        issueInviteBody.invitationToken.startsWith('RCINV-2420-'),
+        true
+      );
+
+      // Wrong member identity attempting to claim Rifat's one-time invitation token is rejected with 403 INVITATION_IDENTITY_MISMATCH
+      const wrongIdentityClaimRes = await fetch(
+        `${baseUrl}/api/auth/claim-member-invite`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            invitationToken: issueInviteBody.invitationToken,
+            rotaryId: 'TR-2420-81024',
+            email: 'sekreter@galatarotary.org',
+            newPin: 'NazliHijack#2026',
+          }),
+        }
+      );
+      assert.equal(wrongIdentityClaimRes.status, 403);
+      const wrongIdentityClaimBody = await wrongIdentityClaimRes.json();
+      assert.equal(
+        wrongIdentityClaimBody.error,
+        'INVITATION_IDENTITY_MISMATCH'
+      );
+
+      // Invited member (TR-2420-88412) claims their own one-time token with verified rotaryId + email and sets their own strong PIN
+      const claimInviteRes = await fetch(
+        `${baseUrl}/api/auth/claim-member-invite`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            invitationToken: issueInviteBody.invitationToken,
+            rotaryId: 'TR-2420-88412',
+            email: 'rifat.akin@galatarotary.org',
+            newPin: 'RifatSelfSet#2026',
+          }),
+        }
+      );
+      assert.equal(claimInviteRes.status, 201);
+      const claimInviteBody = await claimInviteRes.json();
+      assert.equal(claimInviteBody.activated, true);
+      assert.equal(claimInviteBody.user.rotaryId, 'TR-2420-88412');
+
+      // Replaying the consumed one-time invitation token fails with 409 INVITATION_TOKEN_ALREADY_CONSUMED
+      const replayInviteRes = await fetch(
+        `${baseUrl}/api/auth/claim-member-invite`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            invitationToken: issueInviteBody.invitationToken,
+            rotaryId: 'TR-2420-88412',
+            email: 'rifat.akin@galatarotary.org',
+            newPin: 'RifatReplay#2026',
+          }),
+        }
+      );
+      assert.equal(replayInviteRes.status, 409);
+      const replayInviteBody = await replayInviteRes.json();
+      assert.equal(
+        replayInviteBody.error,
+        'INVITATION_TOKEN_ALREADY_CONSUMED'
+      );
 
       const rifatLogin = await loginRole(
         baseUrl,
         'TR-2420-88412',
-        'RifatAdminSet#2026'
+        'RifatSelfSet#2026'
       );
       assert.equal(rifatLogin.user.role, 'uye');
     } finally {
@@ -4182,7 +4318,57 @@ test('Priorities 1, 2, 3, & 4 (#24/#26, #34, #13/#18/#19, #36): Server-Verified 
         'DIRECT_BOARD_WAIVER_RESOLUTION_FORBIDDEN'
       );
 
-      // 1e. Create a valid waiver resolution for ANOTHER member (m-3, Levent Soydan) and verify m-rifat cannot use it (422 BOARD_RESOLUTION_MEMBER_MISMATCH)
+      // 1e-0. Negative test (#24, #39): A single officer attempting to force 'Onaylandı' / 'Oybirliği ile Kabul' or inject forged boardVotes is rejected
+      const forceAutoApproveRes = await fetch(
+        `${baseUrl}/api/pilot/board-debt-waiver-resolution`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${saymanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            targetMemberId: 'm-rifat',
+            waivedAmountTL: 15000,
+            title: 'YK 2026/39 - Tek Kişilik Otomatik Onay Denemesi',
+            approvalStatus: 'Onaylandı',
+            voteStatus: 'Oybirliği ile Kabul',
+          }),
+        }
+      );
+      assert.equal(forceAutoApproveRes.status, 422);
+      const forceAutoApproveBody = await forceAutoApproveRes.json();
+      assert.equal(
+        forceAutoApproveBody.error,
+        'SINGLE_OFFICER_AUTO_APPROVAL_FORBIDDEN'
+      );
+
+      const forgedVotesRes = await fetch(
+        `${baseUrl}/api/pilot/board-debt-waiver-resolution`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${saymanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            targetMemberId: 'm-rifat',
+            waivedAmountTL: 15000,
+            title: 'YK 2026/39B - Sahte Oy Listesi Denemesi',
+            boardVotes: [
+              { memberId: 'm-emre', role: 'baskan', decision: 'KABUL' },
+              { memberId: 'm-levent', role: 'sayman', decision: 'KABUL' },
+            ],
+          }),
+        }
+      );
+      assert.equal(forgedVotesRes.status, 422);
+      const forgedVotesBody = await forgedVotesRes.json();
+      assert.equal(forgedVotesBody.error, 'FORGED_BOARD_VOTES_REJECTED');
+
+      // 1e. Create a waiver resolution for ANOTHER member (m-3, Levent Soydan), approve with quorum, and verify m-rifat cannot use it (422 BOARD_RESOLUTION_MEMBER_MISMATCH)
       const m3WaiverRes = await fetch(
         `${baseUrl}/api/pilot/board-debt-waiver-resolution`,
         {
@@ -4195,12 +4381,34 @@ test('Priorities 1, 2, 3, & 4 (#24/#26, #34, #13/#18/#19, #36): Server-Verified 
             clubId: 'club-galata',
             targetMemberId: 'm-3',
             waivedAmountTL: 15000,
+            boardMeetingNo: 'YK-2026-OTURUM-14',
             title: 'YK 2026/40 - Borç İbrası',
           }),
         }
       );
       assert.equal(m3WaiverRes.status, 201);
       const m3WaiverBody = await m3WaiverRes.json();
+      // Single officer proposal starts strictly as 'Taslak' (#24, #39)
+      assert.equal(m3WaiverBody.resolution.approvalStatus, 'Taslak');
+      assert.equal(m3WaiverBody.quorumSatisfied, false);
+
+      // Second officer (baskan) votes to reach quorum on m3WaiverRes
+      const m3VoteRes = await fetch(
+        `${baseUrl}/api/pilot/board-debt-waiver-vote`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${baskanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            resolutionId: m3WaiverBody.resolution.id,
+            voteDecision: 'KABUL',
+          }),
+        }
+      );
+      assert.equal(m3VoteRes.status, 200);
 
       const wrongMemberWaiverAttempt = await fetch(
         `${baseUrl}/api/pilot/member-lifecycle`,
@@ -4241,6 +4449,7 @@ test('Priorities 1, 2, 3, & 4 (#24/#26, #34, #13/#18/#19, #36): Server-Verified 
             clubId: 'club-karakoy',
             targetMemberId: karakoyMemberId,
             waivedAmountTL: 15000,
+            boardMeetingNo: 'KRK-YK-2026-05',
             title: 'Karaköy YK Kararı',
           }),
         }
@@ -4267,7 +4476,7 @@ test('Priorities 1, 2, 3, & 4 (#24/#26, #34, #13/#18/#19, #36): Server-Verified 
       );
       assert.equal(crossClubWaiverAttempt.status, 422);
 
-      // 1g. Create an EXPIRED waiver resolution for m-rifat and verify it is rejected (422 BOARD_RESOLUTION_EXPIRED)
+      // 1g. Create an EXPIRED waiver resolution for m-rifat (quorum-approved before expiry) and verify it is rejected (422 BOARD_RESOLUTION_EXPIRED)
       const shortLivedWaiverRes = await fetch(
         `${baseUrl}/api/pilot/board-debt-waiver-resolution`,
         {
@@ -4280,6 +4489,7 @@ test('Priorities 1, 2, 3, & 4 (#24/#26, #34, #13/#18/#19, #36): Server-Verified 
             clubId: 'club-galata',
             targetMemberId: 'm-rifat',
             waivedAmountTL: 20000,
+            boardMeetingNo: 'YK-2026-OTURUM-15',
             title: 'YK 2026/41 - Kısa Süreli Borç İbrası',
             expiresInHours: 1,
           }),
@@ -4287,6 +4497,25 @@ test('Priorities 1, 2, 3, & 4 (#24/#26, #34, #13/#18/#19, #36): Server-Verified 
       );
       assert.equal(shortLivedWaiverRes.status, 201);
       const shortLivedWaiverBody = await shortLivedWaiverRes.json();
+
+      const shortLivedVoteRes = await fetch(
+        `${baseUrl}/api/pilot/board-debt-waiver-vote`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${saymanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            resolutionId: shortLivedWaiverBody.resolution.id,
+            voteDecision: 'KABUL',
+          }),
+        }
+      );
+      assert.equal(shortLivedVoteRes.status, 200);
+      const shortLivedVoteBody = await shortLivedVoteRes.json();
+      assert.equal(shortLivedVoteBody.resolution.approvalStatus, 'Onaylandı');
 
       // Advance server clock by 3 hours past expiry
       setServerTimeIso('2026-10-24T15:00:00.000Z');
@@ -4311,8 +4540,12 @@ test('Priorities 1, 2, 3, & 4 (#24/#26, #34, #13/#18/#19, #36): Server-Verified 
       const expiredWaiverBody = await expiredWaiverAttempt.json();
       assert.equal(expiredWaiverBody.error, 'BOARD_RESOLUTION_EXPIRED');
 
-      // 1h. Create a valid, sufficient waiver resolution for m-rifat, execute exit transition,
-      // verify debt is zeroed & resolution is marked consumed, and verify replay fails!
+      // 1h. Create a valid waiver resolution proposal for m-rifat:
+      // - Verify single-officer proposal stays 'Taslak' and cannot be used to exit before quorum (#24, #39)
+      // - Verify same officer cannot vote twice (409 DUPLICATE_BOARD_OFFICER_VOTE)
+      // - Verify second officer ('sayman') voting WITH boardMeetingNo transitions to 'Onaylandı' ('Oyçokluğu ile Kabul'), and third officer ('sekreter') voting transitions to 'Oybirliği ile Kabul'
+      // - Verify attempting exit with skipWriteOffJournal: true fails (422 WRITE_OFF_JOURNAL_MANDATORY)
+      // - Verify valid exit atomically zeroes balances AND records an immutable DebtWaiverWriteOffJournalEntry referencing source receivables!
       const validRifatWaiverRes = await fetch(
         `${baseUrl}/api/pilot/board-debt-waiver-resolution`,
         {
@@ -4332,6 +4565,148 @@ test('Priorities 1, 2, 3, & 4 (#24/#26, #34, #13/#18/#19, #36): Server-Verified 
       );
       assert.equal(validRifatWaiverRes.status, 201);
       const validRifatWaiverBody = await validRifatWaiverRes.json();
+      assert.equal(validRifatWaiverBody.resolution.approvalStatus, 'Taslak');
+      assert.equal(
+        validRifatWaiverBody.resolution.voteStatus,
+        'Taslak (YK Nisabı Bekleniyor)'
+      );
+
+      // Attempting to exit with a draft (single-officer) resolution MUST fail with 422 BOARD_RESOLUTION_NOT_APPROVED
+      const prematureExitAttempt = await fetch(
+        `${baseUrl}/api/pilot/member-lifecycle`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sekreterSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            targetMemberId: 'm-rifat',
+            targetStatus: 'İstifa / Ayrıldı',
+            reason: 'Tek imzalı taslak YK kararı ile ayrılış denemesi',
+            boardResolutionId: validRifatWaiverBody.resolution.id,
+          }),
+        }
+      );
+      assert.equal(prematureExitAttempt.status, 422);
+      const prematureExitBody = await prematureExitAttempt.json();
+      assert.equal(prematureExitBody.error, 'BOARD_RESOLUTION_NOT_APPROVED');
+
+      // Same officer (baskan) trying to cast a second vote on their own draft is rejected with 409 DUPLICATE_BOARD_OFFICER_VOTE
+      const duplicateOfficerVoteRes = await fetch(
+        `${baseUrl}/api/pilot/board-debt-waiver-vote`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${baskanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            resolutionId: validRifatWaiverBody.resolution.id,
+            boardMeetingNo: 'YK-2026-OTURUM-16',
+            voteDecision: 'KABUL',
+          }),
+        }
+      );
+      assert.equal(duplicateOfficerVoteRes.status, 409);
+      const duplicateOfficerVoteBody = await duplicateOfficerVoteRes.json();
+      assert.equal(
+        duplicateOfficerVoteBody.error,
+        'DUPLICATE_BOARD_OFFICER_VOTE'
+      );
+
+      // Sayman votes WITHOUT boardMeetingNo -> still stays 'Taslak' because boardMeetingNo is missing (#24, #39)
+      const sekreterVoteWithoutMeetingNoRes = await fetch(
+        `${baseUrl}/api/pilot/board-debt-waiver-vote`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sekreterSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            resolutionId: validRifatWaiverBody.resolution.id,
+            voteDecision: 'KABUL',
+          }),
+        }
+      );
+      assert.equal(sekreterVoteWithoutMeetingNoRes.status, 200);
+      const sekreterVoteWithoutMeetingNoBody =
+        await sekreterVoteWithoutMeetingNoRes.json();
+      assert.equal(
+        sekreterVoteWithoutMeetingNoBody.resolution.approvalStatus,
+        'Taslak'
+      );
+      assert.equal(sekreterVoteWithoutMeetingNoBody.quorumSatisfied, false);
+
+      // Sayman casts vote AND supplies official boardMeetingNo -> all 3 distinct roles (baskan, sekreter, sayman) have now voted 'KABUL', so resolution becomes 'Onaylandı' & 'Oybirliği ile Kabul'!
+      const saymanQuorumVoteRes = await fetch(
+        `${baseUrl}/api/pilot/board-debt-waiver-vote`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${saymanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            resolutionId: validRifatWaiverBody.resolution.id,
+            boardMeetingNo: 'YK-2026-OTURUM-16',
+            boardMeetingDate: '24 Ekim 2026',
+            voteDecision: 'KABUL',
+            note: 'Sayman mali mutabakat ve terkin onayı',
+          }),
+        }
+      );
+      assert.equal(saymanQuorumVoteRes.status, 200);
+      const saymanQuorumVoteBody = await saymanQuorumVoteRes.json();
+      assert.equal(saymanQuorumVoteBody.quorumSatisfied, true);
+      assert.equal(
+        saymanQuorumVoteBody.resolution.approvalStatus,
+        'Onaylandı'
+      );
+      assert.equal(
+        saymanQuorumVoteBody.resolution.voteStatus,
+        'Oybirliği ile Kabul'
+      );
+
+      // Negative test (#24, #39): Attempting to zero member debt on exit while suppressing the financial write-off journal is rejected with 422 WRITE_OFF_JOURNAL_MANDATORY
+      const journalBypassAttemptRes = await fetch(
+        `${baseUrl}/api/pilot/member-lifecycle`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sekreterSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            targetMemberId: 'm-rifat',
+            targetStatus: 'İstifa / Ayrıldı',
+            reason: 'Journalsiz borç silme denemesi',
+            boardResolutionId: validRifatWaiverBody.resolution.id,
+            skipWriteOffJournal: true,
+          }),
+        }
+      );
+      assert.equal(journalBypassAttemptRes.status, 422);
+      const journalBypassAttemptBody = await journalBypassAttemptRes.json();
+      assert.equal(
+        journalBypassAttemptBody.error,
+        'WRITE_OFF_JOURNAL_MANDATORY'
+      );
+
+      const rifatBeforeExit = store
+        .getTenantState('club-galata')
+        .members.find((m) => m.id === 'm-rifat')!;
+      const expectedTotalWaived =
+        Math.max(0, rifatBeforeExit.duesBalance) +
+        Math.max(0, rifatBeforeExit.mealBalance) +
+        Math.max(0, rifatBeforeExit.foundationBalance);
+      assert.equal(expectedTotalWaived > 0, true);
 
       const validExitRes = await fetch(
         `${baseUrl}/api/pilot/member-lifecycle`,
@@ -4355,10 +4730,54 @@ test('Priorities 1, 2, 3, & 4 (#24/#26, #34, #13/#18/#19, #36): Server-Verified 
       assert.equal(validExitBody.member.membershipStatus, 'İstifa / Ayrıldı');
       assert.equal(validExitBody.member.duesBalance, 0);
       assert.equal(validExitBody.member.mealBalance, 0);
+      assert.equal(validExitBody.member.foundationBalance, 0);
+      assert.ok(validExitBody.writeOffJournal);
+      assert.equal(
+        validExitBody.writeOffJournal.totalWaivedTL,
+        expectedTotalWaived
+      );
+      assert.equal(
+        validExitBody.writeOffJournal.resolutionId,
+        validRifatWaiverBody.resolution.id
+      );
+      assert.equal(
+        validExitBody.writeOffJournal.sourceReceivableIds.length > 0,
+        true
+      );
       const consumedRes = validExitBody.state.boardResolutions.find(
         (r: { id: string }) => r.id === validRifatWaiverBody.resolution.id
       );
       assert.equal(Boolean(consumedRes.consumedAtIso), true);
+      assert.equal(
+        consumedRes.writeOffJournalId,
+        validExitBody.writeOffJournal.id
+      );
+
+      // Attempting to mutate or wipe debtWriteOffJournals via /api/pilot/sync is rejected with 422 DIRECT_LEDGER_MUTATION_FORBIDDEN
+      const tamperWriteOffJournalViaSyncRes = await fetch(
+        `${baseUrl}/api/pilot/sync`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${saymanSession.token}`,
+          },
+          body: JSON.stringify({
+            clubId: 'club-galata',
+            expectedRevision: validExitBody.revision,
+            state: {
+              debtWriteOffJournals: [],
+            },
+          }),
+        }
+      );
+      assert.equal(tamperWriteOffJournalViaSyncRes.status, 422);
+      const tamperWriteOffJournalViaSyncBody =
+        await tamperWriteOffJournalViaSyncRes.json();
+      assert.equal(
+        tamperWriteOffJournalViaSyncBody.error,
+        'DIRECT_LEDGER_MUTATION_FORBIDDEN'
+      );
 
       // Re-activate m-rifat and add debt to verify the consumed resolution CANNOT be replayed (422 BOARD_RESOLUTION_ALREADY_CONSUMED)
       await fetch(`${baseUrl}/api/pilot/member-lifecycle`, {
@@ -4831,31 +5250,95 @@ test('Priorities 1, 2, 3, & 4 (#24/#26, #34, #13/#18/#19, #36): Server-Verified 
       );
       assert.equal(chainVerification.valid, true);
 
-      // 3e. Real SQL Relational Engine Verification (executes src/server/postgresSchema.sql DDL + FK + UNIQUE + CHECK + ACID ROLLBACK)
+      // 3e. Real SQL Relational Engine Verification (executes src/server/postgresSchema.sql DDL + composite tenant FK + UNIQUE + CHECK + ACID ROLLBACK) (#70, #13)
       const sqlEngine = new SqlRelationalVerificationEngine();
       try {
         const schemaReport = sqlEngine.verifySchemaAndConstraints();
         assert.equal(schemaReport.ddlLoaded, true);
-        assert.equal(schemaReport.tableCount, 11);
+        assert.equal(schemaReport.tableCount, 13);
         assert.equal(schemaReport.foreignKeysEnforced, true);
+        assert.equal(schemaReport.crossTenantForeignKeysBlocked, true);
         assert.equal(schemaReport.uniqueConstraintsEnforced, true);
         assert.equal(schemaReport.checkConstraintsEnforced, true);
         assert.equal(schemaReport.acidRollbackVerified, true);
 
-        // Migrate tenant state into real SQL tables and verify row counts match
-        const sqlMigrationCounts = sqlEngine.migrateTenantToSql(readBackTenant);
+        // Migrate both club-galata and club-karakoy into the same SQL relational engine and verify all 13 tables & financial integrity
+        const galataMigration = sqlEngine.migrateTenantState(readBackTenant);
         assert.equal(
-          sqlMigrationCounts.members,
+          galataMigration.members,
           readBackTenant.members.length
         );
         assert.equal(
-          sqlMigrationCounts.meetings,
+          galataMigration.meetings,
           readBackTenant.meetings.length
         );
         assert.equal(
-          sqlMigrationCounts.auditEntries,
+          galataMigration.auditEntries,
           readBackTenant.auditLedger.length
         );
+        assert.equal(galataMigration.memberLifecycleHistory >= 1, true);
+        assert.equal(galataMigration.meetingRsvps >= 1, true);
+        assert.equal(galataMigration.makeupSubmissions >= 1, true);
+        assert.equal(galataMigration.debtWriteOffJournals >= 1, true);
+        assert.equal(galataMigration.integrityVerified, true);
+
+        // Idempotent rerun of migrateTenantState with identical data must succeed without INSERT OR REPLACE data loss
+        const idempotentRerun = sqlEngine.migrateTenantState(readBackTenant);
+        assert.deepEqual(idempotentRerun, galataMigration);
+        assert.equal(idempotentRerun.integrityVerified, true);
+
+        // Migrate second club (club-karakoy) into the same SQL engine
+        const karakoyStateForSql = store.getTenantState('club-karakoy');
+        const karakoyMigration =
+          sqlEngine.migrateTenantState(karakoyStateForSql);
+        assert.equal(karakoyMigration.integrityVerified, true);
+
+        // Adversarial Test 0 (#70 / #13): Two-club composite FK attacks directly against SQLite with PRAGMA foreign_keys=ON:
+        // (a) Club B ('club-karakoy') meeting attendance referencing Club A ('club-galata') member ('m-rifat') MUST be rejected by composite FK!
+        assert.throws(() => {
+          sqlEngine.db
+            .prepare(
+              `INSERT INTO meeting_attendances (club_id, meeting_no, member_id, checkin_mode) VALUES ('club-karakoy', ?, 'm-rifat', 'qr')`
+            )
+            .run(karakoyStateForSql.meetings[0].meetingNo);
+        }, /FOREIGN KEY constraint failed/i);
+
+        // (b) Club B ('club-karakoy') certificate referencing Club A ('club-galata') verified guest attendance MUST be rejected by composite FK!
+        assert.throws(() => {
+          sqlEngine.db
+            .prepare(
+              `INSERT INTO guest_makeup_certificates (id, club_id, meeting_no, guest_name, guest_club, guest_district, guest_email, meeting_date, sent_at, verification_code, status, issued_by_member_id, approved_by_member_id, guest_attendance_record_id, attendance_evidence)
+               VALUES ('cross-club-cert-attack', 'club-karakoy', ?, 'Dr. Selin Demir', 'Beşiktaş Rotary Kulübü', 'UR 2420', 'selin@example.org', '24 Ekim 2026', '24 Ekim 2026', 'AttackCode', 'Aktif', 'm-karakoy-baskan', 'm-karakoy-baskan', ?, 'QR Check-in')`
+            )
+            .run(karakoyStateForSql.meetings[0].meetingNo, guestAttendanceId);
+        }, /FOREIGN KEY constraint failed/i);
+
+        // Adversarial Test 1 (#70 / #13): Conflicting immutable row mutation on re-migration MUST throw MIGRATION_CONFLICT_IMMUTABLE_ROW_MISMATCH and ROLLBACK
+        const mutatedAuditTenant = {
+          ...readBackTenant,
+          auditLedger: readBackTenant.auditLedger.map((a, idx) =>
+            idx === 0 ? { ...a, action: 'TAMPERED_HISTORICAL_AUDIT_ACTION' } : a
+          ),
+        };
+        assert.throws(() => {
+          sqlEngine.migrateTenantState(mutatedAuditTenant);
+        }, /MIGRATION_CONFLICT_IMMUTABLE_ROW_MISMATCH/);
+
+        // Adversarial Test 2 (#70 / #13): Unrecognized or cross-club member identity in meetingAttendances MUST be quarantined (HOLD / ROLLBACK), NEVER assigned to tenant.members[0]!
+        const existingAttendances = readBackTenant.meetingAttendances || {};
+        const unknownMemberTenant = {
+          ...readBackTenant,
+          meetingAttendances: {
+            ...existingAttendances,
+            '1841': [
+              ...(existingAttendances['1841'] || []),
+              'm-unknown-phantom-999',
+            ],
+          },
+        };
+        assert.throws(() => {
+          sqlEngine.migrateTenantState(unknownMemberTenant);
+        }, /MIGRATION_HOLD_UNRESOLVED_MEMBER_IDENTITY/);
       } finally {
         sqlEngine.close();
       }

@@ -320,6 +320,7 @@ export interface MemberLifecycleHistoryEntry {
   leaveStartDate?: string;
   leaveEndDate?: string;
   boardResolutionRef?: string;
+  writeOffJournalId?: string;
 }
 
 export interface RotaryMember {
@@ -445,6 +446,16 @@ export type BoardResolutionScope =
   | 'HONORARY_MEMBERSHIP'
   | 'BUDGET_REVISION';
 
+export interface BoardResolutionVoteEntry {
+  memberId: string;
+  fullName?: string;
+  memberName?: string;
+  role: ClubRole;
+  decision: 'KABUL' | 'RET' | 'RED' | 'CEKIMSER' | 'ÇEKİMSER';
+  votedAtIso: string;
+  note?: string;
+}
+
 export interface BoardResolutionItem {
   id: string;
   resolutionNo: string;
@@ -453,22 +464,62 @@ export interface BoardResolutionItem {
   title: string;
   category?: string;
   summary: string;
-  voteStatus: 'Oybirliği ile Kabul' | 'Oyçokluğu ile Kabul';
+  voteStatus:
+    | 'Taslak (YK Nisabı Bekleniyor)'
+    | 'YK Kararı Onaylandı (Nisap Sağlandı)'
+    | 'Oybirliği ile Kabul'
+    | 'Oyçokluğu ile Kabul'
+    | 'Reddedildi';
   signedBy: string;
-  // Issue #24/#26: Server-Verified Scoped Board Resolution Metadata
+  // Issue #24/#26/#39: Server-Verified Scoped Board Resolution & Quorum Metadata
   clubId?: string;
   resolutionScope?: BoardResolutionScope;
+  boardMeetingNo?: string;
+  boardMeetingDate?: string;
+  quorumRequiredCount?: number;
+  boardVotes?: BoardResolutionVoteEntry[];
   targetMemberId?: string;
   targetMemberName?: string;
   waivedAmountTL?: number;
-  approvalStatus?: 'Taslak' | 'Onaylandı' | 'İptal Edildi';
+  approvalStatus?: 'Taslak' | 'Onaylandı' | 'Reddedildi' | 'İptal Edildi';
   approvedByMemberId?: string;
   approvedByRole?: ClubRole;
   approvedAtIso?: string;
   expiresAtIso?: string;
   consumedAtIso?: string;
   consumedByMemberId?: string;
+  writeOffJournalId?: string;
   serverVerified?: boolean;
+}
+
+export interface DebtWaiverWriteOffJournalEntry {
+  id: string;
+  clubId: string;
+  idempotencyKey: string;
+  resolutionId: string;
+  resolutionNo: string;
+  decisionNo?: string;
+  boardMeetingNo: string;
+  boardMeetingDate: string;
+  targetLifecycleStatus?: 'İstifa / Ayrıldı' | 'Nakil';
+  memberId: string;
+  memberName: string;
+  waivedDuesAmountTL: number;
+  waivedMealAmountTL: number;
+  waivedFoundationAmountTL: number;
+  totalWaivedAmountTL: number;
+  duesWaivedTL?: number;
+  mealWaivedTL?: number;
+  foundationWaivedTL?: number;
+  totalWaivedTL?: number;
+  sourceReceivableIds: string[];
+  debitAccountCode: '689-YK-Onayli-Borc-Terkin-Gideri';
+  creditAccountCode: '120-Uye-Aidat-ve-Kuver-Alacaklari';
+  approvedByMemberIds: string[];
+  recordedByMemberId: string;
+  recordedByRole: ClubRole;
+  recordedAtIso: string;
+  entryHash: string;
 }
 
 export interface ClubAttendancePolicy {

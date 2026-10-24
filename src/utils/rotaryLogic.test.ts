@@ -985,7 +985,96 @@ test('Issue #27 / #28 / #34: calculateMeetingKuverSummary and calculateTermAtten
     'UR-2420-GALATA-STRICT-2026.2'
   );
   assert.equal(cappedPolicyMetrics.minimumRequiredPercent, 75);
-  assert.equal(cappedPolicyMetrics.meetsClubAttendancePolicy, false); // 67% < 75%
+  assert.equal(cappedPolicyMetrics.meetsRotary60PercentRule, true); // 67% >= 60% RI rule (#34)
+  assert.equal(cappedPolicyMetrics.meetsClubAttendancePolicy, false); // 67% < 75% club policy (#34)
+
+  // 6. Explicit separation of meetsRotary60PercentRule (RI 60%) vs meetsClubAttendancePolicy (#34):
+  // Case A: 65% attendance (13/20 meetings) + club minimum 75% -> meetsRotary60PercentRule = true, meetsClubAttendancePolicy = false
+  const twentyHeldMeetings: WeeklyMeeting[] = Array.from(
+    { length: 20 },
+    (_, idx) => ({
+      meetingNo: 1800 + idx,
+      date: `2026-09-${String((idx % 20) + 1).padStart(2, '0')}`,
+      time: '19:30',
+      venue: 'Pera Palace Hotel',
+      hall: 'Grand Pera',
+      speakerName: `Konuşmacı ${idx}`,
+      speakerTitle: 'Unvan',
+      topic: `Konu ${idx}`,
+      speakerBio: 'Biyo',
+      certificateStatus: 'Takdim Edildi',
+      certificateDonationTree: 'PolioPlus',
+      isPast: true,
+      status: 'Tamamlandı',
+    })
+  );
+  const attend13Of20: Record<string, string[]> = {};
+  for (let i = 0; i < 13; i++) {
+    attend13Of20[String(1800 + i)] = ['m-rifat'];
+  }
+  const metrics65WithMin75 = calculateTermAttendanceMetrics({
+    member: SAMPLE_MEMBERS[0],
+    meetings: twentyHeldMeetings,
+    meetingAttendances: attend13Of20,
+    makeupSubmissions: [],
+    allMembers: SAMPLE_MEMBERS,
+    policy: {
+      policyVersion: 'CLUB-MIN-75',
+      termStartDate: '2026-07-01',
+      termEndDate: '2027-06-30',
+      minimumAttendancePercent: 75,
+      maxMakeupsPerTerm: 4,
+    },
+    evaluationDate: '2026-10-23T12:00:00.000Z',
+  });
+  assert.equal(metrics65WithMin75.attendancePercentage, 65);
+  assert.equal(metrics65WithMin75.meetsRotary60PercentRule, true);
+  assert.equal(metrics65WithMin75.meetsClubAttendancePolicy, false);
+
+  // Case B: 55% attendance (11/20 meetings) + club minimum 50% -> meetsRotary60PercentRule = false, meetsClubAttendancePolicy = true
+  const attend11Of20: Record<string, string[]> = {};
+  for (let i = 0; i < 11; i++) {
+    attend11Of20[String(1800 + i)] = ['m-rifat'];
+  }
+  const metrics55WithMin50 = calculateTermAttendanceMetrics({
+    member: SAMPLE_MEMBERS[0],
+    meetings: twentyHeldMeetings,
+    meetingAttendances: attend11Of20,
+    makeupSubmissions: [],
+    allMembers: SAMPLE_MEMBERS,
+    policy: {
+      policyVersion: 'CLUB-MIN-50',
+      termStartDate: '2026-07-01',
+      termEndDate: '2027-06-30',
+      minimumAttendancePercent: 50,
+      maxMakeupsPerTerm: 4,
+    },
+    evaluationDate: '2026-10-23T12:00:00.000Z',
+  });
+  assert.equal(metrics55WithMin50.attendancePercentage, 55);
+  assert.equal(metrics55WithMin50.meetsRotary60PercentRule, false);
+  assert.equal(metrics55WithMin50.meetsClubAttendancePolicy, true);
+
+  // 7. Future-dated meeting (#1842 on 27 Ekim 2026 when evaluationDate is 23 Ekim 2026) with erroneous 'Tamamlandı', isPast: true, and check-in data MUST STILL BE EXCLUDED (#34):
+  const futureCorruptedMeetings: WeeklyMeeting[] = meetings.map((m) =>
+    m.meetingNo === 1842
+      ? { ...m, status: 'Tamamlandı', isPast: true }
+      : m
+  );
+  const futureCorruptedMetrics = calculateTermAttendanceMetrics({
+    member: SAMPLE_MEMBERS[0],
+    meetings: futureCorruptedMeetings,
+    meetingAttendances: {
+      ...meetingAttendances,
+      '1842': ['m-rifat'], // premature/corrupted check-in on future meeting
+    },
+    makeupSubmissions: [],
+    allMembers: SAMPLE_MEMBERS,
+    evaluationDate: '2026-10-23T12:00:00.000Z',
+  });
+  assert.equal(futureCorruptedMetrics.heldMeetingsCount, 3);
+  assert.equal(futureCorruptedMetrics.futureScheduledExcludedCount, 1);
+  assert.equal(futureCorruptedMetrics.directAttendedMeetingsCount, 1); // #1842 not counted!
 
   // Per-meeting Kuver summary excludes resigned members and uses meetingRsvps / meetingMenus
   const rosterWithResigned: RotaryMember[] = [
@@ -1007,7 +1096,7 @@ test('Issue #27 / #28 / #34: calculateMeetingKuverSummary and calculateTermAtten
   assert.equal(kuver1842.menuBreakdown.Balık, 2);
 });
 
-test('Issue #24-#26 & #38-#44: validateMemberLifecycleTransition rejects client boolean debt waiver flag and enforces club+member+scope+expiry+authority verified BoardResolutionItem on exit', () => {
+test('Issue #24-#26 & #38-#44: validateMemberLifecycleTransition rejects client boolean debt waiver flag and enforces multi-officer quorum-verified BoardResolutionItem + write-off breakdown on exit', () => {
   const nowMs = Date.parse('2026-10-23T12:00:00.000Z');
   const memberWithDebt: RotaryMember = {
     ...SAMPLE_MEMBERS[0],
@@ -1051,18 +1140,37 @@ test('Issue #24-#26 & #38-#44: validateMemberLifecycleTransition rejects client 
     id: 'res-waiver-1',
     resolutionNo: 'YK-2026/44-FERAGAT',
     decisionNo: 'YK-2026/44-FERAGAT',
+    boardMeetingNo: 'YK-2026-OTURUM-14',
+    boardMeetingDate: '23 Ekim 2026',
     date: '23 Ekim 2026',
     title: 'Rifat Akın Ayrılış Bakiye Feragat Kararı',
     category: 'Üyelik' as const,
     summary: 'YK kararı ile 4500 TL aidat bakiyesi feragat edildi',
-    voteStatus: 'Oybirliği ile Kabul' as const,
-    signedBy: 'YMM. Levent Soydan (SAYMAN)',
+    voteStatus: 'Oyçokluğu ile Kabul' as const,
+    signedBy: 'Mimar Emre Karaca (BASKAN) · YMM. Levent Soydan (SAYMAN)',
     clubId: 'club-galata',
     resolutionScope: 'DEBT_WAIVER_ON_EXIT' as const,
     targetMemberId: 'm-rifat',
     waivedAmountTL: 4500,
     approvalStatus: 'Onaylandı' as const,
-    approvedByMemberId: 'm-3',
+    quorumRequiredCount: 2,
+    boardVotes: [
+      {
+        memberId: 'm-emre',
+        memberName: 'Mimar Emre Karaca',
+        role: 'baskan' as const,
+        decision: 'KABUL' as const,
+        votedAtIso: '2026-10-23T09:55:00.000Z',
+      },
+      {
+        memberId: 'm-levent',
+        memberName: 'YMM Levent Soydan',
+        role: 'sayman' as const,
+        decision: 'KABUL' as const,
+        votedAtIso: '2026-10-23T10:00:00.000Z',
+      },
+    ],
+    approvedByMemberId: 'm-levent',
     approvedByRole: 'sayman' as const,
     approvedAtIso: '2026-10-23T10:00:00.000Z',
     expiresAtIso: '2026-10-26T10:00:00.000Z',
@@ -1082,6 +1190,75 @@ test('Issue #24-#26 & #38-#44: validateMemberLifecycleTransition rejects client 
   assert.equal(forgedResAttempt.ok, false);
   if (!forgedResAttempt.ok) {
     assert.equal(forgedResAttempt.error, 'BOARD_RESOLUTION_NOT_APPROVED');
+  }
+
+  // 3b. Single-officer auto-approved resolution without second distinct board officer vote -> BOARD_RESOLUTION_QUORUM_NOT_MET (#24, #39)
+  const singleOfficerResAttempt = validateMemberLifecycleTransition({
+    member: memberWithDebt,
+    clubId: 'club-galata',
+    targetStatus: 'İstifa / Ayrıldı',
+    reason: 'Tek kişilik karar denemesi',
+    boardResolutionRef: 'YK-2026/44-FERAGAT',
+    boardResolutions: [
+      {
+        ...validResolution,
+        boardVotes: [validResolution.boardVotes[0]],
+      },
+    ],
+    nowEpochMs: nowMs,
+  });
+  assert.equal(singleOfficerResAttempt.ok, false);
+  if (!singleOfficerResAttempt.ok) {
+    assert.equal(
+      singleOfficerResAttempt.error,
+      'BOARD_RESOLUTION_QUORUM_NOT_MET'
+    );
+  }
+
+  // 3c. False unanimity ('Oybirliği ile Kabul' with only 2 of 3 board roles) -> UNSUBSTANTIATED_UNANIMOUS_BOARD_VOTE (#24, #39)
+  const falseUnanimityAttempt = validateMemberLifecycleTransition({
+    member: memberWithDebt,
+    clubId: 'club-galata',
+    targetStatus: 'İstifa / Ayrıldı',
+    reason: 'Sahte oybirliği denemesi',
+    boardResolutionRef: 'YK-2026/44-FERAGAT',
+    boardResolutions: [
+      {
+        ...validResolution,
+        voteStatus: 'Oybirliği ile Kabul',
+      },
+    ],
+    nowEpochMs: nowMs,
+  });
+  assert.equal(falseUnanimityAttempt.ok, false);
+  if (!falseUnanimityAttempt.ok) {
+    assert.equal(
+      falseUnanimityAttempt.error,
+      'UNSUBSTANTIATED_UNANIMOUS_BOARD_VOTE'
+    );
+  }
+
+  // 3d. Missing boardMeetingNo metadata -> BOARD_RESOLUTION_MISSING_MEETING_METADATA (#24, #39)
+  const missingMeetingMetadataAttempt = validateMemberLifecycleTransition({
+    member: memberWithDebt,
+    clubId: 'club-galata',
+    targetStatus: 'İstifa / Ayrıldı',
+    reason: 'Toplantı numarasız karar denemesi',
+    boardResolutionRef: 'YK-2026/44-FERAGAT',
+    boardResolutions: [
+      {
+        ...validResolution,
+        boardMeetingNo: undefined,
+      },
+    ],
+    nowEpochMs: nowMs,
+  });
+  assert.equal(missingMeetingMetadataAttempt.ok, false);
+  if (!missingMeetingMetadataAttempt.ok) {
+    assert.equal(
+      missingMeetingMetadataAttempt.error,
+      'BOARD_RESOLUTION_MISSING_MEETING_METADATA'
+    );
   }
 
   // 4. Another club's resolution (clubId: 'club-karakoy') -> BOARD_RESOLUTION_CLUB_MISMATCH
@@ -1172,7 +1349,7 @@ test('Issue #24-#26 & #38-#44: validateMemberLifecycleTransition rejects client 
     );
   }
 
-  // 9. Valid server-verified resolution matching club, member, scope, amount, and expiry succeeds!
+  // 9. Valid multi-officer quorum-verified resolution matching club, member, scope, amount, and expiry succeeds and returns writeOffBreakdown!
   const validExitWithResolution = validateMemberLifecycleTransition({
     member: memberWithDebt,
     clubId: 'club-galata',
@@ -1188,6 +1365,12 @@ test('Issue #24-#26 & #38-#44: validateMemberLifecycleTransition rejects client 
       validExitWithResolution.matchedResolution?.decisionNo,
       'YK-2026/44-FERAGAT'
     );
+    assert.deepEqual(validExitWithResolution.writeOffBreakdown, {
+      duesWaivedTL: 4500,
+      mealWaivedTL: 0,
+      foundationWaivedTL: 0,
+      totalWaivedTL: 4500,
+    });
   }
 
   // Transitioning to 'İzinli (Muaf)' without leaveStartDate / leaveEndDate or with inverted dates fails

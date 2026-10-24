@@ -246,7 +246,6 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
   const [bootstrapRequired, setBootstrapRequired] = useState<boolean>(false);
   const [bootstrapTokenInput, setBootstrapTokenInput] = useState<string>('');
   const [newAdminPinInput, setNewAdminPinInput] = useState<string>('');
-  const [newBoardPinInput, setNewBoardPinInput] = useState<string>('');
 
   useEffect(() => {
     const preset =
@@ -306,15 +305,6 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
     setErrorMessage(null);
 
     try {
-      const cleanBoardPin = newBoardPinInput.trim();
-      const rolePins = cleanBoardPin
-        ? {
-            uye: cleanBoardPin,
-            sekreter: cleanBoardPin,
-            sayman: cleanBoardPin,
-          }
-        : undefined;
-
       const res = await fetch('/api/auth/bootstrap-claim', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -323,7 +313,6 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
           rotaryId: 'TR-2420-74105',
           email: 'baskan@galatarotary.org',
           newAdminPin: newAdminPinInput.trim(),
-          rolePins,
         }),
       });
       const data = await res.json();
@@ -657,21 +646,8 @@ export const SplashLockScreenModal: React.FC<SplashLockScreenModalProps> = ({
                 />
               </div>
 
-              <div>
-                <label
-                  htmlFor="bootstrap-board-pin"
-                  className="block text-[11px] font-semibold text-slate-300 mb-1"
-                >
-                  YK & Üye Başlangıç Parolası (İsteğe Bağlı — Sekreter/Sayman/Üye)
-                </label>
-                <input
-                  id="bootstrap-board-pin"
-                  type="password"
-                  value={newBoardPinInput}
-                  onChange={(e) => setNewBoardPinInput(e.target.value)}
-                  placeholder="Örn: GalataUye#2026"
-                  className="w-full text-xs font-mono-num bg-[#09152B]/90 border border-white/20 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-[#F7A81B]"
-                />
+              <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-400/30 text-[10px] text-amber-100/90 leading-relaxed">
+                Güvenlik gereği (#76) ilk kurulum anahtarı yalnızca kurucu Dönem Başkanı hesabını etkinleştirir. Diğer yönetim kurulu üyeleri ve kulüp üyeleri kendi e-posta/Rotary kimliklerine gönderilen tek kullanımlık davet anahtarıyla bireysel parolalarını belirler.
               </div>
             </div>
 

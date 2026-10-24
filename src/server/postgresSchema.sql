@@ -1,6 +1,7 @@
--- RotaClub Canonical PostgreSQL Relational Schema & Transactional Constraint Model (#13, #14, #18, #19, ADR-0001)
--- Enforces tenant isolation (club_id), optimistic concurrency (revision), idempotency keys,
--- non-negative minor-unit/balance checks, and append-only SHA-256 hash-chained audit records.
+-- RotaClub Canonical PostgreSQL Relational Schema & Transactional Constraint Model (#13, #14, #18, #19, #70, #39, ADR-0001)
+-- Enforces tenant isolation via composite (club_id, ...) foreign keys, optimistic concurrency (revision),
+-- idempotency keys, non-negative minor-unit/balance checks, immutable debt write-off journals,
+-- and append-only SHA-256 hash-chained audit records.
 
 BEGIN;
 
@@ -16,9 +17,9 @@ CREATE TABLE IF NOT EXISTS rotary_clubs (
 );
 
 CREATE TABLE IF NOT EXISTS rotary_members (
-  id VARCHAR(64) PRIMARY KEY,
+  id VARCHAR(64) NOT NULL,
   club_id VARCHAR(64) NOT NULL REFERENCES rotary_clubs(club_id) ON DELETE RESTRICT,
-  rotary_id VARCHAR(32) NOT NULL UNIQUE,
+  rotary_id VARCHAR(32) NOT NULL,
   full_name VARCHAR(160) NOT NULL,
   classification VARCHAR(160) NOT NULL,
   role_badge VARCHAR(120) NOT NULL,
@@ -29,13 +30,15 @@ CREATE TABLE IF NOT EXISTS rotary_members (
   foundation_balance NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (foundation_balance >= 0),
   attendance_rate NUMERIC(5, 2) NOT NULL DEFAULT 0 CHECK (attendance_rate >= 0 AND attendance_rate <= 100),
   rsvp_status VARCHAR(24) NOT NULL DEFAULT 'pending'
-    CHECK (rsvp_status IN ('attending', 'regrets', 'excused', 'pending')),
+    CHECK (rsvp_status IN ('attending', 'with_spouse', 'with_guest', 'regrets', 'excused', 'pending')),
   meal_preference VARCHAR(32) NOT NULL DEFAULT 'Standart',
   reminder_opt_out BOOLEAN NOT NULL DEFAULT FALSE,
   preferred_reminder_channel VARCHAR(32) NOT NULL DEFAULT 'WhatsApp Taslağı',
   leave_start_date VARCHAR(32),
   leave_end_date VARCHAR(32),
-  leave_reason TEXT
+  leave_reason TEXT,
+  PRIMARY KEY (club_id, id),
+  UNIQUE (club_id, rotary_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_rotary_members_club_id ON rotary_members(club_id);
@@ -43,7 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_rotary_members_club_id ON rotary_members(club_id)
 CREATE TABLE IF NOT EXISTS member_lifecycle_history (
   id BIGSERIAL PRIMARY KEY,
   club_id VARCHAR(64) NOT NULL REFERENCES rotary_clubs(club_id) ON DELETE RESTRICT,
-  member_id VARCHAR(64) NOT NULL REFERENCES rotary_members(id) ON DELETE RESTRICT,
+  member_id VARCHAR(64) NOT NULL,
   from_status VARCHAR(32) NOT NULL,
   to_status VARCHAR(32) NOT NULL,
   actor_id VARCHAR(64) NOT NULL,
@@ -53,7 +56,10 @@ CREATE TABLE IF NOT EXISTS member_lifecycle_history (
   leave_start_date VARCHAR(32),
   leave_end_date VARCHAR(32),
   board_resolution_ref VARCHAR(64),
-  recorded_at VARCHAR(64) NOT NULL
+  writeoff_journal_id VARCHAR(96),
+  recorded_at VARCHAR(64) NOT NULL,
+  FOREIGN KEY (club_id, member_id) REFERENCES rotary_members(club_id, id) ON DELETE RESTRICT,
+  UNIQUE (club_id, member_id, recorded_at, from_status, to_status)
 );
 
 CREATE TABLE IF NOT EXISTS weekly_meetings (
@@ -73,46 +79,51 @@ CREATE TABLE IF NOT EXISTS weekly_meetings (
 CREATE TABLE IF NOT EXISTS meeting_rsvps (
   club_id VARCHAR(64) NOT NULL,
   meeting_no INTEGER NOT NULL,
-  member_id VARCHAR(64) NOT NULL REFERENCES rotary_members(id) ON DELETE RESTRICT,
+  member_id VARCHAR(64) NOT NULL,
   rsvp_status VARCHAR(24) NOT NULL
-    CHECK (rsvp_status IN ('attending', 'regrets', 'excused', 'pending')),
+    CHECK (rsvp_status IN ('attending', 'with_spouse', 'with_guest', 'regrets', 'excused', 'pending')),
   menu_preference VARCHAR(32) NOT NULL DEFAULT 'Standart',
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (club_id, meeting_no, member_id),
-  FOREIGN KEY (club_id, meeting_no) REFERENCES weekly_meetings(club_id, meeting_no) ON DELETE RESTRICT
+  FOREIGN KEY (club_id, meeting_no) REFERENCES weekly_meetings(club_id, meeting_no) ON DELETE RESTRICT,
+  FOREIGN KEY (club_id, member_id) REFERENCES rotary_members(club_id, id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS meeting_attendances (
   club_id VARCHAR(64) NOT NULL,
   meeting_no INTEGER NOT NULL,
-  member_id VARCHAR(64) NOT NULL REFERENCES rotary_members(id) ON DELETE RESTRICT,
+  member_id VARCHAR(64) NOT NULL,
   checkin_mode VARCHAR(32) NOT NULL DEFAULT 'qr',
   checked_in_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (club_id, meeting_no, member_id),
-  FOREIGN KEY (club_id, meeting_no) REFERENCES weekly_meetings(club_id, meeting_no) ON DELETE RESTRICT
+  FOREIGN KEY (club_id, meeting_no) REFERENCES weekly_meetings(club_id, meeting_no) ON DELETE RESTRICT,
+  FOREIGN KEY (club_id, member_id) REFERENCES rotary_members(club_id, id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS verified_guest_attendances (
-  id VARCHAR(96) PRIMARY KEY,
-  club_id VARCHAR(64) NOT NULL,
+  id VARCHAR(96) NOT NULL,
+  club_id VARCHAR(64) NOT NULL REFERENCES rotary_clubs(club_id) ON DELETE RESTRICT,
   meeting_no INTEGER NOT NULL,
   guest_name VARCHAR(160) NOT NULL,
   guest_club VARCHAR(160) NOT NULL,
   guest_district VARCHAR(64) NOT NULL DEFAULT 'UR 2420. Bölge',
-  verified_by_member_id VARCHAR(64) NOT NULL REFERENCES rotary_members(id) ON DELETE RESTRICT,
+  verified_by_member_id VARCHAR(64) NOT NULL,
   verified_by_name VARCHAR(160) NOT NULL,
   verified_by_role VARCHAR(32) NOT NULL,
   verified_at VARCHAR(64) NOT NULL,
   checkin_method VARCHAR(64) NOT NULL,
   evidence_note TEXT NOT NULL,
+  revoked BOOLEAN NOT NULL DEFAULT FALSE,
+  PRIMARY KEY (club_id, id),
   FOREIGN KEY (club_id, meeting_no) REFERENCES weekly_meetings(club_id, meeting_no) ON DELETE RESTRICT,
+  FOREIGN KEY (club_id, verified_by_member_id) REFERENCES rotary_members(club_id, id) ON DELETE RESTRICT,
   UNIQUE (club_id, meeting_no, guest_name, guest_club)
 );
 
 CREATE TABLE IF NOT EXISTS makeup_submissions (
-  id VARCHAR(96) PRIMARY KEY,
+  id VARCHAR(96) NOT NULL,
   club_id VARCHAR(64) NOT NULL REFERENCES rotary_clubs(club_id) ON DELETE RESTRICT,
-  member_id VARCHAR(64) NOT NULL REFERENCES rotary_members(id) ON DELETE RESTRICT,
+  member_id VARCHAR(64) NOT NULL,
   member_name VARCHAR(160) NOT NULL,
   target_club_or_event VARCHAR(200) NOT NULL,
   activity_type VARCHAR(64) NOT NULL,
@@ -121,12 +132,14 @@ CREATE TABLE IF NOT EXISTS makeup_submissions (
   evidence_ref VARCHAR(160),
   status VARCHAR(32) NOT NULL
     CHECK (status IN ('Taslak', 'İnceleniyor', 'Düzeltme İstendi', 'Onaylandı', 'Reddedildi', 'İtiraz Edildi')),
-  attendance_boost INTEGER NOT NULL DEFAULT 0 CHECK (attendance_boost >= 0)
+  attendance_boost INTEGER NOT NULL DEFAULT 0 CHECK (attendance_boost >= 0),
+  PRIMARY KEY (club_id, id),
+  FOREIGN KEY (club_id, member_id) REFERENCES rotary_members(club_id, id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS guest_makeup_certificates (
-  id VARCHAR(96) PRIMARY KEY,
-  club_id VARCHAR(64) NOT NULL,
+  id VARCHAR(96) NOT NULL,
+  club_id VARCHAR(64) NOT NULL REFERENCES rotary_clubs(club_id) ON DELETE RESTRICT,
   meeting_no INTEGER NOT NULL,
   guest_name VARCHAR(160) NOT NULL,
   guest_club VARCHAR(160) NOT NULL,
@@ -139,10 +152,15 @@ CREATE TABLE IF NOT EXISTS guest_makeup_certificates (
     CHECK (status IN ('Taslak', 'Aktif', 'İptal Edildi')),
   issued_by_member_id VARCHAR(64) NOT NULL,
   approved_by_member_id VARCHAR(64),
-  guest_attendance_record_id VARCHAR(96) REFERENCES verified_guest_attendances(id) ON DELETE RESTRICT,
+  guest_attendance_record_id VARCHAR(96),
   attendance_evidence TEXT,
-  verification_code VARCHAR(64) NOT NULL UNIQUE,
+  verification_code VARCHAR(64) NOT NULL,
+  PRIMARY KEY (club_id, id),
+  UNIQUE (club_id, verification_code),
   FOREIGN KEY (club_id, meeting_no) REFERENCES weekly_meetings(club_id, meeting_no) ON DELETE RESTRICT,
+  FOREIGN KEY (club_id, issued_by_member_id) REFERENCES rotary_members(club_id, id) ON DELETE RESTRICT,
+  FOREIGN KEY (club_id, approved_by_member_id) REFERENCES rotary_members(club_id, id) ON DELETE RESTRICT,
+  FOREIGN KEY (club_id, guest_attendance_record_id) REFERENCES verified_guest_attendances(club_id, id) ON DELETE RESTRICT,
   CHECK (
     status <> 'Aktif'
     OR (approved_by_member_id IS NOT NULL AND guest_attendance_record_id IS NOT NULL AND attendance_evidence IS NOT NULL)
@@ -150,7 +168,7 @@ CREATE TABLE IF NOT EXISTS guest_makeup_certificates (
 );
 
 CREATE TABLE IF NOT EXISTS financial_line_items (
-  id VARCHAR(96) PRIMARY KEY,
+  id VARCHAR(96) NOT NULL,
   club_id VARCHAR(64) NOT NULL REFERENCES rotary_clubs(club_id) ON DELETE RESTRICT,
   category VARCHAR(64) NOT NULL,
   title VARCHAR(200) NOT NULL,
@@ -158,11 +176,13 @@ CREATE TABLE IF NOT EXISTS financial_line_items (
   total_amount NUMERIC(12, 2) NOT NULL CHECK (total_amount > 0),
   paid_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (paid_amount >= 0),
   due_date VARCHAR(64) NOT NULL,
-  idempotency_key VARCHAR(200) NOT NULL UNIQUE
+  idempotency_key VARCHAR(200) NOT NULL,
+  PRIMARY KEY (club_id, id),
+  UNIQUE (club_id, idempotency_key)
 );
 
 CREATE TABLE IF NOT EXISTS treasury_ledger (
-  id VARCHAR(96) PRIMARY KEY,
+  id VARCHAR(96) NOT NULL,
   club_id VARCHAR(64) NOT NULL REFERENCES rotary_clubs(club_id) ON DELETE RESTRICT,
   entry_date VARCHAR(64) NOT NULL,
   type VARCHAR(16) NOT NULL CHECK (type IN ('Gelir', 'Gider')),
@@ -171,11 +191,42 @@ CREATE TABLE IF NOT EXISTS treasury_ledger (
   counterparty VARCHAR(160) NOT NULL,
   amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
   reference_no VARCHAR(96) NOT NULL,
+  PRIMARY KEY (club_id, id),
   UNIQUE (club_id, reference_no)
 );
 
+CREATE TABLE IF NOT EXISTS debt_writeoff_journals (
+  id VARCHAR(96) NOT NULL,
+  club_id VARCHAR(64) NOT NULL REFERENCES rotary_clubs(club_id) ON DELETE RESTRICT,
+  idempotency_key VARCHAR(200) NOT NULL,
+  resolution_id VARCHAR(96) NOT NULL,
+  resolution_no VARCHAR(64) NOT NULL,
+  board_meeting_no VARCHAR(64) NOT NULL,
+  board_meeting_date VARCHAR(64) NOT NULL,
+  member_id VARCHAR(64) NOT NULL,
+  member_name VARCHAR(160) NOT NULL,
+  waived_dues_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (waived_dues_amount >= 0),
+  waived_meal_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (waived_meal_amount >= 0),
+  waived_foundation_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (waived_foundation_amount >= 0),
+  total_waived_amount NUMERIC(12, 2) NOT NULL CHECK (total_waived_amount > 0),
+  source_receivable_ids TEXT NOT NULL,
+  debit_account_code VARCHAR(64) NOT NULL,
+  credit_account_code VARCHAR(64) NOT NULL,
+  approved_by_member_ids TEXT NOT NULL,
+  recorded_by_member_id VARCHAR(64) NOT NULL,
+  recorded_by_role VARCHAR(32) NOT NULL,
+  recorded_at VARCHAR(64) NOT NULL,
+  entry_hash CHAR(64) NOT NULL UNIQUE,
+  PRIMARY KEY (club_id, id),
+  UNIQUE (club_id, idempotency_key),
+  UNIQUE (club_id, resolution_id),
+  FOREIGN KEY (club_id, member_id) REFERENCES rotary_members(club_id, id) ON DELETE RESTRICT,
+  FOREIGN KEY (club_id, recorded_by_member_id) REFERENCES rotary_members(club_id, id) ON DELETE RESTRICT,
+  CHECK (waived_dues_amount + waived_meal_amount + waived_foundation_amount = total_waived_amount)
+);
+
 CREATE TABLE IF NOT EXISTS chained_audit_ledger (
-  id VARCHAR(96) NOT NULL UNIQUE,
+  id VARCHAR(96) NOT NULL,
   club_id VARCHAR(64) NOT NULL REFERENCES rotary_clubs(club_id) ON DELETE RESTRICT,
   sequence_no INTEGER NOT NULL CHECK (sequence_no >= 1),
   recorded_at VARCHAR(64) NOT NULL,
@@ -187,7 +238,8 @@ CREATE TABLE IF NOT EXISTS chained_audit_ledger (
   verified_by_server BOOLEAN NOT NULL DEFAULT TRUE,
   prev_hash CHAR(64) NOT NULL,
   entry_hash CHAR(64) NOT NULL UNIQUE,
-  PRIMARY KEY (club_id, sequence_no)
+  PRIMARY KEY (club_id, sequence_no),
+  UNIQUE (club_id, id)
 );
 
 COMMIT;

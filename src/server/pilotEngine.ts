@@ -27,6 +27,7 @@ import {
   CelebrationItem,
   ClubCommittee,
   ClubRole,
+  DebtWaiverWriteOffJournalEntry,
   FinancialLineItem,
   FiresideGroup,
   GalataProject,
@@ -34,6 +35,7 @@ import {
   LcvReminderQueueItem,
   MakeupAuditHistoryEntry,
   MakeupSubmission,
+  MemberLifecycleHistoryEntry,
   MenuPreference,
   OverdueMemberItem,
   PastPresidentRecord,
@@ -151,6 +153,10 @@ export interface PilotUserAccount {
   passwordSalt: string;
   passwordHash: string;
   activated?: boolean;
+  invitationTokenSalt?: string;
+  invitationTokenHash?: string;
+  invitationExpiresAtIso?: string;
+  invitationIssuedByMemberId?: string;
   webauthnCredentials: WebAuthnCredentialRecord[];
 }
 
@@ -199,6 +205,10 @@ export interface TenantClubDatabaseState {
   paymentNotifications: PaymentNotification[];
   overdueMembers: OverdueMemberItem[];
   treasuryLedger: TreasuryLedgerEntry[];
+  debtWriteOffJournals?: DebtWaiverWriteOffJournalEntry[];
+  memberLifecycleHistory?: Array<
+    MemberLifecycleHistoryEntry & { memberId: string; memberName?: string }
+  >;
   projects: GalataProject[];
   scholars: ScholarStudent[];
   members: RotaryMember[];
@@ -2048,6 +2058,8 @@ export function createTenantClubState(
     boardResolutions: isGalata
       ? INITIAL_BOARD_RESOLUTIONS.map((br) => ({ ...br }))
       : [],
+    debtWriteOffJournals: [],
+    memberLifecycleHistory: [],
     volunteerShifts: isGalata
       ? SYNTHETIC_VOLUNTEER_SHIFTS.map((s) => ({
           ...s,
@@ -2276,6 +2288,14 @@ export function migrateDatabaseLossless(
       boardResolutions: Array.isArray(existingTenant.boardResolutions)
         ? existingTenant.boardResolutions
         : defaultTenant.boardResolutions,
+      debtWriteOffJournals: Array.isArray(existingTenant.debtWriteOffJournals)
+        ? existingTenant.debtWriteOffJournals
+        : [],
+      memberLifecycleHistory: Array.isArray(
+        existingTenant.memberLifecycleHistory
+      )
+        ? existingTenant.memberLifecycleHistory
+        : [],
       volunteerShifts: Array.isArray(existingTenant.volunteerShifts)
         ? existingTenant.volunteerShifts
         : defaultTenant.volunteerShifts,
@@ -2506,6 +2526,11 @@ export function redactStateForRole(
     paymentNotifications: sanitizedPayments,
     overdueMembers: sanitizedOverdue,
     treasuryLedger: sanitizedTreasuryLedger,
+    debtWriteOffJournals: isPrivilegedFinance
+      ? tenantState.debtWriteOffJournals || []
+      : (tenantState.debtWriteOffJournals || []).filter(
+          (j) => j.memberId === user.memberId
+        ),
     bankStatements: isPrivilegedFinance ? tenantState.bankStatements : [],
     scholars: sanitizedScholars,
     boardResolutions: sanitizedBoardResolutions,
@@ -2901,7 +2926,9 @@ export class AtomicMultiTenantStore {
       }
     }
 
-    // Strictly restrict optional officer PIN provisioning to club-galata roles ONLY (#70)
+    // Issue #70 & #76: First check for cross-tenant bootstrap keys (403 CROSS_TENANT_BOOTSTRAP_FORBIDDEN),
+    // and strictly forbid activating ANY other member or board officer during initial bootstrap (422 BULK_MEMBER_BOOTSTRAP_FORBIDDEN).
+    // Each member/officer must activate their own account via a personal one-time invitation token (#76).
     const galataRolePinMap: Record<string, string> = {
       uye: 'm-rifat',
       sekreter: 'm-nazli',
@@ -2909,7 +2936,10 @@ export class AtomicMultiTenantStore {
     };
 
     if (params.rolePins && typeof params.rolePins === 'object') {
-      for (const [roleKey, pinVal] of Object.entries(params.rolePins)) {
+      const roleEntries = Object.entries(params.rolePins).filter(
+        ([, pinVal]) => pinVal !== undefined && String(pinVal).trim() !== ''
+      );
+      for (const [roleKey] of roleEntries) {
         if (!Object.prototype.hasOwnProperty.call(galataRolePinMap, roleKey)) {
           return {
             ok: false,
@@ -2918,17 +2948,15 @@ export class AtomicMultiTenantStore {
             message: `İlk kurulumda başka kulüplerin (${roleKey}) hesapları etkinleştirilemez (#70).`,
           };
         }
-        if (pinVal && String(pinVal).trim()) {
-          const check = validateStrongCredential(String(pinVal));
-          if (!check.valid) {
-            return {
-              ok: false,
-              status: 400,
-              error: 'WEAK_PIN_REJECTED',
-              message: check.reason!,
-            };
-          }
-        }
+      }
+      if (roleEntries.length > 0) {
+        return {
+          ok: false,
+          status: 422,
+          error: 'BULK_MEMBER_BOOTSTRAP_FORBIDDEN',
+          message:
+            'İlk kurulum sahiplik anahtarı yalnızca kurucu Dönem Başkanı hesabını etkinleştirebilir; diğer YK görevlileri ve kulüp üyeleri kendi tek kullanımlık kişisel davet anahtarları (/api/auth/issue-member-invite -> /api/auth/claim-member-invite) ile hesaplarını şahsen etkinleştirmelidir (#76).',
+        };
       }
     }
 
@@ -2988,22 +3016,6 @@ export class AtomicMultiTenantStore {
     );
     baskanAcc.activated = true;
 
-    if (params.rolePins && typeof params.rolePins === 'object') {
-      for (const [roleKey, pinVal] of Object.entries(params.rolePins)) {
-        const targetMemberId = galataRolePinMap[roleKey];
-        if (!targetMemberId || !pinVal || !String(pinVal).trim()) continue;
-        const acc = this.state.accounts.find(
-          (a) => a.memberId === targetMemberId && a.clubId === 'club-galata'
-        );
-        if (acc) {
-          const s = crypto.randomBytes(16).toString('hex');
-          acc.passwordSalt = s;
-          acc.passwordHash = hashPinWithSalt(String(pinVal).trim(), s);
-          acc.activated = true;
-        }
-      }
-    }
-
     this.state.bootstrapClaimed = true;
     this.state.bootstrapTokenSalt = '';
     this.state.bootstrapTokenHash = '';
@@ -3022,10 +3034,228 @@ export class AtomicMultiTenantStore {
     return { ok: true, account: baskanAcc };
   }
 
+  /**
+   * Issues a one-time personal invitation token for a specific member in the officer's own club (#76).
+   * Does NOT set the member's PIN or activate the account directly — the invited member must personally
+   * claim the invitation with their own Rotary ID, email, and self-selected strong PIN.
+   */
+  public issueMemberInvitationToken(params: {
+    targetIdentifier: string;
+    actorClubId: AllowedTenantClubId;
+    issuedByMemberId: string;
+    nowDate?: Date;
+    expiresInHours?: number;
+  }):
+    | {
+        ok: true;
+        invitationToken: string;
+        memberId: string;
+        rotaryId: string;
+        email: string;
+        fullName: string;
+        clubId: AllowedTenantClubId;
+        expiresAtIso: string;
+      }
+    | { ok: false; status: number; error: string; message: string } {
+    const account = findPilotAccount(
+      params.targetIdentifier,
+      this.state.accounts
+    );
+    if (!account) {
+      return {
+        ok: false,
+        status: 404,
+        error: 'ACCOUNT_NOT_FOUND',
+        message: 'Davet gönderilecek hedef üye hesabı bulunamadı.',
+      };
+    }
+    if (
+      account.clubId !== params.actorClubId ||
+      !getAccountClubMembership(account, params.actorClubId)
+    ) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'CLUB_MEMBERSHIP_FORBIDDEN',
+        message:
+          'Yalnızca kendi kulübünüzdeki üyelere hesap aktivasyon daveti oluşturabilirsiniz (#70, #76).',
+      };
+    }
+
+    const nowMs = (params.nowDate || new Date()).getTime();
+    const clampedHours = Math.max(
+      1,
+      Math.min(168, Number(params.expiresInHours) || 48)
+    );
+    const expiresAtIso = new Date(
+      nowMs + clampedHours * 3600 * 1000
+    ).toISOString();
+
+    const invitationToken = `RCINV-2420-${crypto
+      .randomBytes(24)
+      .toString('base64url')}`;
+    const salt = crypto.randomBytes(16).toString('hex');
+    account.invitationTokenSalt = salt;
+    account.invitationTokenHash = hashPinWithSalt(invitationToken, salt);
+    account.invitationExpiresAtIso = expiresAtIso;
+    account.invitationIssuedByMemberId = params.issuedByMemberId;
+
+    this.state.updatedAt = new Date().toISOString();
+    this.atomicWriteToDisk(this.state);
+
+    return {
+      ok: true,
+      invitationToken,
+      memberId: account.memberId,
+      rotaryId: account.rotaryId,
+      email: account.email,
+      fullName: account.fullName,
+      clubId: account.clubId,
+      expiresAtIso,
+    };
+  }
+
+  /**
+   * Claims a one-time member invitation token with the member's own verified identity (rotaryId + email)
+   * and sets the member's personal strong PIN (#76).
+   */
+  public claimMemberInvitationToken(params: {
+    invitationToken: string;
+    rotaryId: string;
+    email: string;
+    newPin: string;
+    nowDate?: Date;
+  }):
+    | { ok: true; account: PilotUserAccount }
+    | { ok: false; status: number; error: string; message: string } {
+    const cleanToken = String(params.invitationToken || '').trim();
+    const cleanRotaryId = String(params.rotaryId || '').trim().toUpperCase();
+    const cleanEmail = String(params.email || '').trim().toLowerCase();
+
+    if (!cleanToken) {
+      return {
+        ok: false,
+        status: 401,
+        error: 'INVITATION_TOKEN_REQUIRED',
+        message: 'Tek kullanımlık üye davet anahtarı (invitationToken) zorunludur (#76).',
+      };
+    }
+    if (!cleanRotaryId || !cleanEmail) {
+      return {
+        ok: false,
+        status: 422,
+        error: 'INVITATION_IDENTITY_REQUIRED',
+        message:
+          'Hesap aktivasyonu için üyenin kendi Rotary Sicil Numarası (rotaryId) ve kurumsal e-posta adresi (email) zorunludur (#76).',
+      };
+    }
+
+    const tokenOwner = this.state.accounts.find(
+      (a) =>
+        Boolean(a.invitationTokenSalt && a.invitationTokenHash) &&
+        verifySecretConstantTime(
+          cleanToken,
+          a.invitationTokenSalt!,
+          a.invitationTokenHash!
+        )
+    );
+    if (
+      tokenOwner &&
+      (tokenOwner.rotaryId.trim().toUpperCase() !== cleanRotaryId ||
+        tokenOwner.email.trim().toLowerCase() !== cleanEmail)
+    ) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'INVITATION_IDENTITY_MISMATCH',
+        message:
+          'Bu tek kullanımlık davet anahtarı başka bir kulüp üyesine aittir; yalnızca davet edilen üye kendi kimliğiyle kullanabilir (#76).',
+      };
+    }
+
+    const account = this.state.accounts.find(
+      (a) =>
+        a.rotaryId.trim().toUpperCase() === cleanRotaryId &&
+        a.email.trim().toLowerCase() === cleanEmail
+    );
+    if (!account) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'INVITATION_IDENTITY_MISMATCH',
+        message:
+          'Rotary Sicil No ve e-posta adresi eşleşen bir davetli üye hesabı bulunamadı (#76).',
+      };
+    }
+
+    if (!account.invitationTokenSalt || !account.invitationTokenHash) {
+      return {
+        ok: false,
+        status: 409,
+        error: 'INVITATION_TOKEN_ALREADY_CONSUMED',
+        message:
+          'Bu üye hesabı için aktif bir tek kullanımlık davet anahtarı bulunmuyor veya daha önce kullanılmış (#76).',
+      };
+    }
+
+    if (
+      !verifySecretConstantTime(
+        cleanToken,
+        account.invitationTokenSalt,
+        account.invitationTokenHash
+      )
+    ) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'INVALID_MEMBER_INVITATION_TOKEN',
+        message: 'Tek kullanımlık üye davet anahtarı (invitationToken) geçersiz (#76).',
+      };
+    }
+
+    if (account.invitationExpiresAtIso) {
+      const expMs = Date.parse(account.invitationExpiresAtIso);
+      const nowMs = (params.nowDate || new Date()).getTime();
+      if (!Number.isNaN(expMs) && nowMs > expMs) {
+        return {
+          ok: false,
+          status: 422,
+          error: 'INVITATION_TOKEN_EXPIRED',
+          message:
+            'Tek kullanımlık üye davet anahtarının geçerlilik süresi dolmuş (#76).',
+        };
+      }
+    }
+
+    const strength = validateStrongCredential(params.newPin);
+    if (!strength.valid) {
+      return {
+        ok: false,
+        status: 400,
+        error: 'WEAK_PIN_REJECTED',
+        message: strength.reason!,
+      };
+    }
+
+    const salt = crypto.randomBytes(16).toString('hex');
+    account.passwordSalt = salt;
+    account.passwordHash = hashPinWithSalt(params.newPin.trim(), salt);
+    account.activated = true;
+    account.invitationTokenSalt = '';
+    account.invitationTokenHash = '';
+    account.invitationExpiresAtIso = '';
+
+    this.state.updatedAt = new Date().toISOString();
+    this.atomicWriteToDisk(this.state);
+
+    return { ok: true, account };
+  }
+
   public adminSetAccountPin(
     targetIdentifier: string,
     newPin: string,
-    actorClubId: AllowedTenantClubId = 'club-galata'
+    actorClubId: AllowedTenantClubId = 'club-galata',
+    actorMemberId?: string
   ):
     | { ok: true; account: PilotUserAccount }
     | { ok: false; status?: number; error: string; message: string } {
@@ -3057,6 +3287,15 @@ export class AtomicMultiTenantStore {
         error: 'CLUB_MEMBERSHIP_FORBIDDEN',
         message:
           'Yalnızca kendi kulübünüzdeki üye ve görevlilerin parolasını tanımlayabilirsiniz (#70).',
+      };
+    }
+    if (actorMemberId && account.memberId !== actorMemberId) {
+      return {
+        ok: false,
+        status: 422,
+        error: 'PERSONAL_INVITATION_FLOW_REQUIRED',
+        message:
+          'Yönetici başka bir üyenin parolasını doğrudan belirleyip hesabını etkinleştiremez; /api/auth/issue-member-invite ile tek kullanımlık davet oluşturulmalı ve üye kendi kimliğiyle /api/auth/claim-member-invite üzerinden hesabını şahsen etkinleştirmelidir (#76).',
       };
     }
     const salt = crypto.randomBytes(16).toString('hex');
@@ -3568,21 +3807,23 @@ export const POSTGRESQL_RELATIONAL_SCHEMA_V5_4 = {
   version: '5.4.0-relational-hardened',
   tables: [
     'rotary_clubs (club_id PK, club_name, district, revision, updated_at)',
-    'rotary_members (id PK, club_id FK, rotary_id UNIQUE, full_name, membership_status, dues_balance CHECK >= 0, meal_balance CHECK >= 0, foundation_balance CHECK >= 0)',
+    'rotary_members (id PK, club_id FK, rotary_id UNIQUE, full_name, membership_status, dues_balance CHECK >= 0, meal_balance CHECK >= 0, foundation_balance CHECK >= 0, UNIQUE (club_id, id))',
+    'member_lifecycle_history (id PK, club_id FK, (club_id, member_id) FK -> rotary_members)',
     'weekly_meetings (club_id FK, meeting_no, PRIMARY KEY (club_id, meeting_no))',
-    'meeting_rsvps (club_id FK, meeting_no FK, member_id FK, rsvp_status, menu_preference, PRIMARY KEY (club_id, meeting_no, member_id))',
-    'meeting_attendances (club_id FK, meeting_no FK, member_id FK, PRIMARY KEY (club_id, meeting_no, member_id))',
-    'verified_guest_attendances (id PK, club_id FK, meeting_no FK, guest_name, guest_club, verified_by_member_id FK, UNIQUE (club_id, meeting_no, guest_name, guest_club))',
-    'makeup_submissions (id PK, club_id FK, member_id FK, activity_date, target_club_or_event, activity_type, status)',
-    'guest_makeup_certificates (id PK, club_id FK, meeting_no FK, guest_attendance_record_id FK, verification_code UNIQUE, status)',
+    'meeting_rsvps (club_id FK, (club_id, meeting_no) FK, (club_id, member_id) FK, PRIMARY KEY (club_id, meeting_no, member_id))',
+    'meeting_attendances (club_id FK, (club_id, meeting_no) FK, (club_id, member_id) FK, PRIMARY KEY (club_id, meeting_no, member_id))',
+    'verified_guest_attendances (id PK, club_id FK, (club_id, meeting_no) FK, (club_id, verified_by_member_id) FK, UNIQUE (club_id, id))',
+    'makeup_submissions (id PK, club_id FK, (club_id, member_id) FK, UNIQUE (club_id, id))',
+    'guest_makeup_certificates (id PK, club_id FK, (club_id, meeting_no) FK, (club_id, guest_attendance_record_id) FK, verification_code UNIQUE)',
     'financial_line_items (id PK, club_id FK, category, period, title, idempotency_key UNIQUE)',
     'treasury_ledger (id PK, club_id FK, type, category, amount CHECK > 0, reference_no UNIQUE)',
+    'debt_writeoff_journals (id PK, club_id FK, (club_id, member_id) FK, idempotency_key UNIQUE, resolution_id UNIQUE, entry_hash UNIQUE)',
     'chained_audit_ledger (id PK, club_id FK, sequence_no, prev_hash, entry_hash UNIQUE, PRIMARY KEY (club_id, sequence_no))',
   ],
 } as const;
 
 /**
- * Issue #13, #14, #18, #19: Verifies relational & transactional invariants on a tenant database state
+ * Issue #13, #14, #18, #19, #39: Verifies relational & transactional invariants on a tenant database state
  * AND honestly reports the active runtime storage engine (distinguishing single-process JSON file CAS
  * from a live PostgreSQL ACID connection).
  */
@@ -3612,6 +3853,7 @@ export function verifyTransactionalIntegrity(
     guestCertificates: number;
     verifiedGuestAttendances: number;
     treasuryLedgerEntries: number;
+    debtWriteOffJournals: number;
     auditLedgerEntries: number;
   };
 } {
@@ -3653,6 +3895,26 @@ export function verifyTransactionalIntegrity(
     ledgerRefs.add(normRef);
     if (!Number.isFinite(entry.amount) || entry.amount <= 0) {
       violations.push(`INVALID_TREASURY_AMOUNT:${entry.id}`);
+    }
+  }
+
+  const writeOffIds = new Set<string>();
+  const writeOffResIds = new Set<string>();
+  for (const j of tenant.debtWriteOffJournals || []) {
+    if (writeOffIds.has(j.id)) {
+      violations.push(`DUPLICATE_WRITEOFF_JOURNAL_PK:${j.id}`);
+    }
+    writeOffIds.add(j.id);
+    if (writeOffResIds.has(j.resolutionId)) {
+      violations.push(`DUPLICATE_WRITEOFF_RESOLUTION_FK:${j.resolutionId}`);
+    }
+    writeOffResIds.add(j.resolutionId);
+    if (
+      j.waivedDuesAmountTL + j.waivedMealAmountTL + j.waivedFoundationAmountTL !==
+        j.totalWaivedAmountTL ||
+      j.totalWaivedAmountTL <= 0
+    ) {
+      violations.push(`UNBALANCED_WRITEOFF_JOURNAL:${j.id}`);
     }
   }
 
@@ -3713,6 +3975,7 @@ export function verifyTransactionalIntegrity(
       guestCertificates: (tenant.guestMakeupCards || []).length,
       verifiedGuestAttendances: (tenant.verifiedGuestAttendances || []).length,
       treasuryLedgerEntries: (tenant.treasuryLedger || []).length,
+      debtWriteOffJournals: (tenant.debtWriteOffJournals || []).length,
       auditLedgerEntries: (tenant.auditLedger || []).length,
     },
   };

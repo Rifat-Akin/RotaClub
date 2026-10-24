@@ -1,6 +1,7 @@
 import {
   BoardResolutionItem,
   ClubAttendancePolicy,
+  ClubRole,
   FinancialLineItem,
   LcvReminderQueueItem,
   MakeupSubmission,
@@ -1592,21 +1593,25 @@ export function calculateTermAttendanceMetrics(params: {
       continue;
     }
 
+    // Issue #34 Fix: A meeting whose calendar date is in the future relative to evaluationDate
+    // CANNOT have occurred yet, even if erroneously marked 'Tamamlandı', isPast:true, or given check-in rows!
+    if (
+      evaluationMs !== null &&
+      meetingDateMs !== null &&
+      meetingDateMs > evaluationMs
+    ) {
+      futureScheduledExcludedCount += 1;
+      continue;
+    }
+
     const attendees = meetingAttendances[String(m.meetingNo)] || [];
     const hasOccurred =
       m.isPast === true ||
       m.status === 'Tamamlandı' ||
       attendees.length > 0;
 
-    // Issue #34 Fix: Never count a future scheduled 'Aktif' or 'Planlandı' meeting as held!
-    if (
-      !hasOccurred ||
-      (evaluationMs !== null &&
-        meetingDateMs !== null &&
-        meetingDateMs > evaluationMs &&
-        attendees.length === 0 &&
-        m.status !== 'Tamamlandı')
-    ) {
+    // Issue #34 Fix: Never count an unheld 'Aktif' or 'Planlandı' meeting with 0 check-ins as held!
+    if (!hasOccurred) {
       futureScheduledExcludedCount += 1;
       continue;
     }
@@ -1769,8 +1774,10 @@ export function calculateTermAttendanceMetrics(params: {
     100,
     Math.round((creditedMeetingsCount / obligatoryMeetingsCount) * 100)
   );
-  const meetsPolicy =
+  // Issue #34 Fix: Separate Club Attendance Policy threshold from the RI 60% constitutional threshold!
+  const meetsClubPolicy =
     attendancePercentage >= effectivePolicy.minimumAttendancePercent;
+  const meetsRotary60 = attendancePercentage >= 60;
 
   return {
     memberId: member.id,
@@ -1790,16 +1797,107 @@ export function calculateTermAttendanceMetrics(params: {
     approvedMakeupsApplied,
     creditedMeetingsCount,
     attendancePercentage,
-    meetsClubAttendancePolicy: meetsPolicy,
-    meetsRotary60PercentRule: meetsPolicy,
+    meetsClubAttendancePolicy: meetsClubPolicy,
+    meetsRotary60PercentRule: meetsRotary60,
   };
 }
 
 /**
- * Issue #24-#26: Validates a member lifecycle status transition (Candidate -> Active -> Leave -> Honorary -> Resigned/Transferred).
+ * Issue #24 / #39: Verifies that a Board Debt Waiver Resolution has genuine board meeting metadata,
+ * official resolution number, and independent multi-officer quorum votes (at least 2 distinct board officers
+ * with distinct memberIds and roles, including both 'baskan' and 'sayman').
+ * A single officer's request can NEVER self-certify 'Onaylandı' or 'Oybirliği ile Kabul'.
+ */
+export function verifyBoardDebtWaiverQuorum(resolution: BoardResolutionItem): {
+  ok: boolean;
+  valid: boolean;
+  error?: string;
+  message?: string;
+  distinctApprovingOfficerIds: string[];
+  distinctApprovingRoles: ClubRole[];
+} {
+  const cleanResNo = String(
+    resolution.resolutionNo || resolution.decisionNo || ''
+  ).trim();
+  const cleanMeetingNo = String(resolution.boardMeetingNo || '').trim();
+  const cleanMeetingDate = String(resolution.boardMeetingDate || '').trim();
+
+  if (
+    cleanResNo.length < 4 ||
+    cleanMeetingNo.length < 3 ||
+    !cleanMeetingDate ||
+    parseRotaryDateToEpochMs(cleanMeetingDate) === null
+  ) {
+    return {
+      ok: false,
+      valid: false,
+      error: 'BOARD_RESOLUTION_MISSING_MEETING_METADATA',
+      message: `YK karar bütünlüğü (#24, #39): "${cleanResNo || resolution.id}" kararında resmi YK toplantı numarası (boardMeetingNo), geçerli YK toplantı tarihi (boardMeetingDate) veya karar numarası (resolutionNo) eksik.`,
+      distinctApprovingOfficerIds: [],
+      distinctApprovingRoles: [],
+    };
+  }
+
+  const votes = Array.isArray(resolution.boardVotes)
+    ? resolution.boardVotes
+    : [];
+  const allowedBoardRoles = new Set<ClubRole>(['baskan', 'sayman', 'sekreter']);
+  const seenMemberIds = new Set<string>();
+  const seenRoles = new Set<ClubRole>();
+
+  for (const v of votes) {
+    if (!v || v.decision !== 'KABUL') continue;
+    const mId = String(v.memberId || '').trim();
+    if (!mId || !allowedBoardRoles.has(v.role)) continue;
+    if (seenMemberIds.has(mId) || seenRoles.has(v.role)) continue;
+    seenMemberIds.add(mId);
+    seenRoles.add(v.role);
+  }
+
+  const requiredQuorum = Math.max(2, resolution.quorumRequiredCount || 2);
+  const hasBaskanAndSayman =
+    seenRoles.has('baskan') && seenRoles.has('sayman');
+
+  if (seenMemberIds.size < requiredQuorum || !hasBaskanAndSayman) {
+    return {
+      ok: false,
+      valid: false,
+      error: 'BOARD_RESOLUTION_QUORUM_NOT_MET',
+      message: `YK nisap ve bağımsız onay eksikliği (#24, #39): "${cleanResNo}" sayılı borç ibra kararının yürürlüğe girmesi için en az ${requiredQuorum} farklı Yönetim Kurulu üyesinin (Dönem Başkanı ve Sayman dahil) bağımsız kabul oyu zorunludur. Tek kişinin isteğiyle onaylı karar üretilemez (Mevcut geçerli oy: ${seenMemberIds.size}).`,
+      distinctApprovingOfficerIds: Array.from(seenMemberIds),
+      distinctApprovingRoles: Array.from(seenRoles),
+    };
+  }
+
+  // Do not allow fabricated 'Oybirliği ile Kabul' unless all 3 distinct board officers (baskan, sayman, sekreter) voted KABUL
+  if (
+    resolution.voteStatus === 'Oybirliği ile Kabul' &&
+    seenMemberIds.size < 3
+  ) {
+    return {
+      ok: false,
+      valid: false,
+      error: 'UNSUBSTANTIATED_UNANIMOUS_BOARD_VOTE',
+      message: `Sahte oybirliği tespiti (#24, #39): "${cleanResNo}" kararında tüm YK görevlilerinin (Başkan, Sayman, Sekreter) oyu bulunmadan "Oybirliği ile Kabul" statüsü kullanılamaz.`,
+      distinctApprovingOfficerIds: Array.from(seenMemberIds),
+      distinctApprovingRoles: Array.from(seenRoles),
+    };
+  }
+
+  return {
+    ok: true,
+    valid: true,
+    distinctApprovingOfficerIds: Array.from(seenMemberIds),
+    distinctApprovingRoles: Array.from(seenRoles),
+  };
+}
+
+/**
+ * Issue #24-#26 & #39: Validates a member lifecycle status transition (Candidate -> Active -> Leave -> Honorary -> Resigned/Transferred).
  * Strictly blocks exit/resignation/transfer when the member has unsettled financial obligations unless a
- * server-verified, club-scoped, member-bound, unconsumed, non-expired Board Debt Waiver Resolution (`DEBT_WAIVER_ON_EXIT`)
- * exists in `boardResolutions`. Client-supplied boolean `boardDebtWaiverApproved: true` is NEVER sufficient!
+ * server-verified, club-scoped, member-bound, quorum-attested, unconsumed, non-expired Board Debt Waiver Resolution (`DEBT_WAIVER_ON_EXIT`)
+ * exists in `boardResolutions` AND a balanced, immutable financial write-off journal breakdown can be posted.
+ * Client-supplied boolean `boardDebtWaiverApproved: true` is NEVER sufficient!
  */
 export function validateMemberLifecycleTransition(params: {
   clubId?: string;
@@ -1820,6 +1918,8 @@ export function validateMemberLifecycleTransition(params: {
   boardResolutionId?: string;
   boardResolutions?: BoardResolutionItem[];
   boardDebtWaiverApproved?: boolean;
+  sourceReceivableIds?: string[];
+  requireWriteOffJournal?: boolean;
   nowEpochMs?: number;
 }):
   | {
@@ -1827,6 +1927,18 @@ export function validateMemberLifecycleTransition(params: {
       currentStatus: MembershipLifecycleStatus;
       verifiedDebtWaiverResolution?: BoardResolutionItem;
       matchedResolution?: BoardResolutionItem;
+      writeOffBreakdown?: {
+        duesWaivedTL: number;
+        mealWaivedTL: number;
+        foundationWaivedTL: number;
+        totalWaivedTL: number;
+        waivedDuesAmountTL?: number;
+        waivedMealAmountTL?: number;
+        waivedFoundationAmountTL?: number;
+        totalWaivedAmountTL?: number;
+        sourceReceivableIds?: string[];
+        approvedByMemberIds?: string[];
+      };
     }
   | { ok: false; error: string; message: string } {
   const allowedStatuses: MembershipLifecycleStatus[] = [
@@ -1883,12 +1995,24 @@ export function validateMemberLifecycleTransition(params: {
     }
   }
 
+  const waivedDuesAmountTL = Math.max(0, params.member.duesBalance || 0);
+  const waivedMealAmountTL = Math.max(0, params.member.mealBalance || 0);
+  const waivedFoundationAmountTL = Math.max(
+    0,
+    params.member.foundationBalance || 0
+  );
   const totalDebt =
-    (params.member.duesBalance || 0) +
-    (params.member.mealBalance || 0) +
-    (params.member.foundationBalance || 0);
+    waivedDuesAmountTL + waivedMealAmountTL + waivedFoundationAmountTL;
 
   let verifiedDebtWaiverResolution: BoardResolutionItem | undefined;
+  let writeOffBreakdown:
+    | {
+        duesWaivedTL: number;
+        mealWaivedTL: number;
+        foundationWaivedTL: number;
+        totalWaivedTL: number;
+      }
+    | undefined;
 
   if (
     (params.targetStatus === 'İstifa / Ayrıldı' ||
@@ -1944,20 +2068,6 @@ export function validateMemberLifecycleTransition(params: {
       };
     }
 
-    if (
-      matchedResolution.serverVerified !== true ||
-      matchedResolution.approvalStatus !== 'Onaylandı' ||
-      !matchedResolution.approvedByMemberId ||
-      (matchedResolution.approvedByRole !== 'baskan' &&
-        matchedResolution.approvedByRole !== 'sayman')
-    ) {
-      return {
-        ok: false,
-        error: 'BOARD_RESOLUTION_NOT_APPROVED',
-        message: `Yetkisiz veya onaylanmamış YK kararı (#24, #26): "${cleanRef}" kararı sunucu tarafında Dönem Başkanı / Sayman yetkisiyle onaylanmış resmi bir karar değildir.`,
-      };
-    }
-
     if (matchedResolution.targetMemberId !== params.member.id) {
       return {
         ok: false,
@@ -1977,6 +2087,34 @@ export function validateMemberLifecycleTransition(params: {
         ok: false,
         error: 'BOARD_RESOLUTION_SCOPE_MISMATCH',
         message: `Karar kapsam/tutar hatası (#24, #26): "${cleanRef}" kararı DEBT_WAIVER_ON_EXIT kapsamında olmalı ve üyenin toplam açık borcunu (${totalDebt} TL) karşılamalıdır.`,
+      };
+    }
+
+    if (
+      matchedResolution.serverVerified !== true ||
+      matchedResolution.approvalStatus !== 'Onaylandı' ||
+      !matchedResolution.approvedByMemberId ||
+      (matchedResolution.approvedByRole !== 'baskan' &&
+        matchedResolution.approvedByRole !== 'sayman')
+    ) {
+      return {
+        ok: false,
+        error: 'BOARD_RESOLUTION_NOT_APPROVED',
+        message: `Yetkisiz veya taslak YK kararı (#24, #26): "${cleanRef}" kararı henüz gerekli YK nisabıyla onaylanmamış ("${String(
+          matchedResolution.approvalStatus || 'Taslak'
+        )}").`,
+      };
+    }
+
+    // Issue #24 / #39 Fix: Verify multi-officer board quorum & meeting/resolution evidence BEFORE accepting 'Onaylandı'
+    const quorumCheck = verifyBoardDebtWaiverQuorum(matchedResolution);
+    if (!quorumCheck.valid) {
+      return {
+        ok: false,
+        error: quorumCheck.error || 'BOARD_RESOLUTION_QUORUM_NOT_MET',
+        message:
+          quorumCheck.message ||
+          'YK nisap ve bağımsız onay kanıtı doğrulanamadı (#24, #39).',
       };
     }
 
@@ -2003,7 +2141,26 @@ export function validateMemberLifecycleTransition(params: {
       };
     }
 
+    if (
+      params.requireWriteOffJournal &&
+      Array.isArray(params.sourceReceivableIds) &&
+      params.sourceReceivableIds.filter((s) => String(s || '').trim()).length ===
+        0
+    ) {
+      return {
+        ok: false,
+        error: 'DEBT_WRITEOFF_JOURNAL_REQUIRED',
+        message: `Finansal terkin bütünlüğü (#24, #39): ${params.member.fullName} üyesinin ${totalDebt} TL borcunun sıfırlanabilmesi için kaynak alacak kayıtlarını (sourceReceivableIds) içeren değiştirilemez terkin yevmiye kaydı zorunludur; journalsiz borç silinemez.`,
+      };
+    }
+
     verifiedDebtWaiverResolution = matchedResolution;
+    writeOffBreakdown = {
+      duesWaivedTL: waivedDuesAmountTL,
+      mealWaivedTL: waivedMealAmountTL,
+      foundationWaivedTL: waivedFoundationAmountTL,
+      totalWaivedTL: totalDebt,
+    };
   }
 
   return {
@@ -2013,6 +2170,7 @@ export function validateMemberLifecycleTransition(params: {
       ? {
           verifiedDebtWaiverResolution,
           matchedResolution: verifiedDebtWaiverResolution,
+          writeOffBreakdown,
         }
       : {}),
   };
