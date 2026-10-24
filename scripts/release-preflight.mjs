@@ -75,7 +75,7 @@ export function evaluateReleaseEvidence({
       id: 'issue-' + n + '-closed',
       pass: checkedIssues && issues[n]?.state === 'closed' &&
         issues[n]?.pull_request === undefined,
-      detail: 'Issue #' + n + ' must have independently accepted closure evidence',
+      detail: 'Issue #' + n + ' must be closed; closure alone does not prove human acceptance',
     })),
   ];
   const machineReady = gates.every((g) => g.pass === true);
@@ -107,15 +107,26 @@ export function validateDispatchWorkflow(source) {
       /^\s+(?:contents|issues|checks|id-token|actions|deployments):\s*write\s*$/m.test(source)) {
     errors.push('read-only-permissions-required');
   }
-  if (!source.includes('actions/checkout@11d5960a326750d5838078e36cf38b85af677262') ||
-      !source.includes('actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020') ||
+  const uses = lines.filter((s) => /^\s+uses:\s/.test(s)).map((s) => s.trim());
+  const reviewedActions = [
+    'uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
+    'uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020',
+  ];
+  if (uses.length !== 2 || reviewedActions.some((a) => !uses.includes(a)) ||
       !source.includes('persist-credentials: false')) {
     errors.push('action-pinning-or-checkout-policy');
   }
-  const runLines = lines.filter((s) => /^\s+run:\s/.test(s));
-  if (!runLines.some((s) => s.trim() === 'run: node scripts/release-preflight.mjs') ||
-      !runLines.some((s) => s.trim() === 'run: node --test scripts/release-preflight.test.mjs')) {
+  const runLines = lines.filter((s) => /^\s+run:\s/.test(s)).map((s) => s.trim());
+  const allowedRuns = [
+    'run: node scripts/release-preflight.mjs',
+    'run: node --test scripts/release-preflight.test.mjs',
+  ];
+  if (allowedRuns.some((a) => !runLines.includes(a))) {
     errors.push('preflight-and-regression-required');
+  }
+  if (runLines.length !== allowedRuns.length ||
+      runLines.some((line) => !allowedRuns.includes(line))) {
+    errors.push('unexpected-execution-command');
   }
   if (/\b(?:npm\s+(?:publish|deploy)|docker\s+push|kubectl\s+(?:apply|rollout)|gh\s+release\s+create)\b/i.test(source)) {
     errors.push('deployment-command-forbidden');
