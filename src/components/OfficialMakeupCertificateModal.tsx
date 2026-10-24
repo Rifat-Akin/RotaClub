@@ -84,10 +84,32 @@ export const OfficialMakeupCertificateModal: React.FC<
                 <div className="font-bold text-[#0C3C7C]">
                   Belge No: {card.verificationCode}
                 </div>
+                <div>
+                  Durum:{' '}
+                  <span
+                    className={
+                      card.status === 'İptal Edildi'
+                        ? 'text-rose-600 font-bold'
+                        : 'text-emerald-700 font-bold'
+                    }
+                  >
+                    {card.status || 'Aktif'}
+                  </span>{' '}
+                  · Şema v{card.schemaVersion ?? 1}
+                </div>
                 <div>Toplantı #{card.meetingNo}</div>
                 <div>Tarih: {card.meetingDate}</div>
               </div>
             </div>
+
+            {card.status === 'İptal Edildi' && (
+              <div
+                role="alert"
+                className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-800 font-medium"
+              >
+                Bu katılım belgesi Sekreterlik/Başkanlık tarafından iptal edilmiştir ({card.revokedAt || 'İptal Kayıtlı'}). Sebep: {card.revocationReason || 'Belirtilmedi'}.
+              </div>
+            )}
 
             {/* Certificate Main Statement */}
             <div className="space-y-4 text-sm text-slate-800 leading-relaxed py-2">
@@ -135,7 +157,7 @@ export const OfficialMakeupCertificateModal: React.FC<
                     GALATA ROTARY
                   </span>
                   <span className="text-[7px] font-mono-num text-slate-600">
-                    DİJİTAL KAYIT
+                    HMAC-SHA256
                   </span>
                 </div>
               </div>
@@ -150,10 +172,10 @@ export const OfficialMakeupCertificateModal: React.FC<
                   <span>Doğrulama: {card.verificationCode}</span>
                 </div>
                 <div className="text-xs font-bold text-slate-900">
-                  {termInfo.secretary}
+                  {card.issuedByName || termInfo.secretary}
                 </div>
                 <div className="text-[11px] text-slate-500">
-                  Alıcı: {card.guestEmail}
+                  Alıcı: {card.guestEmail || 'KVKK Korumalı'}
                 </div>
               </div>
             </div>

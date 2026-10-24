@@ -14,12 +14,16 @@ import {
   calculateVolunteerShiftMetrics,
   createSpeakerProposal,
   deriveLiveMeetingCostSharing,
+  evaluateLcvReminderBatch,
   executeJulyFirstRollover,
   filterMembersByQueryAndClassification,
   generateKuverCsvContent,
   generateMeetingIcsContent,
   generateMembersFinanceCsvContent,
+  hasDuplicateMakeupActivity,
+  maskGuestNameForPublicVerification,
   maskPhoneForKvkk,
+  resolveUnambiguousLegacyMemberId,
   SYNTHETIC_SPECIALIZED_MODULES,
   SYNTHETIC_VOLUNTEER_SHIFTS,
   toggleVolunteerShiftAssignment,
@@ -564,4 +568,150 @@ test('Issue #35: calculateMemberExtraMakeups isolates approved make-ups per memb
     ),
     1
   );
+
+  // Legacy record WITHOUT memberId when two members share the exact same name ('Ahmet Yılmaz'):
+  // resolveUnambiguousLegacyMemberId returns undefined and calculateMemberExtraMakeups refuses to credit either member ambiguously
+  const duplicateNamedMembers: RotaryMember[] = [
+    { ...SAMPLE_MEMBERS[0], id: 'm-ahmet-1', fullName: 'Ahmet Yılmaz' },
+    { ...SAMPLE_MEMBERS[1], id: 'm-ahmet-2', fullName: 'Ahmet Yılmaz' },
+  ];
+  assert.equal(
+    resolveUnambiguousLegacyMemberId(
+      'Rtn. Ahmet Yılmaz',
+      duplicateNamedMembers
+    ),
+    undefined
+  );
+
+  const legacyAmbiguousMakeups: MakeupSubmission[] = [
+    {
+      id: 'mk-legacy-no-id',
+      memberName: 'Rtn. Ahmet Yılmaz',
+      targetClubOrEvent: 'Kadıköy Rotary Kulübü',
+      activityType: 'Kulüp Toplantısı',
+      date: '22 Ekim 2026',
+      description: 'MemberId olmayan eski kayıt',
+      status: 'Onaylandı',
+      attendanceBoost: 3,
+    },
+  ];
+  assert.equal(
+    calculateMemberExtraMakeups(
+      legacyAmbiguousMakeups,
+      [],
+      'm-ahmet-1',
+      'Rtn. Ahmet Yılmaz',
+      duplicateNamedMembers
+    ),
+    0
+  );
+
+  // Duplicate activity prevention (#35): same memberId, date, activityType, and targetClubOrEvent is detected
+  assert.equal(
+    hasDuplicateMakeupActivity(currentMakeups, {
+      memberId: 'm-ahmet-1',
+      targetClubOrEvent: 'Maçka Rotary Kulübü',
+      activityType: 'Kulüp Toplantısı',
+      date: '18 Ekim 2026',
+    }),
+    true
+  );
+  // Different memberId for the same event is NOT a duplicate for that member
+  assert.equal(
+    hasDuplicateMakeupActivity(currentMakeups, {
+      memberId: 'm-ahmet-2',
+      targetClubOrEvent: 'Maçka Rotary Kulübü',
+      activityType: 'Kulüp Toplantısı',
+      date: '18 Ekim 2026',
+    }),
+    false
+  );
 });
+
+test('evaluateLcvReminderBatch enforces quiet hours, opt-out, 6h cooldown, and honest draft-only status (#32)', () => {
+  const nowMs = Date.parse('2026-10-23T14:00:00.000Z');
+  const membersForReminder: RotaryMember[] = [
+    {
+      ...SAMPLE_MEMBERS[0],
+      id: 'm-pending-ok',
+      fullName: 'Caner Erkin',
+      rsvpStatus: 'pending',
+      preferredReminderChannel: 'E-Posta',
+    },
+    {
+      ...SAMPLE_MEMBERS[1],
+      id: 'm-pending-optout',
+      fullName: 'Selim Yalçın',
+      rsvpStatus: 'pending',
+      reminderOptOut: true,
+    },
+    {
+      ...SAMPLE_MEMBERS[0],
+      id: 'm-pending-cooldown',
+      fullName: 'Zeynep Korkmaz',
+      rsvpStatus: 'pending',
+    },
+  ];
+
+  const existingQueue = [
+    {
+      id: 'rem-1842-m-pending-cooldown-prev',
+      meetingNo: 1842,
+      memberId: 'm-pending-cooldown',
+      memberName: 'Zeynep Korkmaz',
+      channel: 'WhatsApp Taslağı' as const,
+      draftMessage: 'Önceki taslak',
+      status: 'Taslak Kuyrukta (Dış Gönderim Kapalı)' as const,
+      createdAt: '23 Ekim 2026 · 12:00',
+      createdAtEpochMs: nowMs - 2 * 60 * 60 * 1000, // 2 hours ago (within 6h cooldown)
+      createdBy: 'Dr. Zeynep Kaya',
+    },
+  ];
+
+  // Quiet hours (23:00 TR) blocks batch queueing
+  const quietBatch = evaluateLcvReminderBatch({
+    meetingNo: 1842,
+    meetingDate: '27 Ekim 2026 Salı',
+    members: membersForReminder,
+    existingQueue,
+    actorName: 'Dr. Zeynep Kaya',
+    currentHourTR: 23,
+    nowEpochMs: nowMs,
+  });
+  assert.equal(quietBatch.isQuietHours, true);
+  assert.equal(quietBatch.queuedItems.length, 0);
+
+  // Normal daytime hour (14:00 TR, 2 hours after m-pending-cooldown was reminded)
+  const daytimeBatch = evaluateLcvReminderBatch({
+    meetingNo: 1842,
+    meetingDate: '27 Ekim 2026 Salı',
+    members: membersForReminder,
+    existingQueue,
+    actorName: 'Dr. Zeynep Kaya',
+    currentHourTR: 14,
+    nowEpochMs: nowMs,
+  });
+  assert.equal(daytimeBatch.isQuietHours, false);
+  assert.equal(daytimeBatch.queuedItems.length, 1);
+  assert.equal(daytimeBatch.queuedItems[0].memberId, 'm-pending-ok');
+  assert.equal(daytimeBatch.queuedItems[0].channel, 'E-Posta');
+  assert.equal(
+    daytimeBatch.queuedItems[0].status,
+    'Taslak Kuyrukta (Dış Gönderim Kapalı)'
+  );
+  assert.equal(daytimeBatch.queuedItems[0].providerReceiptId, undefined);
+  assert.deepEqual(daytimeBatch.skippedOptOutMembers, ['Selim Yalçın']);
+  assert.deepEqual(daytimeBatch.skippedCooldownMembers, ['Zeynep Korkmaz']);
+});
+
+test('maskGuestNameForPublicVerification masks guest full name under KVKK for unauthenticated public queries (#36)', () => {
+  assert.equal(
+    maskGuestNameForPublicVerification('Rtn. Hakan Çelik'),
+    'Rtn. H*** Ç***'
+  );
+  assert.equal(
+    maskGuestNameForPublicVerification('Sinan Kuyumcu'),
+    'S*** K***'
+  );
+});
+

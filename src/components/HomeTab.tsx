@@ -24,7 +24,9 @@ import {
 import {
   CelebrationItem,
   ClubRole,
+  LcvReminderQueueItem,
   MenuPreference,
+  ReminderChannel,
   RitualStep,
   RotaryMember,
   RsvpStatus,
@@ -80,6 +82,13 @@ interface HomeTabProps {
     meetingNo: number,
     patch: Partial<WeeklyMeeting>
   ) => void;
+  lcvReminderQueue?: LcvReminderQueueItem[];
+  outboundMessagingEnabled?: boolean;
+  activeMemberId?: string;
+  onUpdateCommunicationPrefs?: (
+    reminderOptOut: boolean,
+    preferredReminderChannel: ReminderChannel
+  ) => void;
 }
 
 const RSVP_OPTIONS: {
@@ -131,6 +140,10 @@ export const HomeTab: React.FC<HomeTabProps> = ({
   onRemindUnrespondedMembers,
   onDownloadKuverCsvNotify,
   onUpdateMeetingHotelCommitment,
+  lcvReminderQueue = [],
+  outboundMessagingEnabled = false,
+  activeMemberId = 'm-rifat',
+  onUpdateCommunicationPrefs,
 }) => {
   const [isSpeakerPoolOpen, setIsSpeakerPoolOpen] = useState(true);
   const [showAddSpeakerForm, setShowAddSpeakerForm] = useState(false);
@@ -818,6 +831,67 @@ export const HomeTab: React.FC<HomeTabProps> = ({
                 </div>
               </div>
             )}
+
+            {/* Issue #32: Member LCV Reminder Channel & Opt-Out Preferences */}
+            {onUpdateCommunicationPrefs && (() => {
+              const currentMember =
+                members.find((m) => m.id === activeMemberId) || members[0];
+              const isOptedOut = Boolean(currentMember?.reminderOptOut);
+              const preferredChannel: ReminderChannel =
+                currentMember?.preferredReminderChannel || 'WhatsApp Taslağı';
+              return (
+                <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-semibold text-slate-800">
+                        LCV Hatırlatma Kanalı & Bildirim Tercihi (#32)
+                      </div>
+                      <div className="text-[11px] text-slate-500">
+                        Dış SMS/WhatsApp gönderimi kapalıdır; yalnızca tercih ettiğiniz kanal için taslak kuyruğu oluşturulur.
+                      </div>
+                    </div>
+                    <label className="inline-flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={isOptedOut}
+                        onChange={(e) =>
+                          onUpdateCommunicationPrefs(
+                            e.target.checked,
+                            preferredChannel
+                          )
+                        }
+                        className="rounded border-slate-300 text-[#0C3C7C] focus:ring-[#0C3C7C]"
+                      />
+                      <span>Hatırlatmaları Sessize Al (Opt-Out)</span>
+                    </label>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {(
+                      [
+                        'WhatsApp Taslağı',
+                        'E-Posta Taslağı',
+                        'SMS Taslağı',
+                      ] as ReminderChannel[]
+                    ).map((ch) => (
+                      <button
+                        key={ch}
+                        type="button"
+                        onClick={() =>
+                          onUpdateCommunicationPrefs(isOptedOut, ch)
+                        }
+                        className={`px-3 py-1.5 rounded-lg text-[11px] font-semibold border transition-colors cursor-pointer ${
+                          preferredChannel === ch
+                            ? 'bg-[#0C3C7C] text-white border-[#0C3C7C]'
+                            : 'bg-white text-slate-700 border-slate-200 hover:border-slate-400'
+                        }`}
+                      >
+                        {ch}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
           </section>
         </div>
 
@@ -951,7 +1025,7 @@ export const HomeTab: React.FC<HomeTabProps> = ({
                         className="min-h-[34px] px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-[11px] font-semibold text-white flex items-center gap-1 transition-colors cursor-pointer"
                       >
                         <BellRing className="w-3 h-3 text-[#F7A81B]" />
-                        <span>LCV Hatırlatma Metnini Kopyala</span>
+                        <span>LCV Hatırlatma Kuyruğu & Metin Kopyala</span>
                       </button>
                       <button
                         type="button"
@@ -962,6 +1036,36 @@ export const HomeTab: React.FC<HomeTabProps> = ({
                         <span>Kuver Listesini CSV İndir</span>
                       </button>
                     </div>
+                  </div>
+
+                  {/* Issue #32: LCV Reminder Queue & Outbound Status Banner */}
+                  <div className="p-2.5 rounded-xl bg-[#09152B]/80 border border-white/10 text-[11px] space-y-1.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-slate-300 font-semibold">
+                        LCV Hatırlatma Motoru (#32):{' '}
+                        <span className="text-amber-300">
+                          {outboundMessagingEnabled
+                            ? 'Dış Gönderim Aktif'
+                            : 'Taslak Kuyruk Modu (Dış Gönderim Kapalı)'}
+                        </span>
+                      </span>
+                      <span className="font-mono-num text-slate-400">
+                        Sessiz Saat: 22:00–08:00 · Cooldown: 6 Saat
+                      </span>
+                    </div>
+                    {lcvReminderQueue.filter(
+                      (q) => q.meetingNo === selectedMeetingNo
+                    ).length > 0 && (
+                      <div className="text-slate-300 font-mono-num">
+                        Toplantı #{selectedMeetingNo} Taslak Kuyruğu:{' '}
+                        {
+                          lcvReminderQueue.filter(
+                            (q) => q.meetingNo === selectedMeetingNo
+                          ).length
+                        }{' '}
+                        kayıt (Durum: Taslak Kuyrukta — Dış Gönderim Kapalı)
+                      </div>
+                    )}
                   </div>
 
                   <div className="max-h-64 overflow-y-auto rounded-xl border border-white/10 divide-y divide-white/10 bg-white/5">

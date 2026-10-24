@@ -26,10 +26,19 @@ import {
   AuditLogEntry,
   ClubRole,
   FinancialLineItem,
+  MakeupAuditHistoryEntry,
+  MakeupStatus,
   MakeupSubmission,
+  ReminderChannel,
   RotaryMember,
   TreasuryLedgerEntry,
 } from './src/types/rotary';
+import {
+  evaluateLcvReminderBatch,
+  hasDuplicateMakeupActivity,
+  maskGuestNameForPublicVerification,
+  resolveUnambiguousLegacyMemberId,
+} from './src/utils/rotaryLogic';
 
 const PORT = 3000;
 
@@ -2239,9 +2248,30 @@ export function createPilotExpressApp(
         Number.isInteger(parsedMeetingNo) && parsedMeetingNo > 0
           ? parsedMeetingNo
           : tenant.selectedMeetingNo || 1842;
-      const meetingObj =
-        tenant.meetings.find((m) => m.meetingNo === targetMeetingNo) ||
-        tenant.meetings[0];
+      const meetingObj = tenant.meetings.find(
+        (m) => m.meetingNo === targetMeetingNo
+      );
+      if (!meetingObj) {
+        res.status(404).json({
+          error: 'MEETING_NOT_FOUND',
+          message: `Toplantı bulunamadı (#33): #${targetMeetingNo} numaralı toplantı kulüp takviminde kayıtlı değildir.`,
+        });
+        return;
+      }
+      if (meetingObj.status === 'İptal Edildi') {
+        res.status(422).json({
+          error: 'MEETING_CANCELLED',
+          message: `İptal edilmiş toplantı (#33): Toplantı #${targetMeetingNo} iptal edildiği için QR yoklama kodu üretilemez.`,
+        });
+        return;
+      }
+      if (meetingObj.isPast === true || meetingObj.status === 'Tamamlandı') {
+        res.status(422).json({
+          error: 'MEETING_CLOSED',
+          message: `Kapanmış toplantı (#33): Geçmiş veya tamamlanmış Toplantı #${targetMeetingNo} için canlı QR yoklama kodu üretilemez.`,
+        });
+        return;
+      }
 
       const rawTtl =
         req.query.ttlSeconds !== undefined ? Number(req.query.ttlSeconds) : 300;
@@ -2260,7 +2290,7 @@ export function createPilotExpressApp(
         ok: true,
         clubId: authorizedClubId,
         meetingNo: targetMeetingNo,
-        venue: meetingObj?.venue || 'Pera Palace Hotel',
+        venue: meetingObj.venue || 'Pera Palace Hotel',
         qrToken,
         expiresAt: expiresAtEpochSec * 1000,
         ttlSeconds,
@@ -2318,6 +2348,31 @@ export function createPilotExpressApp(
           return;
         }
 
+        const meetingObj = tenant.meetings.find(
+          (m) => m.meetingNo === targetMeetingNo
+        );
+        if (!meetingObj) {
+          res.status(404).json({
+            error: 'MEETING_NOT_FOUND',
+            message: `Toplantı bulunamadı (#33): #${targetMeetingNo} numaralı toplantı kulüp takviminde mevcut değildir.`,
+          });
+          return;
+        }
+        if (meetingObj.status === 'İptal Edildi') {
+          res.status(422).json({
+            error: 'MEETING_CANCELLED',
+            message: `İptal edilmiş toplantı (#33): Toplantı #${targetMeetingNo} iptal edildiği için yoklama yapılamaz.`,
+          });
+          return;
+        }
+        if (meetingObj.isPast === true || meetingObj.status === 'Tamamlandı') {
+          res.status(422).json({
+            error: 'MEETING_CLOSED',
+            message: `Kapanmış toplantı (#33): Geçmiş veya tamamlanmış Toplantı #${targetMeetingNo} için canlı QR yoklama yapılamaz.`,
+          });
+          return;
+        }
+
         const expectedHmacHex = computeMeetingQrHmacHex(
           authorizedClubId,
           targetMeetingNo,
@@ -2355,9 +2410,22 @@ export function createPilotExpressApp(
           ? tenant.meetingAttendances![meetingKey]
           : [];
         if (alreadyCheckedInMembers.includes(user.memberId)) {
-          res.status(409).json({
+          res.status(200).json({
+            ok: true,
+            idempotentReplay: true,
+            alreadyCheckedIn: true,
+            code: 'ALREADY_CHECKED_IN',
             error: 'ALREADY_CHECKED_IN',
-            message: `Tekrarlı QR yoklama reddedildi (#33): ${user.fullName} Toplantı #${targetMeetingNo} için zaten yoklama yapmış.`,
+            revision: tenant.revision,
+            qrToken: submittedToken,
+            meetingNo: targetMeetingNo,
+            memberId: user.memberId,
+            message: `Mükerrer QR yoklama (İdempotent Yanıt #33): ${user.fullName} Toplantı #${targetMeetingNo} için zaten kayıtlıdır; ek katılım puanı eklenmedi.`,
+            state: redactStateForRole(
+              tenant,
+              store.getAuditLedger(authorizedClubId),
+              user
+            ),
           });
           return;
         }
@@ -2406,6 +2474,8 @@ export function createPilotExpressApp(
 
         res.json({
           ok: true,
+          idempotentReplay: false,
+          alreadyCheckedIn: false,
           revision: casResult.state.revision,
           qrToken: submittedToken,
           meetingNo: targetMeetingNo,
@@ -2425,29 +2495,478 @@ export function createPilotExpressApp(
     }
   );
 
-  // Issue #36: Cryptographic Guest Make-up Certificate Verification Code Generator & Public/Authenticated Verification Endpoint
+  // Issue #33: Authorized Manual / Offline Sync Attendance Endpoint (Secretary / President only)
+  app.post(
+    '/api/pilot/manual-checkin',
+    requireAuth,
+    (req: AuthenticatedRequest, res) => {
+      const user = req.authUser!;
+      if (user.role !== 'sekreter' && user.role !== 'baskan') {
+        res.status(403).json({
+          error: 'RBAC_FORBIDDEN',
+          message:
+            'Manuel / çevrimdışı yoklama yetki sınırı (#33): Yalnızca Genel Sekreter veya Dönem Başkanı manuel yoklama kaydı girebilir.',
+        });
+        return;
+      }
+
+      const { clubId, meetingNo, targetMemberId, reason, mode } = req.body || {};
+      const authorizedClubId = verifyTenantBoundary(
+        user,
+        typeof clubId === 'string' ? clubId.trim() : undefined,
+        store,
+        res
+      );
+      if (!authorizedClubId) return;
+
+      const tenant = store.getTenantState(authorizedClubId);
+      const targetMeetingNo =
+        typeof meetingNo === 'number' &&
+        Number.isInteger(meetingNo) &&
+        meetingNo > 0
+          ? meetingNo
+          : tenant.selectedMeetingNo || 1842;
+
+      const meetingObj = tenant.meetings.find(
+        (m) => m.meetingNo === targetMeetingNo
+      );
+      if (!meetingObj) {
+        res.status(404).json({
+          error: 'MEETING_NOT_FOUND',
+          message: `Toplantı bulunamadı (#33): #${targetMeetingNo} numaralı toplantı mevcut değildir.`,
+        });
+        return;
+      }
+      if (meetingObj.status === 'İptal Edildi') {
+        res.status(422).json({
+          error: 'MEETING_CANCELLED',
+          message: `İptal edilmiş toplantı (#33): Toplantı #${targetMeetingNo} iptal edildiği için manuel yoklama işlenemez.`,
+        });
+        return;
+      }
+
+      const cleanMemberId =
+        typeof targetMemberId === 'string' ? targetMemberId.trim() : '';
+      const rosterMember = tenant.members.find((m) => m.id === cleanMemberId);
+      const authAccount = store
+        .getAccounts()
+        .find(
+          (a) =>
+            a.memberId === cleanMemberId &&
+            (a.clubId === authorizedClubId ||
+              a.clubMemberships?.some((cm) => cm.clubId === authorizedClubId))
+        );
+      if (!rosterMember && !authAccount) {
+        res.status(404).json({
+          error: 'MEMBER_NOT_FOUND',
+          message: `Kulüp üyesi bulunamadı (#33): "${cleanMemberId}" kimliğine sahip üye kulüp listesinde yer almıyor.`,
+        });
+        return;
+      }
+      const targetMemberName =
+        rosterMember?.fullName || authAccount?.fullName || cleanMemberId;
+
+      const cleanReason = typeof reason === 'string' ? reason.trim() : '';
+      if (cleanReason.length < 5) {
+        res.status(422).json({
+          error: 'REASON_REQUIRED',
+          message:
+            'Manuel / çevrimdışı yoklama için en az 5 karakterlik denetim gerekçesi (reason) zorunludur (#33).',
+        });
+        return;
+      }
+
+      const meetingKey = String(targetMeetingNo);
+      const existingAttendees = Array.isArray(
+        tenant.meetingAttendances?.[meetingKey]
+      )
+        ? tenant.meetingAttendances![meetingKey]
+        : [];
+
+      if (existingAttendees.includes(cleanMemberId)) {
+        res.status(200).json({
+          ok: true,
+          idempotentReplay: true,
+          alreadyCheckedIn: true,
+          code: 'ALREADY_CHECKED_IN',
+          revision: tenant.revision,
+          meetingNo: targetMeetingNo,
+          memberId: cleanMemberId,
+          state: redactStateForRole(
+            tenant,
+            store.getAuditLedger(authorizedClubId),
+            user
+          ),
+        });
+        return;
+      }
+
+      const casResult = store.updateTenant(
+        authorizedClubId,
+        (curr) => {
+          const prev = curr.meetingAttendances || {};
+          const list = Array.isArray(prev[meetingKey]) ? prev[meetingKey] : [];
+          return {
+            ...curr,
+            meetingAttendances: {
+              ...prev,
+              [meetingKey]: list.includes(cleanMemberId)
+                ? list
+                : [...list, cleanMemberId],
+            },
+          };
+        },
+        tenant.revision
+      );
+
+      if (!casResult.ok) {
+        res.status(409).json({
+          error: 'REVISION_CONFLICT',
+          currentRevision: casResult.currentRevision,
+        });
+        return;
+      }
+
+      const entryModeLabel =
+        mode === 'offline_sync' ? 'Çevrimdışı Senkronizasyon' : 'Yetkili Manuel';
+      store.appendAuditEntry({
+        clubId: authorizedClubId,
+        actorName: `${user.fullName} (${user.rotaryId})`,
+        actorRole: user.role,
+        module: 'QR Yoklama & Make-up',
+        action: `${entryModeLabel} Yoklama Kaydı (Toplantı #${targetMeetingNo})`,
+        detail: `${targetMemberName} (${cleanMemberId}) için ${user.fullName} tarafından manuel/çevrimdışı yoklama işlendi. Gerekçe: ${cleanReason}`,
+        timestamp: formatNowTR(),
+      });
+
+      res.json({
+        ok: true,
+        idempotentReplay: false,
+        alreadyCheckedIn: false,
+        revision: casResult.state.revision,
+        meetingNo: targetMeetingNo,
+        memberId: cleanMemberId,
+        state: redactStateForRole(
+          casResult.state,
+          store.getAuditLedger(authorizedClubId),
+          user
+        ),
+      });
+    }
+  );
+
+  // Issue #32: LCV Reminder Queue & Member Communication Preferences Endpoints
+  app.post(
+    '/api/pilot/lcv-reminders',
+    requireAuth,
+    (req: AuthenticatedRequest, res) => {
+      const user = req.authUser!;
+      if (user.role !== 'sekreter' && user.role !== 'baskan') {
+        res.status(403).json({
+          error: 'RBAC_FORBIDDEN',
+          message:
+            'LCV hatırlatma kuyruğu oluşturma yetkisi (#32): Yalnızca Genel Sekreter veya Dönem Başkanı toplu LCV hatırlatması başlatabilir.',
+        });
+        return;
+      }
+
+      const {
+        clubId,
+        meetingNo,
+        simulatedHourTR,
+        simulatedNowIso,
+        cooldownWindowMs,
+        providerReceiptsByMemberId,
+      } = req.body || {};
+      const authorizedClubId = verifyTenantBoundary(
+        user,
+        typeof clubId === 'string' ? clubId.trim() : undefined,
+        store,
+        res
+      );
+      if (!authorizedClubId) return;
+
+      const tenant = store.getTenantState(authorizedClubId);
+      const targetMeetingNo =
+        typeof meetingNo === 'number' &&
+        Number.isInteger(meetingNo) &&
+        meetingNo > 0
+          ? meetingNo
+          : tenant.selectedMeetingNo || 1842;
+
+      const meetingObj = tenant.meetings.find(
+        (m) => m.meetingNo === targetMeetingNo
+      );
+      if (!meetingObj) {
+        res.status(404).json({
+          error: 'MEETING_NOT_FOUND',
+          message: `Toplantı bulunamadı (#32): #${targetMeetingNo} numaralı toplantı kulüp takviminde kayıtlı değildir.`,
+        });
+        return;
+      }
+
+      const effectiveHour =
+        typeof simulatedHourTR === 'number' && Number.isFinite(simulatedHourTR)
+          ? simulatedHourTR
+          : 14;
+      const parsedSimMs =
+        typeof simulatedNowIso === 'string' && simulatedNowIso.trim()
+          ? Date.parse(simulatedNowIso.trim())
+          : NaN;
+      const effectiveNowMs = Number.isFinite(parsedSimMs)
+        ? parsedSimMs
+        : Date.now();
+
+      const batch = evaluateLcvReminderBatch({
+        meetingNo: targetMeetingNo,
+        meetingDate: meetingObj.date,
+        members: tenant.members,
+        existingQueue: tenant.lcvReminderQueue || [],
+        actorName: `${user.fullName} (${user.role})`,
+        currentHourTR: effectiveHour,
+        nowEpochMs: effectiveNowMs,
+        cooldownWindowMs:
+          typeof cooldownWindowMs === 'number' ? cooldownWindowMs : undefined,
+        outboundDispatchEnabled: Boolean(tenant.outboundMessagingEnabled),
+        providerReceiptsByMemberId:
+          providerReceiptsByMemberId &&
+          typeof providerReceiptsByMemberId === 'object'
+            ? (providerReceiptsByMemberId as Record<string, string>)
+            : undefined,
+      });
+
+      if (batch.isQuietHours) {
+        res.status(422).json({
+          error: 'QUIET_HOURS_ACTIVE',
+          message:
+            'Sessiz saat kuralı (#32): 22:00 ile 08:00 saatleri arasında üyelere LCV hatırlatma bildirimi kuyruğa alınamaz veya gönderilemez.',
+          batchSummary: batch,
+        });
+        return;
+      }
+
+      const queuedMemberIds = new Set(batch.queuedItems.map((q) => q.memberId));
+      const nowIso = new Date(effectiveNowMs).toISOString();
+      const casResult = store.updateTenant(
+        authorizedClubId,
+        (curr) => ({
+          ...curr,
+          lcvReminderQueue: [
+            ...batch.queuedItems,
+            ...(curr.lcvReminderQueue || []),
+          ],
+          members: curr.members.map((m) =>
+            queuedMemberIds.has(m.id)
+              ? {
+                  ...m,
+                  lastRemindedMeetingNo: targetMeetingNo,
+                  lastRemindedAtIso: nowIso,
+                }
+              : m
+          ),
+        }),
+        tenant.revision
+      );
+
+      if (!casResult.ok) {
+        res.status(409).json({
+          error: 'REVISION_CONFLICT',
+          currentRevision: casResult.currentRevision,
+        });
+        return;
+      }
+
+      store.appendAuditEntry({
+        clubId: authorizedClubId,
+        actorName: `${user.fullName} (${user.rotaryId})`,
+        actorRole: user.role,
+        module: 'LCV & Kuver',
+        action: `LCV Hatırlatma Kuyruğu İşlendi (Toplantı #${targetMeetingNo})`,
+        detail: `Toplantı #${targetMeetingNo} için ${batch.queuedItems.length} üye taslak kuyruğa eklendi (Dış gönderim: ${
+          tenant.outboundMessagingEnabled ? 'Açık' : 'Kapalı'
+        }, Opt-out atlanan: ${batch.skippedOptOutMembers.length}, Mükerrer atlanan: ${
+          batch.skippedCooldownMembers.length
+        }).`,
+        timestamp: formatNowTR(),
+      });
+
+      res.json({
+        ok: true,
+        revision: casResult.state.revision,
+        outboundMessagingEnabled: Boolean(tenant.outboundMessagingEnabled),
+        queued: batch.queuedItems,
+        skippedOptOut: batch.skippedOptOutMembers,
+        skippedCooldown: batch.skippedCooldownMembers,
+        batchSummary: batch,
+        state: redactStateForRole(
+          casResult.state,
+          store.getAuditLedger(authorizedClubId),
+          user
+        ),
+      });
+    }
+  );
+
+  app.post(
+    '/api/pilot/member-communication-prefs',
+    requireAuth,
+    (req: AuthenticatedRequest, res) => {
+      const user = req.authUser!;
+      const { clubId, targetMemberId, reminderOptOut, preferredReminderChannel } =
+        req.body || {};
+      const authorizedClubId = verifyTenantBoundary(
+        user,
+        typeof clubId === 'string' ? clubId.trim() : undefined,
+        store,
+        res
+      );
+      if (!authorizedClubId) return;
+
+      const effectiveMemberId =
+        typeof targetMemberId === 'string' && targetMemberId.trim()
+          ? targetMemberId.trim()
+          : user.memberId;
+
+      const isOfficer = user.role === 'sekreter' || user.role === 'baskan';
+      if (effectiveMemberId !== user.memberId && !isOfficer) {
+        res.status(403).json({
+          error: 'RBAC_FORBIDDEN',
+          message:
+            'İletişim tercihi yetki sınırı (#32): Standart üye yalnızca kendi LCV bildirim ve opt-out tercihini güncelleyebilir.',
+        });
+        return;
+      }
+
+      const tenant = store.getTenantState(authorizedClubId);
+      const memberExists = tenant.members.some((m) => m.id === effectiveMemberId);
+      if (!memberExists) {
+        res.status(404).json({
+          error: 'MEMBER_NOT_FOUND',
+          message: 'İletişim tercihi güncellenecek üye bulunamadı (#32).',
+        });
+        return;
+      }
+
+      const allowedChannels: ReminderChannel[] = [
+        'E-Posta',
+        'SMS',
+        'WhatsApp Taslağı',
+      ];
+      const nextChannel = allowedChannels.includes(
+        preferredReminderChannel as ReminderChannel
+      )
+        ? (preferredReminderChannel as ReminderChannel)
+        : undefined;
+
+      const casResult = store.updateTenant(
+        authorizedClubId,
+        (curr) => ({
+          ...curr,
+          members: curr.members.map((m) =>
+            m.id === effectiveMemberId
+              ? {
+                  ...m,
+                  ...(typeof reminderOptOut === 'boolean'
+                    ? { reminderOptOut }
+                    : {}),
+                  ...(nextChannel
+                    ? { preferredReminderChannel: nextChannel }
+                    : {}),
+                }
+              : m
+          ),
+        }),
+        tenant.revision
+      );
+
+      if (!casResult.ok) {
+        res.status(409).json({
+          error: 'REVISION_CONFLICT',
+          currentRevision: casResult.currentRevision,
+        });
+        return;
+      }
+
+      store.appendAuditEntry({
+        clubId: authorizedClubId,
+        actorName: `${user.fullName} (${user.rotaryId})`,
+        actorRole: user.role,
+        module: 'LCV & Kuver',
+        action: `LCV İletişim ve Opt-Out Tercihi Güncellendi (${effectiveMemberId})`,
+        detail: `Üye (${effectiveMemberId}) LCV hatırlatma tercihi güncellendi: Opt-out=${String(
+          reminderOptOut
+        )}, Kanal=${nextChannel || 'Mevcut'}.`,
+        timestamp: formatNowTR(),
+      });
+
+      res.json({
+        ok: true,
+        revision: casResult.state.revision,
+        state: redactStateForRole(
+          casResult.state,
+          store.getAuditLedger(authorizedClubId),
+          user
+        ),
+      });
+    }
+  );
+
+  // Issue #36: Cryptographic Guest Make-up Certificate Verification Code Generator (64-bit / 16-Hex HMAC-SHA256), Rate Limiter, Re-Verification & Revocation
   const computeGuestCertificateVerificationCode = (
     clubId: string,
     card: {
       id: string;
       guestName: string;
       guestClub: string;
+      guestDistrict?: string;
       meetingNo: number;
       meetingDate: string;
+      issuedByMemberId?: string;
+      schemaVersion?: number;
     }
   ): string => {
+    const version = card.schemaVersion || 1;
+    const issuer = card.issuedByMemberId || 'officer';
+    const district = card.guestDistrict || 'UR 2420. Bölge';
     const digest = crypto
       .createHmac('sha256', getServerSecret())
       .update(
-        `RotaclubGuestCertificate:v1:${clubId}:${card.id}:${card.meetingNo}:${card.guestName}:${card.guestClub}:${card.meetingDate}`
+        `RotaclubGuestCertificate:v${version}:${clubId}:${card.id}:${card.meetingNo}:${card.guestName}:${card.guestClub}:${district}:${card.meetingDate}:${issuer}`
       )
       .digest('hex')
-      .slice(0, 8)
+      .slice(0, 16)
       .toUpperCase();
     return `GLR-2420-${card.meetingNo}-${digest}`;
   };
 
-  app.get('/api/pilot/verify-certificate', (req, res) => {
+  const verifyCertRateBuckets = new Map<
+    string,
+    { count: number; windowStartMs: number }
+  >();
+
+  app.get('/api/pilot/verify-certificate', (req: AuthenticatedRequest, res) => {
+    const rateKey =
+      (typeof req.headers['x-test-rate-limit-key'] === 'string' &&
+        req.headers['x-test-rate-limit-key'].trim()) ||
+      req.ip ||
+      'global-verify-client';
+    const nowMs = Date.now();
+    const bucket = verifyCertRateBuckets.get(rateKey);
+    if (!bucket || nowMs - bucket.windowStartMs > 60_000) {
+      verifyCertRateBuckets.set(rateKey, { count: 1, windowStartMs: nowMs });
+    } else {
+      bucket.count += 1;
+      if (bucket.count > 20) {
+        res.status(429).json({
+          valid: false,
+          error: 'RATE_LIMIT_EXCEEDED',
+          message:
+            'Sertifika doğrulama hız sınırı aşıldı (#36): Çok fazla doğrulama sorgusu gönderildi. Lütfen 1 dakika sonra tekrar deneyin.',
+        });
+        return;
+      }
+    }
+
     const clubId =
       typeof req.query.clubId === 'string' && req.query.clubId.trim()
         ? req.query.clubId.trim()
@@ -2484,21 +3003,184 @@ export function createPilotExpressApp(
       });
       return;
     }
+
+    if (card.status === 'İptal Edildi') {
+      res.status(410).json({
+        valid: false,
+        error: 'CERTIFICATE_REVOKED',
+        status: 'İptal Edildi',
+        revokedAt: card.revokedAt,
+        revocationReason: card.revocationReason,
+        message: `Bu katılım belgesi (${code}) kulüp yetkilisi tarafından iptal edilmiştir (#36).`,
+      });
+      return;
+    }
+
+    if (card.status === 'Taslak') {
+      res.status(422).json({
+        valid: false,
+        error: 'CERTIFICATE_NOT_APPROVED',
+        status: 'Taslak',
+        message:
+          'Bu belge henüz taslak aşamasındadır ve resmi onay almamıştır (#36).',
+      });
+      return;
+    }
+
+    // Re-verify HMAC against current stored fields for all v1+ server-issued certificates (#36)
+    if (
+      card.schemaVersion ||
+      /^GLR-2420-\d+-[0-9A-F]{16}$/.test(card.verificationCode)
+    ) {
+      const recomputedCode = computeGuestCertificateVerificationCode(
+        clubId,
+        card
+      );
+      const bufA = Buffer.from(card.verificationCode, 'utf8');
+      const bufB = Buffer.from(recomputedCode, 'utf8');
+      if (bufA.length !== bufB.length || !crypto.timingSafeEqual(bufA, bufB)) {
+        res.status(422).json({
+          valid: false,
+          error: 'CERTIFICATE_INTEGRITY_MISMATCH',
+          message:
+            'Belge bütünlük hatası (#36): Sertifika içeriği düzenlendikten sonra değiştirilmiş veya imza doğrulaması başarısız.',
+        });
+        return;
+      }
+    }
+
+    // Check if caller has an authenticated officer token for this club
+    const { token } = extractBearerToken(req);
+    const verifiedUser = token ? verifySignedToken(token) : null;
+    const isAuthorizedClubOfficer =
+      Boolean(verifiedUser) &&
+      verifiedUser!.clubId === clubId &&
+      (verifiedUser!.role === 'sekreter' || verifiedUser!.role === 'baskan');
+
     res.json({
       valid: true,
       clubId,
       verificationCode: card.verificationCode,
+      kvkkRedacted: !isAuthorizedClubOfficer,
       certificate: {
-        id: card.id,
-        guestName: card.guestName,
+        guestName: isAuthorizedClubOfficer
+          ? card.guestName
+          : maskGuestNameForPublicVerification(card.guestName),
         guestClub: card.guestClub,
         guestDistrict: card.guestDistrict,
         meetingNo: card.meetingNo,
         meetingDate: card.meetingDate,
         sentAt: card.sentAt,
+        status: card.status || 'Aktif',
+        schemaVersion: card.schemaVersion || 1,
+        issuedByRole: card.issuedByRole || 'sekreter',
+        ...(isAuthorizedClubOfficer
+          ? {
+              id: card.id,
+              issuedByName: card.issuedByName,
+            }
+          : {}),
       },
     });
   });
+
+  app.post(
+    '/api/pilot/revoke-certificate',
+    requireAuth,
+    (req: AuthenticatedRequest, res) => {
+      const user = req.authUser!;
+      if (user.role !== 'sekreter' && user.role !== 'baskan') {
+        res.status(403).json({
+          error: 'RBAC_FORBIDDEN',
+          message:
+            'Sertifika iptal yetkisi (#36): Yalnızca Genel Sekreter veya Dönem Başkanı dijital katılım belgesini iptal edebilir.',
+        });
+        return;
+      }
+
+      const { clubId, certificateId, reason } = req.body || {};
+      const authorizedClubId = verifyTenantBoundary(
+        user,
+        typeof clubId === 'string' ? clubId.trim() : undefined,
+        store,
+        res
+      );
+      if (!authorizedClubId) return;
+
+      const cleanCertId =
+        typeof certificateId === 'string' ? certificateId.trim() : '';
+      const cleanReason = typeof reason === 'string' ? reason.trim() : '';
+      if (!cleanCertId || cleanReason.length < 4) {
+        res.status(422).json({
+          error: 'INVALID_REVOCATION_REQUEST',
+          message:
+            'Sertifika iptali için geçerli certificateId ve en az 4 karakterlik iptal gerekçesi (reason) zorunludur (#36).',
+        });
+        return;
+      }
+
+      const tenant = store.getTenantState(authorizedClubId);
+      const targetCard = (tenant.guestMakeupCards || []).find(
+        (c) => c.id === cleanCertId || c.verificationCode === cleanCertId
+      );
+      if (!targetCard) {
+        res.status(404).json({
+          error: 'CERTIFICATE_NOT_FOUND',
+          message: 'İptal edilecek katılım belgesi bulunamadı (#36).',
+        });
+        return;
+      }
+
+      const nowStr = formatNowTR();
+      const casResult = store.updateTenant(
+        authorizedClubId,
+        (curr) => ({
+          ...curr,
+          guestMakeupCards: (curr.guestMakeupCards || []).map((c) =>
+            c.id === targetCard.id
+              ? {
+                  ...c,
+                  status: 'İptal Edildi' as const,
+                  revokedAt: nowStr,
+                  revokedBy: `${user.fullName} (${user.role})`,
+                  revocationReason: cleanReason,
+                }
+              : c
+          ),
+        }),
+        tenant.revision
+      );
+
+      if (!casResult.ok) {
+        res.status(409).json({
+          error: 'REVISION_CONFLICT',
+          currentRevision: casResult.currentRevision,
+        });
+        return;
+      }
+
+      store.appendAuditEntry({
+        clubId: authorizedClubId,
+        actorName: `${user.fullName} (${user.rotaryId})`,
+        actorRole: user.role,
+        module: 'QR Yoklama & Make-up',
+        action: `Misafir Katılım Belgesi İptal Edildi (${targetCard.verificationCode})`,
+        detail: `${targetCard.guestName} (${targetCard.guestClub}) adına düzenlenen ${targetCard.verificationCode} kodlu belge iptal edildi. Gerekçe: ${cleanReason}`,
+        timestamp: nowStr,
+      });
+
+      res.json({
+        ok: true,
+        revision: casResult.state.revision,
+        revokedCertificateCode: targetCard.verificationCode,
+        state: redactStateForRole(
+          casResult.state,
+          store.getAuditLedger(authorizedClubId),
+          user
+        ),
+      });
+    }
+  );
 
   // 8. Authenticated State Synchronization, Mandatory CAS Revision Check, Immutable Payment Records & Closed Accounting Ledger Bypass (#14, #16, #18, #20, #39, #70, #76)
   app.post('/api/pilot/sync', requireAuth, (req: AuthenticatedRequest, res) => {
@@ -2590,7 +3272,37 @@ export function createPilotExpressApp(
         return;
       }
 
-      // Issue #35 Fix: Enforce officer-approved Make-up workflow & prevent self-approval or cross-member tampering
+      // Issue #33 Fix: Only board officers can change club-wide selectedMeetingNo, and it must exist in meetings
+      if (
+        incomingPatch.selectedMeetingNo !== undefined &&
+        incomingPatch.selectedMeetingNo !== currentTenant.selectedMeetingNo
+      ) {
+        if (!isBoardAdmin) {
+          res.status(403).json({
+            error: 'RBAC_FORBIDDEN',
+            message:
+              'Aktif toplantı seçimi (selectedMeetingNo) kulüp geneli operasyonel bir ayardır; yalnızca Yönetim Kurulu yetkilileri (Sekreter, Sayman, Başkan) tarafından değiştirilebilir (#33).',
+          });
+          return;
+        }
+        const targetMeetingExists = (
+          Array.isArray(incomingPatch.meetings)
+            ? incomingPatch.meetings
+            : currentTenant.meetings
+        ).some(
+          (m: { meetingNo: number }) =>
+            m.meetingNo === Number(incomingPatch.selectedMeetingNo)
+        );
+        if (!targetMeetingExists) {
+          res.status(422).json({
+            error: 'INVALID_MEETING_NO',
+            message: `Seçilen toplantı numarası (#${incomingPatch.selectedMeetingNo}) kulüp takviminde bulunamadı (#33).`,
+          });
+          return;
+        }
+      }
+
+      // Issue #35 Fix: Enforce officer-approved Make-up workflow, full lifecycle, duplicate activity prevention, & memberId isolation
       if (Array.isArray(incomingPatch.makeupSubmissions)) {
         const existingMakeupsById = new Map(
           currentTenant.makeupSubmissions.map((mk) => [mk.id, mk])
@@ -2598,6 +3310,79 @@ export function createPilotExpressApp(
         const stripTitle = (name: string) =>
           normalizePersonName(String(name || '').replace(/^Rtn\.\s*/i, ''));
         const selfCanonical = stripTitle(user.fullName);
+
+        // Check for duplicate make-up activity across all incoming submissions (#35)
+        for (const incMk of incomingPatch.makeupSubmissions) {
+          if (!incMk || typeof incMk.id !== 'string') continue;
+          const existingMk = existingMakeupsById.get(incMk.id);
+          const effectiveMemberId =
+            existingMk?.memberId ||
+            (isMakeupApprover
+              ? incMk.memberId ||
+                resolveUnambiguousLegacyMemberId(
+                  incMk.memberName || '',
+                  currentTenant.members
+                ) ||
+                user.memberId
+              : user.memberId);
+
+          const isNewOrReactivatedOrActivityChanged =
+            !existingMk ||
+            (existingMk.status === 'Reddedildi' &&
+              incMk.status !== 'Reddedildi') ||
+            existingMk.targetClubOrEvent !== incMk.targetClubOrEvent ||
+            existingMk.activityType !== incMk.activityType ||
+            existingMk.date !== incMk.date;
+
+          if (
+            isNewOrReactivatedOrActivityChanged &&
+            incMk.status !== 'Reddedildi' &&
+            effectiveMemberId &&
+            hasDuplicateMakeupActivity(
+              currentTenant.makeupSubmissions,
+              {
+                id: incMk.id,
+                memberId: effectiveMemberId,
+                targetClubOrEvent: incMk.targetClubOrEvent || '',
+                activityType: incMk.activityType || 'Kulüp Ziyareti',
+                date: incMk.date || '',
+              }
+            )
+          ) {
+            res.status(409).json({
+              error: 'DUPLICATE_MAKEUP_SUBMISSION',
+              message:
+                'Mükerrer telafi engellendi (#35): Aynı üye için aynı tarih, etkinlik türü ve hedef kulüp/etkinlik adına zaten aktif veya onaylanmış bir make-up kaydı bulunmaktadır.',
+            });
+            return;
+          }
+        }
+
+        // Prevent officers from approving their OWN make-up submission (#35)
+        if (isMakeupApprover) {
+          for (const incMk of incomingPatch.makeupSubmissions) {
+            const existingMk = existingMakeupsById.get(incMk?.id);
+            const targetOwnerId =
+              existingMk?.memberId ||
+              incMk?.memberId ||
+              resolveUnambiguousLegacyMemberId(
+                incMk?.memberName || existingMk?.memberName || '',
+                currentTenant.members
+              );
+            if (
+              incMk?.status === 'Onaylandı' &&
+              (!existingMk || existingMk.status !== 'Onaylandı') &&
+              targetOwnerId === user.memberId
+            ) {
+              res.status(403).json({
+                error: 'MAKEUP_SELF_APPROVAL_FORBIDDEN',
+                message:
+                  'Make-up çıkar çatışması kuralı (#35): Yetkili bir görevli kendi adına açılmış make-up bildirimini bizzat onaylayamaz; diğer yetkili (Başkan/Sekreter) onayı gereklidir.',
+              });
+              return;
+            }
+          }
+        }
 
         if (!isMakeupApprover) {
           const incomingIds = new Set(
@@ -2619,46 +3404,106 @@ export function createPilotExpressApp(
           for (const incMk of incomingPatch.makeupSubmissions) {
             const existingMk = existingMakeupsById.get(incMk?.id);
             if (existingMk) {
+              const existingOwnerId =
+                existingMk.memberId ||
+                resolveUnambiguousLegacyMemberId(
+                  existingMk.memberName,
+                  currentTenant.members
+                );
+              const isOwnSubmission = existingOwnerId === user.memberId;
+
               if (
-                incMk.status !== existingMk.status ||
-                incMk.attendanceBoost !== existingMk.attendanceBoost
+                incMk.attendanceBoost !== existingMk.attendanceBoost ||
+                (incMk.status !== existingMk.status &&
+                  (incMk.status === 'Onaylandı' ||
+                    incMk.status === 'Reddedildi' ||
+                    incMk.status === 'Düzeltme İstendi'))
               ) {
                 res.status(403).json({
                   error: 'MAKEUP_APPROVAL_FORBIDDEN',
                   message:
-                    'Make-up onay yetki sınırı (#35): Make-up bildirimlerini onaylama veya reddetme yetkisi yalnızca Genel Sekreter ve Dönem Başkanına aittir.',
+                    'Make-up onay yetki sınırı (#35): Make-up bildirimlerini onaylama, reddetme veya düzeltme isteme yetkisi yalnızca Genel Sekreter ve Dönem Başkanına aittir.',
                 });
                 return;
               }
-              if (
-                (existingMk.memberId &&
-                  incMk.memberId &&
-                  incMk.memberId !== existingMk.memberId) ||
-                stripTitle(incMk.memberName) !==
-                  stripTitle(existingMk.memberName) ||
-                incMk.targetClubOrEvent !== existingMk.targetClubOrEvent ||
-                incMk.activityType !== existingMk.activityType ||
-                incMk.date !== existingMk.date ||
-                incMk.description !== existingMk.description
-              ) {
-                res.status(403).json({
-                  error: 'MAKEUP_FORBIDDEN_MUTATION',
-                  message:
-                    'Make-up yetki sınırı (#35): Mevcut make-up kayıtlarının içeriği değiştirilemez.',
-                });
-                return;
+
+              if (!isOwnSubmission) {
+                if (
+                  incMk.status !== existingMk.status ||
+                  (existingMk.memberId &&
+                    incMk.memberId &&
+                    incMk.memberId !== existingMk.memberId) ||
+                  stripTitle(incMk.memberName) !==
+                    stripTitle(existingMk.memberName) ||
+                  incMk.targetClubOrEvent !== existingMk.targetClubOrEvent ||
+                  incMk.activityType !== existingMk.activityType ||
+                  incMk.date !== existingMk.date ||
+                  incMk.description !== existingMk.description
+                ) {
+                  res.status(403).json({
+                    error: 'MAKEUP_FORBIDDEN_MUTATION',
+                    message:
+                      'Make-up yetki sınırı (#35): Başka bir üyeye ait make-up kaydının içeriği veya durumu değiştirilemez.',
+                  });
+                  return;
+                }
+              } else {
+                // Own submission: allowed transitions for member:
+                // - 'Taslak' -> 'Taslak' or 'İnceleniyor' (can edit fields)
+                // - 'Düzeltme İstendi' -> 'Düzeltme İstendi' or 'İnceleniyor' (can edit fields & resubmit)
+                // - 'Reddedildi' -> 'İtiraz Edildi' (can add appealNote / evidenceRef) or unchanged 'Reddedildi'
+                const canMemberEditCoreFields =
+                  existingMk.status === 'Taslak' ||
+                  existingMk.status === 'Düzeltme İstendi';
+                const isValidStatusTransition =
+                  incMk.status === existingMk.status ||
+                  (existingMk.status === 'Taslak' &&
+                    incMk.status === 'İnceleniyor') ||
+                  (existingMk.status === 'Düzeltme İstendi' &&
+                    incMk.status === 'İnceleniyor') ||
+                  (existingMk.status === 'Reddedildi' &&
+                    incMk.status === 'İtiraz Edildi');
+
+                if (!isValidStatusTransition) {
+                  res.status(403).json({
+                    error: 'MAKEUP_APPROVAL_FORBIDDEN',
+                    message: `Make-up durum geçiş sınırı (#35): "${existingMk.status}" durumundaki kayıt üye tarafından "${incMk.status}" durumuna geçirilemez.`,
+                  });
+                  return;
+                }
+
+                const coreFieldsChanged =
+                  (existingMk.memberId &&
+                    incMk.memberId &&
+                    incMk.memberId !== existingMk.memberId) ||
+                  stripTitle(incMk.memberName) !==
+                    stripTitle(existingMk.memberName) ||
+                  incMk.targetClubOrEvent !== existingMk.targetClubOrEvent ||
+                  incMk.activityType !== existingMk.activityType ||
+                  incMk.date !== existingMk.date ||
+                  incMk.description !== existingMk.description;
+
+                if (coreFieldsChanged && !canMemberEditCoreFields) {
+                  res.status(403).json({
+                    error: 'MAKEUP_FORBIDDEN_MUTATION',
+                    message:
+                      'Make-up yetki sınırı (#35): İncelemede veya sonuçlanmış make-up kayıtlarının temel faaliyet bilgileri değiştirilemez.',
+                  });
+                  return;
+                }
               }
             } else {
-              // New Make-up submission by regular member
+              // New Make-up submission by regular member ('Taslak' or 'İnceleniyor')
               if (
-                incMk?.status !== 'İnceleniyor' ||
+                (incMk?.status !== 'İnceleniyor' &&
+                  incMk?.status !== 'Taslak') ||
                 (typeof incMk?.attendanceBoost === 'number' &&
                   incMk.attendanceBoost > 0)
               ) {
                 res.status(403).json({
                   error: 'MAKEUP_APPROVAL_FORBIDDEN',
                   message:
-                    'Make-up onay yetki sınırı (#35): Standart üye oturumu doğrudan onaylı make-up oluşturamaz; yeni bildirimler "İnceleniyor" durumunda açılmalıdır.',
+                    'Make-up onay yetki sınırı (#35): Standart üye oturumu doğrudan onaylı make-up oluşturamaz; yeni bildirimler "Taslak" veya "İnceleniyor" durumunda açılmalıdır.',
                 });
                 return;
               }
@@ -3192,10 +4037,18 @@ export function createPilotExpressApp(
                         mealPreference:
                           selfPatch.mealPreference ??
                           existingMember.mealPreference,
+                        reminderOptOut:
+                          selfPatch.reminderOptOut ??
+                          existingMember.reminderOptOut,
+                        preferredReminderChannel:
+                          selfPatch.preferredReminderChannel ??
+                          existingMember.preferredReminderChannel,
                       }
                     : existingMember;
                 })
             : curr.members;
+
+          const nowTrStamp = formatNowTR();
 
           const sanitizedMakeupSubmissions = Array.isArray(
             incomingPatch.makeupSubmissions
@@ -3210,6 +4063,9 @@ export function createPilotExpressApp(
                     activityType: MakeupSubmission['activityType'];
                     date: string;
                     description: string;
+                    evidenceRef?: string;
+                    reviewerNote?: string;
+                    appealNote?: string;
                     status: MakeupSubmission['status'];
                   }) => {
                     const existingMk = curr.makeupSubmissions.find(
@@ -3218,11 +4074,30 @@ export function createPilotExpressApp(
                     const resolvedMemberId =
                       existingMk?.memberId ||
                       mk.memberId ||
-                      curr.members.find(
-                        (m) =>
-                          normalizePersonName(m.fullName) ===
-                          normalizePersonName(mk.memberName)
-                      )?.id;
+                      resolveUnambiguousLegacyMemberId(
+                        mk.memberName,
+                        curr.members
+                      );
+                    const prevTrail = existingMk?.auditTrail || [];
+                    const statusChanged =
+                      !existingMk || existingMk.status !== mk.status;
+                    const newTrailEntry: MakeupAuditHistoryEntry | null =
+                      statusChanged
+                        ? {
+                            timestamp: nowTrStamp,
+                            actorId: user.memberId,
+                            actorName: user.fullName,
+                            actorRole: user.role,
+                            fromStatus: existingMk?.status,
+                            toStatus: mk.status,
+                            note:
+                              mk.reviewerNote ||
+                              mk.appealNote ||
+                              (existingMk
+                                ? `Durum güncellendi: ${existingMk.status} -> ${mk.status}`
+                                : 'Make-up kaydı oluşturuldu'),
+                          }
+                        : null;
                     return {
                       ...existingMk,
                       ...mk,
@@ -3230,11 +4105,68 @@ export function createPilotExpressApp(
                         ? { memberId: resolvedMemberId }
                         : {}),
                       attendanceBoost: mk.status === 'Onaylandı' ? 3 : 0,
+                      auditTrail: newTrailEntry
+                        ? [...prevTrail, newTrailEntry]
+                        : prevTrail,
                     };
                   }
                 )
-              : [
-                  ...incomingPatch.makeupSubmissions
+              : (() => {
+                  const updatedExisting = curr.makeupSubmissions.map(
+                    (existingMk) => {
+                      const incMatch = incomingPatch.makeupSubmissions.find(
+                        (m: { id: string }) => m.id === existingMk.id
+                      );
+                      if (!incMatch) return existingMk;
+                      const ownerId =
+                        existingMk.memberId ||
+                        resolveUnambiguousLegacyMemberId(
+                          existingMk.memberName,
+                          curr.members
+                        );
+                      if (ownerId !== user.memberId) return existingMk;
+                      const nextStatus: MakeupStatus =
+                        incMatch.status || existingMk.status;
+                      const prevTrail = existingMk.auditTrail || [];
+                      const statusChanged = nextStatus !== existingMk.status;
+                      const newTrailEntry: MakeupAuditHistoryEntry | null =
+                        statusChanged
+                          ? {
+                              timestamp: nowTrStamp,
+                              actorId: user.memberId,
+                              actorName: user.fullName,
+                              actorRole: user.role,
+                              fromStatus: existingMk.status,
+                              toStatus: nextStatus,
+                              note:
+                                incMatch.appealNote ||
+                                `Üye işlemi: ${existingMk.status} -> ${nextStatus}`,
+                            }
+                          : null;
+                      return {
+                        ...existingMk,
+                        targetClubOrEvent:
+                          incMatch.targetClubOrEvent ??
+                          existingMk.targetClubOrEvent,
+                        activityType:
+                          incMatch.activityType ?? existingMk.activityType,
+                        date: incMatch.date ?? existingMk.date,
+                        description:
+                          incMatch.description ?? existingMk.description,
+                        evidenceRef:
+                          incMatch.evidenceRef ?? existingMk.evidenceRef,
+                        appealNote:
+                          incMatch.appealNote ?? existingMk.appealNote,
+                        status: nextStatus,
+                        memberId: user.memberId,
+                        attendanceBoost: existingMk.attendanceBoost,
+                        auditTrail: newTrailEntry
+                          ? [...prevTrail, newTrailEntry]
+                          : prevTrail,
+                      };
+                    }
+                  );
+                  const newlyAdded = incomingPatch.makeupSubmissions
                     .filter(
                       (mk: { id: string }) =>
                         !curr.makeupSubmissions.some((ex) => ex.id === mk.id)
@@ -3246,16 +4178,35 @@ export function createPilotExpressApp(
                         activityType: MakeupSubmission['activityType'];
                         date: string;
                         description: string;
-                      }) => ({
-                        ...mk,
-                        memberId: user.memberId,
-                        memberName: user.fullName,
-                        status: 'İnceleniyor' as const,
-                        attendanceBoost: 0,
-                      })
-                    ),
-                  ...curr.makeupSubmissions,
-                ]
+                        evidenceRef?: string;
+                        status?: MakeupStatus;
+                      }) => {
+                        const initialStatus: MakeupStatus =
+                          mk.status === 'Taslak' ? 'Taslak' : 'İnceleniyor';
+                        return {
+                          ...mk,
+                          memberId: user.memberId,
+                          memberName: user.fullName,
+                          status: initialStatus,
+                          attendanceBoost: 0,
+                          auditTrail: [
+                            {
+                              at: nowTrStamp,
+                              actorMemberId: user.memberId,
+                              actorName: user.fullName,
+                              actorRole: user.role,
+                              toStatus: initialStatus,
+                              note:
+                                initialStatus === 'Taslak'
+                                  ? 'Üye tarafından taslak olarak kaydedildi'
+                                  : 'Üye tarafından incelemeye gönderildi',
+                            },
+                          ],
+                        };
+                      }
+                    );
+                  return [...newlyAdded, ...updatedExisting];
+                })()
             : curr.makeupSubmissions;
 
           const sanitizedGuestMakeupCards =
@@ -3269,7 +4220,9 @@ export function createPilotExpressApp(
                     guestEmail: string;
                     meetingNo: number;
                     meetingDate: string;
+                    speakerAndTopic?: string;
                     sentAt: string;
+                    status?: 'Taslak' | 'Aktif' | 'İptal Edildi';
                   }) => {
                     const existingCard = curr.guestMakeupCards.find(
                       (ex) => ex.id === card.id
@@ -3277,13 +4230,25 @@ export function createPilotExpressApp(
                     if (existingCard) {
                       return existingCard;
                     }
+                    const schemaVersion = 1;
+                    const issuedByMemberId = user.memberId;
+                    const cardForHmac = {
+                      ...card,
+                      schemaVersion,
+                      issuedByMemberId,
+                    };
                     return {
                       ...card,
                       guestDistrict: card.guestDistrict || 'UR 2420. Bölge',
+                      schemaVersion,
+                      status: card.status === 'Taslak' ? 'Taslak' : 'Aktif',
+                      issuedByMemberId,
+                      issuedByName: user.fullName,
+                      issuedByRole: user.role,
                       verificationCode:
                         computeGuestCertificateVerificationCode(
                           authorizedClubId,
-                          card
+                          cardForHmac
                         ),
                     };
                   }
@@ -3296,7 +4261,9 @@ export function createPilotExpressApp(
             menuPreference: incomingPatch.menuPreference ?? curr.menuPreference,
             guestNameInput: incomingPatch.guestNameInput ?? curr.guestNameInput,
             selectedMeetingNo:
-              incomingPatch.selectedMeetingNo ?? curr.selectedMeetingNo,
+              isBoardAdmin && incomingPatch.selectedMeetingNo !== undefined
+                ? incomingPatch.selectedMeetingNo
+                : curr.selectedMeetingNo,
             qrCheckedIn: curr.qrCheckedIn,
             meetingAttendances: curr.meetingAttendances || {},
             makeupSubmissions: sanitizedMakeupSubmissions,

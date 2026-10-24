@@ -31,6 +31,7 @@ import {
   FiresideGroup,
   GalataProject,
   GuestRotaryMakeupCard,
+  LcvReminderQueueItem,
   MakeupSubmission,
   MenuPreference,
   OverdueMemberItem,
@@ -47,6 +48,7 @@ import {
 } from '../types/rotary';
 import {
   maskPhoneForKvkk,
+  resolveUnambiguousLegacyMemberId,
   SpecializedModuleData,
   SYNTHETIC_SPECIALIZED_MODULES,
   SYNTHETIC_VOLUNTEER_SHIFTS,
@@ -202,6 +204,8 @@ export interface TenantClubDatabaseState {
   boardResolutions: BoardResolutionItem[];
   volunteerShifts?: VolunteerShiftSlot[];
   specializedModules?: SpecializedModuleData;
+  lcvReminderQueue?: LcvReminderQueueItem[];
+  outboundMessagingEnabled?: boolean;
   kvkkMaskPhone: boolean;
   bankStatements: BankStatementEntry[];
   auditLedger: ChainedAuditLogEntry[];
@@ -1956,6 +1960,8 @@ export function createTenantClubState(
       galatart: { ...SYNTHETIC_SPECIALIZED_MODULES.galatart },
       ryla: { ...SYNTHETIC_SPECIALIZED_MODULES.ryla },
     },
+    lcvReminderQueue: [],
+    outboundMessagingEnabled: false,
     kvkkMaskPhone: false,
     bankStatements: createInitialBankStatementsForClub(clubId),
     auditLedger: createInitialAuditChainForClub(clubId, clubPrefix),
@@ -2051,7 +2057,17 @@ export function migrateDatabaseLossless(
           ? existingTenant.meetingAttendances
           : {},
       makeupSubmissions: Array.isArray(existingTenant.makeupSubmissions)
-        ? existingTenant.makeupSubmissions
+        ? existingTenant.makeupSubmissions.map((mk) => {
+            if (mk.memberId) return mk;
+            const roster = Array.isArray(existingTenant.members)
+              ? existingTenant.members
+              : defaultTenant.members;
+            const resolvedId = resolveUnambiguousLegacyMemberId(
+              mk.memberName,
+              roster
+            );
+            return resolvedId ? { ...mk, memberId: resolvedId } : mk;
+          })
         : defaultTenant.makeupSubmissions,
       guestMakeupCards: Array.isArray(existingTenant.guestMakeupCards)
         ? existingTenant.guestMakeupCards
@@ -2113,6 +2129,10 @@ export function migrateDatabaseLossless(
               },
             }
           : defaultTenant.specializedModules,
+      lcvReminderQueue: Array.isArray(existingTenant.lcvReminderQueue)
+        ? existingTenant.lcvReminderQueue
+        : [],
+      outboundMessagingEnabled: Boolean(existingTenant.outboundMessagingEnabled),
       bankStatements: Array.isArray(existingTenant.bankStatements)
         ? existingTenant.bankStatements
         : defaultTenant.bankStatements,
@@ -2319,6 +2339,12 @@ export function redactStateForRole(
     scholars: sanitizedScholars,
     boardResolutions: sanitizedBoardResolutions,
     guestMakeupCards: sanitizedGuestMakeupCards,
+    lcvReminderQueue: isPrivilegedBoard
+      ? tenantState.lcvReminderQueue || []
+      : (tenantState.lcvReminderQueue || []).filter(
+          (q) => q.memberId === user.memberId
+        ),
+    outboundMessagingEnabled: Boolean(tenantState.outboundMessagingEnabled),
     auditLedger: isPrivilegedBoard ? auditLedger : [],
     auditLogs: isPrivilegedBoard ? auditLedger : [],
     auditVerification: chainVerification,

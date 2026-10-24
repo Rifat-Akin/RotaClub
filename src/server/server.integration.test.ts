@@ -2646,8 +2646,46 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
     const expiredCheckinBody = await expiredCheckinRes.json();
     assert.equal(expiredCheckinBody.error, 'EXPIRED_MEETING_QR_TOKEN');
 
-    // 9f. Secretary ('sekreter') generates a valid short-lived meeting QR token and member ('m-rifat') checks in:
-    // Verify per-member & per-meeting isolation: m-rifat has qrCheckedIn === true, while m-selim-yalcin still has qrCheckedIn === false!
+    // 9f-0. Generating QR token for a non-existent meeting (#9999) MUST fail with 404 MEETING_NOT_FOUND, and past/closed meeting (#1841) MUST fail with 422 MEETING_CLOSED (#33)
+    const missingMeetingQrRes = await fetch(
+      `${baseUrl}/api/pilot/meeting-qr-token?clubId=club-galata&meetingNo=9999`,
+      {
+        headers: { Authorization: `Bearer ${sekreterSession.token}` },
+      }
+    );
+    assert.equal(missingMeetingQrRes.status, 404);
+    const missingMeetingQrBody = await missingMeetingQrRes.json();
+    assert.equal(missingMeetingQrBody.error, 'MEETING_NOT_FOUND');
+
+    const closedMeetingQrRes = await fetch(
+      `${baseUrl}/api/pilot/meeting-qr-token?clubId=club-galata&meetingNo=1841`,
+      {
+        headers: { Authorization: `Bearer ${sekreterSession.token}` },
+      }
+    );
+    assert.equal(closedMeetingQrRes.status, 422);
+    const closedMeetingQrBody = await closedMeetingQrRes.json();
+    assert.equal(closedMeetingQrBody.error, 'MEETING_CLOSED');
+
+    // 9f-0b. Regular member ('uye') attempting to mutate club-wide selectedMeetingNo via /api/pilot/sync MUST fail with 403 RBAC_FORBIDDEN (#33)
+    const memberMutateMeetingNoRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${uyeSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: selimRealJoinBody.revision,
+        state: {
+          selectedMeetingNo: 1841,
+        },
+      }),
+    });
+    assert.equal(memberMutateMeetingNoRes.status, 403);
+    const memberMutateMeetingNoBody = await memberMutateMeetingNoRes.json();
+    assert.equal(memberMutateMeetingNoBody.error, 'RBAC_FORBIDDEN');
+
     const qrTokenRes = await fetch(
       `${baseUrl}/api/pilot/meeting-qr-token?clubId=club-galata&meetingNo=1842&ttlSeconds=9999`,
       {
@@ -2700,7 +2738,7 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
       'm-rifat',
     ]);
 
-    // 9g. Duplicate check-in by the same member for the same meeting MUST be rejected with 409 ALREADY_CHECKED_IN (#33)
+    // 9g. Duplicate check-in by the same member for the same meeting returns idempotent 200 OK with idempotentReplay: true, code: 'ALREADY_CHECKED_IN', and unchanged revision (#33)
     const duplicateQrCheckinRes = await fetch(
       `${baseUrl}/api/pilot/qr-checkin`,
       {
@@ -2716,9 +2754,15 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
         }),
       }
     );
-    assert.equal(duplicateQrCheckinRes.status, 409);
+    assert.equal(duplicateQrCheckinRes.status, 200);
     const duplicateQrCheckinBody = await duplicateQrCheckinRes.json();
-    assert.equal(duplicateQrCheckinBody.error, 'ALREADY_CHECKED_IN');
+    assert.equal(duplicateQrCheckinBody.idempotentReplay, true);
+    assert.equal(duplicateQrCheckinBody.alreadyCheckedIn, true);
+    assert.equal(duplicateQrCheckinBody.code, 'ALREADY_CHECKED_IN');
+    assert.equal(duplicateQrCheckinBody.revision, validQrCheckinBody.revision);
+    assert.deepEqual(duplicateQrCheckinBody.state.meetingAttendances['1842'], [
+      'm-rifat',
+    ]);
 
     const selimAfterRifatCheckinRes = await fetch(
       `${baseUrl}/api/pilot/state?clubId=club-galata`,
@@ -2729,9 +2773,51 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
     const selimAfterRifatCheckin = await selimAfterRifatCheckinRes.json();
     assert.equal(selimAfterRifatCheckin.qrCheckedIn, false);
 
+    // 9h. Officer Manual / Offline Check-in (#33): regular member is rejected with 403 RBAC_FORBIDDEN, while Secretary checks in m-selim-yalcin with mandatory reason
+    const memberManualAttemptRes = await fetch(
+      `${baseUrl}/api/pilot/manual-checkin`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${uyeSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          meetingNo: 1842,
+          targetMemberId: 'm-selim-yalcin',
+          reason: 'Yetkisiz deneme',
+        }),
+      }
+    );
+    assert.equal(memberManualAttemptRes.status, 403);
+
+    const sekreterManualCheckinRes = await fetch(
+      `${baseUrl}/api/pilot/manual-checkin`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sekreterSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          meetingNo: 1842,
+          targetMemberId: 'm-selim-yalcin',
+          reason: 'Salon girişinde fiziksel teyit — kamera arızası',
+        }),
+      }
+    );
+    assert.equal(sekreterManualCheckinRes.status, 200);
+    const sekreterManualCheckinBody = await sekreterManualCheckinRes.json();
+    assert.deepEqual(
+      sekreterManualCheckinBody.state.meetingAttendances['1842'],
+      ['m-rifat', 'm-selim-yalcin']
+    );
+
     // 10. Issue #35 Officer-Approved Make-up Workflow & memberId Isolation Test:
     // 10a. Regular member ('uye') attempting to submit a pre-approved make-up (status: 'Onaylandı', attendanceBoost: 3) MUST fail with 403 MAKEUP_APPROVAL_FORBIDDEN
-    const currentMakeups = validQrCheckinBody.state.makeupSubmissions;
+    const currentMakeups = sekreterManualCheckinBody.state.makeupSubmissions;
     const selfApprovedMakeupRes = await fetch(`${baseUrl}/api/pilot/sync`, {
       method: 'POST',
       headers: {
@@ -2740,7 +2826,7 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
       },
       body: JSON.stringify({
         clubId: 'club-galata',
-        expectedRevision: validQrCheckinBody.revision,
+        expectedRevision: sekreterManualCheckinBody.revision,
         state: {
           makeupSubmissions: [
             {
@@ -2771,7 +2857,7 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
       },
       body: JSON.stringify({
         clubId: 'club-galata',
-        expectedRevision: validQrCheckinBody.revision,
+        expectedRevision: sekreterManualCheckinBody.revision,
         state: {
           makeupSubmissions: [
             {
@@ -2794,14 +2880,15 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
     const spoofedMemberIdMakeupBody = await spoofedMemberIdMakeupRes.json();
     assert.equal(spoofedMemberIdMakeupBody.error, 'MAKEUP_FORBIDDEN_MUTATION');
 
-    // 10b. Regular member ('uye') submitting a make-up with status: 'İnceleniyor' and attendanceBoost: 0 succeeds (200 OK) and server stamps memberId: 'm-rifat'
+    // 10b. Regular member ('uye') submitting a make-up with status: 'İnceleniyor' and attendanceBoost: 0 succeeds (200 OK) and server stamps memberId: 'm-rifat' + auditTrail
     const pendingMakeupEntry = {
       id: 'mk-pending-review-1',
       memberName: 'Rtn. Rifat Akın',
-      activityType: 'Kulüp Ziyareti' as const,
+      activityType: 'Kulüp Toplantısı' as const,
       targetClubOrEvent: 'Beşiktaş Rotary Kulübü',
       date: '23 Ekim 2026',
-      proofNote: 'Sekreterlik teyitli ziyaret',
+      description: 'Sekreterlik teyitli ziyaret',
+      evidenceRef: 'BSK-2026-1842-KANIT',
       status: 'İnceleniyor' as const,
       attendanceBoost: 0,
     };
@@ -2813,7 +2900,7 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
       },
       body: JSON.stringify({
         clubId: 'club-galata',
-        expectedRevision: validQrCheckinBody.revision,
+        expectedRevision: sekreterManualCheckinBody.revision,
         state: {
           makeupSubmissions: [pendingMakeupEntry, ...currentMakeups],
         },
@@ -2827,6 +2914,33 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
     assert.equal(savedPending.status, 'İnceleniyor');
     assert.equal(savedPending.attendanceBoost, 0);
     assert.equal(savedPending.memberId, 'm-rifat');
+    assert.equal(Array.isArray(savedPending.auditTrail), true);
+    assert.equal(savedPending.auditTrail.length, 1);
+
+    // 10b-2. Submitting a duplicate make-up for the exact same member, date, activityType, and targetClubOrEvent MUST fail with 409 DUPLICATE_MAKEUP_SUBMISSION (#35)
+    const duplicateMakeupRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${uyeSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: submitPendingMakeupBody.revision,
+        state: {
+          makeupSubmissions: [
+            {
+              ...pendingMakeupEntry,
+              id: 'mk-duplicate-attempt-2',
+            },
+            ...submitPendingMakeupBody.state.makeupSubmissions,
+          ],
+        },
+      }),
+    });
+    assert.equal(duplicateMakeupRes.status, 409);
+    const duplicateMakeupBody = await duplicateMakeupRes.json();
+    assert.equal(duplicateMakeupBody.error, 'DUPLICATE_MAKEUP_SUBMISSION');
 
     // 10c. Regular member ('uye') attempting to approve their own pending make-up MUST fail with 403 MAKEUP_APPROVAL_FORBIDDEN
     const memberSelfApproveExistingRes = await fetch(
@@ -2860,7 +2974,42 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
       'MAKEUP_APPROVAL_FORBIDDEN'
     );
 
-    // 10d. Club Secretary ('sekreter') approving the pending make-up succeeds (200 OK), preserves memberId: 'm-rifat', and grants attendanceBoost: 3
+    // 10c-2. Officer ('sekreter', m-nazli) attempting to approve their OWN make-up submission MUST fail with 403 MAKEUP_SELF_APPROVAL_FORBIDDEN (#35)
+    const officerSelfApproveRes = await fetch(`${baseUrl}/api/pilot/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${sekreterSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        expectedRevision: submitPendingMakeupBody.revision,
+        state: {
+          makeupSubmissions: [
+            {
+              id: 'mk-officer-self-approve',
+              memberId: 'm-nazli',
+              memberName: 'Rtn. Av. Nazlı Denizmen',
+              activityType: 'Bölge Semineri',
+              targetClubOrEvent: 'UR 2420. Bölge Sekreterler Semineri',
+              date: '24 Ekim 2026',
+              description: 'Kendi başvurusunu onaylama denemesi',
+              status: 'Onaylandı',
+              attendanceBoost: 3,
+            },
+            ...submitPendingMakeupBody.state.makeupSubmissions,
+          ],
+        },
+      }),
+    });
+    assert.equal(officerSelfApproveRes.status, 403);
+    const officerSelfApproveBody = await officerSelfApproveRes.json();
+    assert.equal(
+      officerSelfApproveBody.error,
+      'MAKEUP_SELF_APPROVAL_FORBIDDEN'
+    );
+
+    // 10d. Club Secretary ('sekreter') approving the pending make-up succeeds (200 OK), preserves memberId: 'm-rifat', grants attendanceBoost: 3, and appends auditTrail
     const sekreterApproveMakeupRes = await fetch(`${baseUrl}/api/pilot/sync`, {
       method: 'POST',
       headers: {
@@ -2875,7 +3024,12 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
             submitPendingMakeupBody.state.makeupSubmissions.map(
               (m: { id: string }) =>
                 m.id === 'mk-pending-review-1'
-                  ? { ...m, status: 'Onaylandı', attendanceBoost: 3 }
+                  ? {
+                      ...m,
+                      status: 'Onaylandı',
+                      reviewerNote: 'Sekreterlik teyidi doğrulandı',
+                      attendanceBoost: 3,
+                    }
                   : m
             ),
         },
@@ -2890,6 +3044,7 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
     assert.equal(approvedMakeup.status, 'Onaylandı');
     assert.equal(approvedMakeup.attendanceBoost, 3);
     assert.equal(approvedMakeup.memberId, 'm-rifat');
+    assert.equal(approvedMakeup.auditTrail.length, 2);
 
     // 11. Issue #51 New Project Zeroed Collection Enforcement Test:
     // Creating a new project via /api/pilot/sync with inflated initial collectedAmount/supportersCount forces both to 0 in returned server state
@@ -2933,9 +3088,75 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
     assert.equal(createdProj.collectedAmount, 0);
     assert.equal(createdProj.supportersCount, 0);
 
+    // 11b. Issue #32 LCV Reminder Queue, Opt-Out, Quiet Hours & Cooldown Test:
+    const quietReminderRes = await fetch(`${baseUrl}/api/pilot/lcv-reminders`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${sekreterSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        meetingNo: 1842,
+        simulatedHourTR: 23,
+        simulatedNowIso: '2026-10-23T23:00:00.000Z',
+      }),
+    });
+    assert.equal(quietReminderRes.status, 422);
+    const quietReminderBody = await quietReminderRes.json();
+    assert.equal(quietReminderBody.error, 'QUIET_HOURS_ACTIVE');
+
+    const daytimeReminderRes = await fetch(
+      `${baseUrl}/api/pilot/lcv-reminders`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sekreterSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          meetingNo: 1842,
+          simulatedHourTR: 14,
+          simulatedNowIso: '2026-10-23T14:00:00.000Z',
+        }),
+      }
+    );
+    assert.equal(daytimeReminderRes.status, 200);
+    const daytimeReminderBody = await daytimeReminderRes.json();
+    assert.equal(daytimeReminderBody.outboundMessagingEnabled, false);
+    assert.equal(Array.isArray(daytimeReminderBody.queued), true);
+    assert.equal(daytimeReminderBody.queued.length > 0, true);
+    assert.equal(
+      daytimeReminderBody.queued[0].status,
+      'Taslak Kuyrukta (Dış Gönderim Kapalı)'
+    );
+
+    // Cooldown test: calling again 1 hour later skips all recently reminded members
+    const cooldownReminderRes = await fetch(
+      `${baseUrl}/api/pilot/lcv-reminders`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sekreterSession.token}`,
+        },
+        body: JSON.stringify({
+          clubId: 'club-galata',
+          meetingNo: 1842,
+          simulatedHourTR: 15,
+          simulatedNowIso: '2026-10-23T15:00:00.000Z',
+        }),
+      }
+    );
+    assert.equal(cooldownReminderRes.status, 200);
+    const cooldownReminderBody = await cooldownReminderRes.json();
+    assert.equal(cooldownReminderBody.queued.length, 0);
+    assert.equal(cooldownReminderBody.skippedCooldown.length > 0, true);
+
     // 12. Issue #36 Server-Verified Digital Guest Make-up Certificate Test:
     // 12a. Regular member attempting to issue a guest make-up certificate MUST fail with 403 RBAC_FORBIDDEN
-    const existingCerts = newProjectBody.state.guestMakeupCards || [];
+    const existingCerts = cooldownReminderBody.state.guestMakeupCards || [];
     const memberCertAttemptRes = await fetch(`${baseUrl}/api/pilot/sync`, {
       method: 'POST',
       headers: {
@@ -2944,7 +3165,7 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
       },
       body: JSON.stringify({
         clubId: 'club-galata',
-        expectedRevision: newProjectBody.revision,
+        expectedRevision: cooldownReminderBody.revision,
         state: {
           guestMakeupCards: [
             {
@@ -2965,7 +3186,7 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
     });
     assert.equal(memberCertAttemptRes.status, 403);
 
-    // 12b. Club Secretary issuing a guest make-up certificate succeeds and server replaces client verificationCode with HMAC-derived code
+    // 12b. Club Secretary issuing a guest make-up certificate succeeds and server replaces client verificationCode with 64-bit (16 hex) HMAC-derived code
     const sekreterIssueCertRes = await fetch(`${baseUrl}/api/pilot/sync`, {
       method: 'POST',
       headers: {
@@ -2974,7 +3195,7 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
       },
       body: JSON.stringify({
         clubId: 'club-galata',
-        expectedRevision: newProjectBody.revision,
+        expectedRevision: cooldownReminderBody.revision,
         state: {
           guestMakeupCards: [
             {
@@ -3000,25 +3221,71 @@ test('Pilot Modules (#29, #46, #51): Server enforces LCV lock before hotel confi
     );
     assert.ok(issuedCert);
     assert.notEqual(issuedCert.verificationCode, 'CLIENT-FORGED-CODE');
-    assert.match(issuedCert.verificationCode, /^GLR-2420-1842-[0-9A-F]{8}$/);
+    assert.match(issuedCert.verificationCode, /^GLR-2420-1842-[0-9A-F]{16}$/);
+    assert.equal(issuedCert.schemaVersion, 1);
+    assert.equal(issuedCert.status, 'Aktif');
 
-    // 12c. Verify certificate via GET /api/pilot/verify-certificate
-    const verifyValidCertRes = await fetch(
+    // 12c. Verify certificate via GET /api/pilot/verify-certificate (Public KVKK-masked vs Officer unmasked)
+    const verifyPublicCertRes = await fetch(
       `${baseUrl}/api/pilot/verify-certificate?clubId=club-galata&code=${encodeURIComponent(
         issuedCert.verificationCode
       )}`
     );
-    assert.equal(verifyValidCertRes.status, 200);
-    const verifyValidCertBody = await verifyValidCertRes.json();
-    assert.equal(verifyValidCertBody.valid, true);
-    assert.equal(verifyValidCertBody.certificate.guestName, 'Rtn. Hakan Çelik');
+    assert.equal(verifyPublicCertRes.status, 200);
+    const verifyPublicCertBody = await verifyPublicCertRes.json();
+    assert.equal(verifyPublicCertBody.valid, true);
+    assert.equal(verifyPublicCertBody.kvkkRedacted, true);
+    assert.equal(verifyPublicCertBody.certificate.guestName, 'Rtn. H*** Ç***');
+    assert.equal(verifyPublicCertBody.certificate.guestEmail, undefined);
+
+    const verifyOfficerCertRes = await fetch(
+      `${baseUrl}/api/pilot/verify-certificate?clubId=club-galata&code=${encodeURIComponent(
+        issuedCert.verificationCode
+      )}`,
+      {
+        headers: { Authorization: `Bearer ${sekreterSession.token}` },
+      }
+    );
+    assert.equal(verifyOfficerCertRes.status, 200);
+    const verifyOfficerCertBody = await verifyOfficerCertRes.json();
+    assert.equal(verifyOfficerCertBody.valid, true);
+    assert.equal(verifyOfficerCertBody.kvkkRedacted, false);
+    assert.equal(
+      verifyOfficerCertBody.certificate.guestName,
+      'Rtn. Hakan Çelik'
+    );
 
     const verifyForgedCertRes = await fetch(
-      `${baseUrl}/api/pilot/verify-certificate?clubId=club-galata&code=GLR-2420-1842-DEADBEEF`
+      `${baseUrl}/api/pilot/verify-certificate?clubId=club-galata&code=GLR-2420-1842-DEADBEEF00000000`
     );
     assert.equal(verifyForgedCertRes.status, 404);
     const verifyForgedCertBody = await verifyForgedCertRes.json();
     assert.equal(verifyForgedCertBody.valid, false);
+
+    // 12d. Revoke certificate via POST /api/pilot/revoke-certificate and verify 410 CERTIFICATE_REVOKED (#36)
+    const revokeCertRes = await fetch(`${baseUrl}/api/pilot/revoke-certificate`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${sekreterSession.token}`,
+      },
+      body: JSON.stringify({
+        clubId: 'club-galata',
+        certificateId: 'gmk-server-verified-36',
+        reason: 'Yanlış toplantı tarihi nedeniyle iptal edildi',
+      }),
+    });
+    assert.equal(revokeCertRes.status, 200);
+
+    const verifyRevokedCertRes = await fetch(
+      `${baseUrl}/api/pilot/verify-certificate?clubId=club-galata&code=${encodeURIComponent(
+        issuedCert.verificationCode
+      )}`
+    );
+    assert.equal(verifyRevokedCertRes.status, 410);
+    const verifyRevokedCertBody = await verifyRevokedCertRes.json();
+    assert.equal(verifyRevokedCertBody.valid, false);
+    assert.equal(verifyRevokedCertBody.error, 'CERTIFICATE_REVOKED');
   });
 });
 

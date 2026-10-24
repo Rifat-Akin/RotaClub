@@ -29,22 +29,33 @@ interface OperationsTabProps {
   qrCheckedIn: boolean;
   onSimulateQrCheckIn: (qrTokenInput?: string) => void;
   onGenerateMeetingQrToken?: () => Promise<string | null>;
+  onManualCheckIn?: (targetMemberId: string, reason: string) => void;
   activeSalonQrToken?: string;
   makeupSubmissions: MakeupSubmission[];
   onAddMakeupSubmission: (
-    submission: Omit<MakeupSubmission, 'id' | 'status' | 'attendanceBoost' | 'memberName'>
+    submission: Omit<
+      MakeupSubmission,
+      'id' | 'status' | 'attendanceBoost' | 'memberName'
+    > & { status?: MakeupSubmission['status'] }
   ) => void;
   onApproveMakeupSubmission?: (makeupId: string) => void;
   onRejectMakeupSubmission?: (makeupId: string) => void;
+  onRequestMakeupRevision?: (makeupId: string, reviewerNote: string) => void;
+  onUpdateOwnMakeupSubmission?: (
+    makeupId: string,
+    patch: Partial<MakeupSubmission>
+  ) => void;
   guestMakeupCards: GuestRotaryMakeupCard[];
   onSendGuestMakeupCard: (
     card: Omit<GuestRotaryMakeupCard, 'id' | 'sentAt' | 'verificationCode'>
   ) => void;
+  onRevokeGuestMakeupCard?: (cardId: string, reason: string) => void;
   onOpenOfficialCertificateModal: (card: GuestRotaryMakeupCard) => void;
   firesideGroups: FiresideGroup[];
   onSubmitFiresideReport: (groupId: string, summary: string, attendanceRate: string) => void;
   members: RotaryMember[];
   onCreateFiresideGroup: (newGroup: Omit<FiresideGroup, 'id' | 'reportSubmitted'>) => void;
+  activeMemberId?: string;
   activeMemberName?: string;
   volunteerShifts?: VolunteerShiftSlot[];
   onToggleVolunteerShift?: (shiftId: string, volunteerName: string) => void;
@@ -56,18 +67,23 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
   qrCheckedIn,
   onSimulateQrCheckIn,
   onGenerateMeetingQrToken,
+  onManualCheckIn,
   activeSalonQrToken,
   makeupSubmissions,
   onAddMakeupSubmission,
   onApproveMakeupSubmission,
   onRejectMakeupSubmission,
+  onRequestMakeupRevision,
+  onUpdateOwnMakeupSubmission,
   guestMakeupCards,
   onSendGuestMakeupCard,
+  onRevokeGuestMakeupCard,
   onOpenOfficialCertificateModal,
   firesideGroups,
   onSubmitFiresideReport,
   members,
   onCreateFiresideGroup,
+  activeMemberId = 'm-rifat',
   activeMemberName,
   volunteerShifts: externalVolunteerShifts,
   onToggleVolunteerShift,
@@ -76,6 +92,11 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
     'member_makeup'
   );
   const [qrTokenDraft, setQrTokenDraft] = useState('');
+  const [isCameraScannerOpen, setIsCameraScannerOpen] = useState(false);
+  const [manualCheckInMemberId, setManualCheckInMemberId] = useState('m-selim-yalcin');
+  const [manualCheckInReason, setManualCheckInReason] = useState(
+    'Salon girişinde fiziksel teyit — kamera erişimi yok'
+  );
 
   // Member Make-up Form State
   const [targetClub, setTargetClub] = useState('Karaköy Rotary Kulübü Toplantısı');
@@ -83,6 +104,7 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
     useState<MakeupSubmission['activityType']>('Kulüp Toplantısı');
   const [makeupDate, setMakeupDate] = useState('2026-10-22');
   const [makeupDesc, setMakeupDesc] = useState('');
+  const [makeupEvidenceRef, setMakeupEvidenceRef] = useState('');
   const [makeupError, setMakeupError] = useState('');
 
   // Guest Rotarian Make-up Card Form State (Secretary Special)
@@ -139,8 +161,7 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
     }
   };
 
-  const handleMemberMakeupSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
+  const submitMemberMakeup = (initialStatus: 'Taslak' | 'İnceleniyor') => {
     if (!targetClub.trim() || !makeupDesc.trim()) {
       setMakeupError(
         'Lütfen katıldığınız kulüp/etkinlik adını ve kısa açıklamayı giriniz.'
@@ -153,8 +174,18 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
       activityType,
       date: makeupDate,
       description: makeupDesc.trim(),
+      ...(makeupEvidenceRef.trim()
+        ? { evidenceRef: makeupEvidenceRef.trim() }
+        : {}),
+      status: initialStatus,
     });
     setMakeupDesc('');
+    setMakeupEvidenceRef('');
+  };
+
+  const handleMemberMakeupSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    submitMemberMakeup('İnceleniyor');
   };
 
   const handleGuestCardSubmit = (e: React.FormEvent) => {
@@ -289,6 +320,9 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                 <p className="text-sm text-slate-600 leading-relaxed">
                   Toplantı girişinde Sekreterlik masasında üretilen imzalı salon QR kodunu (HMAC-SHA256) doğrulayarak yoklama kaydınızı oluşturun (#33).
                 </p>
+                <div className="p-2.5 rounded-xl bg-amber-50/70 border border-amber-200/80 text-[11px] text-slate-700">
+                  <strong>Kriptografik Doğrulama Bilgilendirmesi (#33):</strong> QR doğrulaması 5 dakika ömürlü imzalı salon masa anahtarının geçerliliğini teyit eder; tek başına fiziksel jeolokasyon kanıtı yerine geçmez.
+                </div>
                 <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs space-y-1">
                   <div className="flex justify-between">
                     <span className="text-slate-500">Aktif Oturum Üyesi:</span>
@@ -299,13 +333,13 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                   <div className="flex justify-between">
                     <span className="text-slate-500">Toplantı Durumu:</span>
                     <span className="font-semibold text-[#0C3C7C]">
-                      {qrCheckedIn ? 'Salonda — Yoklama Alındı (+%2)' : 'Henüz Okutulmadı'}
+                      {qrCheckedIn ? 'İmzalı QR Doğrulandı — Yoklama Alındı (+%2)' : 'Henüz Okutulmadı'}
                     </span>
                   </div>
                 </div>
 
                 {isBoardLeader && onGenerateMeetingQrToken && (
-                  <div className="p-3 rounded-xl bg-[#0C3C7C]/5 border border-[#0C3C7C]/20 space-y-2">
+                  <div className="p-3 rounded-xl bg-[#0C3C7C]/5 border border-[#0C3C7C]/20 space-y-2.5">
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-[11px] font-bold text-[#0C3C7C]">
                         Sekreterlik / Başkanlık Salon Görevlisi Paneli (#33)
@@ -328,17 +362,103 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                         Aktif Salon Kodu: <strong>{activeSalonQrToken}</strong>
                       </div>
                     )}
+                    {onManualCheckIn && (
+                      <div className="pt-2 border-t border-[#0C3C7C]/15 space-y-2">
+                        <div className="text-[11px] font-semibold text-slate-700">
+                          Yetkili Manuel / Çevrimdışı Yoklama Kaydı (Kamera Olmayan Üyeler)
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          <select
+                            aria-label="Manuel Yoklama Üye Seçimi"
+                            value={manualCheckInMemberId}
+                            onChange={(e) =>
+                              setManualCheckInMemberId(e.target.value)
+                            }
+                            className="text-xs bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 text-slate-900"
+                          >
+                            {members.map((m) => (
+                              <option key={m.id} value={m.id}>
+                                Rtn. {m.fullName}
+                              </option>
+                            ))}
+                          </select>
+                          <input
+                            type="text"
+                            aria-label="Manuel Yoklama Gerekçesi"
+                            value={manualCheckInReason}
+                            onChange={(e) =>
+                              setManualCheckInReason(e.target.value)
+                            }
+                            placeholder="Gerekçe (en az 5 karakter)"
+                            className="text-xs bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 text-slate-900"
+                          />
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onManualCheckIn(
+                              manualCheckInMemberId,
+                              manualCheckInReason
+                            )
+                          }
+                          className="px-3 py-1.5 rounded-lg bg-[#0F172A] hover:bg-slate-800 text-[#F7A81B] text-[11px] font-semibold cursor-pointer"
+                        >
+                          Yetkili Manuel Yoklama İşle
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )}
 
                 {!qrCheckedIn && (
-                  <div>
-                    <label
-                      htmlFor="meeting-qr-token-input"
-                      className="block text-[11px] font-semibold text-slate-600 mb-1"
-                    >
-                      Salon Masa QR Doğrulama Kodu (Sekreterlik / Başkanlık tarafından üretilen 5 dk geçerli kod)
-                    </label>
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <label
+                        htmlFor="meeting-qr-token-input"
+                        className="block text-[11px] font-semibold text-slate-600"
+                      >
+                        Salon Masa QR Doğrulama Kodu (5 dk geçerli imzalı kod)
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setIsCameraScannerOpen((prev) => !prev)
+                        }
+                        className="text-[11px] font-semibold text-[#0C3C7C] underline cursor-pointer"
+                      >
+                        {isCameraScannerOpen
+                          ? 'Kamera Vizörünü Kapat'
+                          : 'Kamera / QR Tarayıcı Aç'}
+                      </button>
+                    </div>
+                    {isCameraScannerOpen && (
+                      <div className="p-3 rounded-xl bg-slate-900 text-white text-xs space-y-2 border border-slate-700">
+                        <div className="flex items-center justify-between">
+                          <span className="font-semibold text-[#F7A81B]">
+                            Optik QR Vizörü (Toplantı #1842)
+                          </span>
+                          <span className="text-[11px] text-slate-300 font-mono-num">
+                            RCQR-1842-*
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-300">
+                          Masa üzerindeki QR kodu vizöre hizalayın veya salondaki aktif masa kodunu doğrudan okutun.
+                        </p>
+                        {activeSalonQrToken && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setQrTokenDraft(activeSalonQrToken);
+                              setIsCameraScannerOpen(false);
+                              onSimulateQrCheckIn(activeSalonQrToken);
+                            }}
+                            className="w-full py-1.5 px-3 rounded-lg bg-[#F7A81B] text-[#0F172A] font-bold text-[11px] cursor-pointer"
+                          >
+                            Vizördeki Masa QR Kodunu Yakala & Doğrula
+                          </button>
+                        )}
+                      </div>
+                    )}
                     <input
                       id="meeting-qr-token-input"
                       type="text"
@@ -509,19 +629,45 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                     </div>
                   </div>
 
+                  <div>
+                    <label
+                      htmlFor="makeup-evidence-input"
+                      className="block text-xs font-semibold text-slate-700 mb-1"
+                    >
+                      Kanıt / Belge Referansı (İsteğe Bağlı — Katılım Sertifika No veya Fotoğraf Bağlantısı)
+                    </label>
+                    <input
+                      id="makeup-evidence-input"
+                      type="text"
+                      value={makeupEvidenceRef}
+                      onChange={(e) => setMakeupEvidenceRef(e.target.value)}
+                      placeholder="Örn: KRK-2420-1840-BELGE veya Sekreterlik Teyit No"
+                      className="w-full text-xs font-mono-num bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-slate-900 focus:outline-none focus:bg-white focus:border-[#0C3C7C]"
+                    />
+                  </div>
+
                   {makeupError && (
                     <p role="alert" className="text-xs font-medium text-rose-600">
                       {makeupError}
                     </p>
                   )}
 
-                  <button
-                    type="submit"
-                    className="w-full min-h-[44px] py-2.5 px-4 rounded-xl bg-[#0C3C7C] text-white text-xs font-semibold hover:bg-[#17458F] transition-colors flex items-center justify-center gap-2 cursor-pointer"
-                  >
-                    <PlusCircle className="w-4 h-4" />
-                    <span>Make-up Bildirimi Gönder (Sekreterlik Onayına İlet)</span>
-                  </button>
+                  <div className="flex flex-col sm:flex-row gap-2.5">
+                    <button
+                      type="button"
+                      onClick={() => submitMemberMakeup('Taslak')}
+                      className="sm:w-1/3 min-h-[44px] py-2.5 px-4 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-semibold transition-colors cursor-pointer"
+                    >
+                      Taslak Olarak Kaydet
+                    </button>
+                    <button
+                      type="submit"
+                      className="flex-1 min-h-[44px] py-2.5 px-4 rounded-xl bg-[#0C3C7C] text-white text-xs font-semibold hover:bg-[#17458F] transition-colors flex items-center justify-center gap-2 cursor-pointer"
+                    >
+                      <PlusCircle className="w-4 h-4" />
+                      <span>Make-up Bildirimi Gönder (Sekreterlik Onayına İlet)</span>
+                    </button>
+                  </div>
                 </form>
 
                 {/* Recent Make-ups List */}
@@ -530,75 +676,150 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                     Dönem İçi Kayıtlı Make-up Bildirimleri ({makeupSubmissions.length})
                   </div>
                   <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden">
-                    {makeupSubmissions.map((mk) => (
-                      <div
-                        key={mk.id}
-                        className="p-3 bg-white flex flex-col sm:flex-row sm:items-start justify-between gap-3"
-                      >
-                        <div className="min-w-0">
-                          <div className="text-xs font-semibold text-slate-900">
-                            {mk.targetClubOrEvent}
-                          </div>
-                          <div className="text-[11px] text-slate-500 mt-0.5">
-                            <span className="font-semibold text-[#0C3C7C]">
-                              {mk.memberName}
-                            </span>
-                            <span className="mx-1.5" aria-hidden="true">
-                              ·
-                            </span>
-                            <span>{mk.activityType}</span>
-                            <span className="mx-1.5" aria-hidden="true">
-                              ·
-                            </span>
-                            <span className="font-mono-num">{mk.date}</span>
-                          </div>
-                          <p className="text-xs text-slate-600 mt-1">{mk.description}</p>
-                        </div>
-                        <div className="sm:text-right shrink-0 space-y-1.5">
-                          <div>
-                            <div
-                              className={`text-xs font-semibold ${
-                                mk.status === 'Onaylandı'
-                                  ? 'text-emerald-700'
-                                  : mk.status === 'Reddedildi'
-                                  ? 'text-rose-600'
-                                  : 'text-amber-700'
-                              }`}
-                            >
-                              {mk.status}
+                    {makeupSubmissions.map((mk) => {
+                      const isOwnSubmission = mk.memberId === activeMemberId;
+                      return (
+                        <div
+                          key={mk.id}
+                          className="p-3 bg-white flex flex-col sm:flex-row sm:items-start justify-between gap-3"
+                        >
+                          <div className="min-w-0 space-y-1">
+                            <div className="text-xs font-semibold text-slate-900">
+                              {mk.targetClubOrEvent}
                             </div>
-                            <div className="text-[11px] font-mono-num text-[#0C3C7C] font-semibold">
-                              {mk.status === 'Onaylandı'
-                                ? `+ %${mk.attendanceBoost} Katılım`
-                                : mk.status === 'Reddedildi'
-                                ? '0% Katılım'
-                                : 'Onay Bekliyor (+%3)'}
+                            <div className="text-[11px] text-slate-500">
+                              <span className="font-semibold text-[#0C3C7C]">
+                                {mk.memberName}
+                              </span>
+                              <span className="mx-1.5" aria-hidden="true">
+                                ·
+                              </span>
+                              <span>{mk.activityType}</span>
+                              <span className="mx-1.5" aria-hidden="true">
+                                ·
+                              </span>
+                              <span className="font-mono-num">{mk.date}</span>
                             </div>
-                          </div>
-                          {mk.status === 'İnceleniyor' &&
-                            isBoardLeader &&
-                            onApproveMakeupSubmission &&
-                            onRejectMakeupSubmission && (
-                              <div className="flex items-center sm:justify-end gap-1.5 pt-1">
-                                <button
-                                  type="button"
-                                  onClick={() => onApproveMakeupSubmission(mk.id)}
-                                  className="px-2.5 py-1 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-[11px] font-semibold cursor-pointer"
-                                >
-                                  Onayla (+%3)
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => onRejectMakeupSubmission(mk.id)}
-                                  className="px-2.5 py-1 rounded-lg bg-white border border-rose-300 hover:bg-rose-50 text-rose-700 text-[11px] font-semibold cursor-pointer"
-                                >
-                                  Reddet
-                                </button>
+                            <p className="text-xs text-slate-600">{mk.description}</p>
+                            {mk.evidenceRef && (
+                              <div className="text-[11px] font-mono-num text-slate-500">
+                                Kanıt Ref: {mk.evidenceRef}
                               </div>
                             )}
+                            {mk.reviewerNote && (
+                              <div className="text-[11px] text-amber-800 bg-amber-50 px-2 py-1 rounded">
+                                Sekreterlik Notu: {mk.reviewerNote}
+                              </div>
+                            )}
+                            {mk.appealNote && (
+                              <div className="text-[11px] text-indigo-800 bg-indigo-50 px-2 py-1 rounded">
+                                Üye İtiraz Notu: {mk.appealNote}
+                              </div>
+                            )}
+                            {mk.auditTrail && mk.auditTrail.length > 0 && (
+                              <div className="text-[10px] text-slate-400 font-mono-num">
+                                Son İşlem: {mk.auditTrail[mk.auditTrail.length - 1].actorName} ({mk.auditTrail[mk.auditTrail.length - 1].toStatus})
+                              </div>
+                            )}
+                          </div>
+                          <div className="sm:text-right shrink-0 space-y-1.5">
+                            <div>
+                              <div
+                                className={`text-xs font-semibold ${
+                                  mk.status === 'Onaylandı'
+                                    ? 'text-emerald-700'
+                                    : mk.status === 'Reddedildi'
+                                    ? 'text-rose-600'
+                                    : mk.status === 'Düzeltme İstendi'
+                                    ? 'text-orange-700'
+                                    : mk.status === 'Taslak'
+                                    ? 'text-slate-500'
+                                    : 'text-amber-700'
+                                }`}
+                              >
+                                {mk.status}
+                              </div>
+                              <div className="text-[11px] font-mono-num text-[#0C3C7C] font-semibold">
+                                {mk.status === 'Onaylandı'
+                                  ? `+ %${mk.attendanceBoost} Katılım`
+                                  : mk.status === 'Reddedildi'
+                                  ? '0% Katılım'
+                                  : 'Onay Bekliyor (+%3)'}
+                              </div>
+                            </div>
+                            {(mk.status === 'İnceleniyor' ||
+                              mk.status === 'İtiraz Edildi') &&
+                              isBoardLeader &&
+                              onApproveMakeupSubmission &&
+                              onRejectMakeupSubmission && (
+                                <div className="flex flex-wrap items-center sm:justify-end gap-1.5 pt-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => onApproveMakeupSubmission(mk.id)}
+                                    className="px-2.5 py-1 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-[11px] font-semibold cursor-pointer"
+                                  >
+                                    Onayla (+%3)
+                                  </button>
+                                  {onRequestMakeupRevision && (
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        onRequestMakeupRevision(
+                                          mk.id,
+                                          'Katılım kanıt belgesi veya tarih teyidi ekleyiniz.'
+                                        )
+                                      }
+                                      className="px-2.5 py-1 rounded-lg bg-amber-50 border border-amber-300 hover:bg-amber-100 text-amber-800 text-[11px] font-semibold cursor-pointer"
+                                    >
+                                      Düzeltme İste
+                                    </button>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={() => onRejectMakeupSubmission(mk.id)}
+                                    className="px-2.5 py-1 rounded-lg bg-white border border-rose-300 hover:bg-rose-50 text-rose-700 text-[11px] font-semibold cursor-pointer"
+                                  >
+                                    Reddet
+                                  </button>
+                                </div>
+                              )}
+                            {isOwnSubmission && onUpdateOwnMakeupSubmission && (
+                              <div className="flex flex-wrap items-center sm:justify-end gap-1.5 pt-1">
+                                {(mk.status === 'Taslak' ||
+                                  mk.status === 'Düzeltme İstendi') && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      onUpdateOwnMakeupSubmission(mk.id, {
+                                        status: 'İnceleniyor',
+                                      })
+                                    }
+                                    className="px-2.5 py-1 rounded-lg bg-[#0C3C7C] text-white text-[11px] font-semibold cursor-pointer"
+                                  >
+                                    İncelemeye Gönder
+                                  </button>
+                                )}
+                                {mk.status === 'Reddedildi' && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      onUpdateOwnMakeupSubmission(mk.id, {
+                                        status: 'İtiraz Edildi',
+                                        appealNote:
+                                          'Misafir kulüp sekreterlik teyit yazısı eklendi, yeniden değerlendirme arz ederim.',
+                                      })
+                                    }
+                                    className="px-2.5 py-1 rounded-lg bg-indigo-600 text-white text-[11px] font-semibold cursor-pointer"
+                                  >
+                                    İtiraz Et
+                                  </button>
+                                )}
+                              </div>
+                            )}
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               </div>
@@ -763,12 +984,40 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                               ·
                             </span>
                             <span className="font-mono-num">{card.sentAt}</span>
+                            <span className="mx-1.5" aria-hidden="true">
+                              ·
+                            </span>
+                            <span
+                              className={
+                                card.status === 'İptal Edildi'
+                                  ? 'text-rose-600 font-semibold'
+                                  : 'text-emerald-700 font-semibold'
+                              }
+                            >
+                              {card.status || 'Aktif'}
+                            </span>
                           </div>
                         </div>
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
                           <span className="font-mono-num text-[11px] text-emerald-700 font-semibold">
                             {card.verificationCode}
                           </span>
+                          {isBoardLeader &&
+                            onRevokeGuestMakeupCard &&
+                            card.status !== 'İptal Edildi' && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  onRevokeGuestMakeupCard(
+                                    card.id,
+                                    'Sekreterlik kararıyla belge iptal edildi'
+                                  )
+                                }
+                                className="min-h-[34px] px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 font-semibold transition-colors cursor-pointer"
+                              >
+                                İptal Et
+                              </button>
+                            )}
                           <button
                             type="button"
                             onClick={() => onOpenOfficialCertificateModal(card)}

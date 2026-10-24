@@ -10,12 +10,14 @@ import {
   FiresideGroup,
   GalataProject,
   GuestRotaryMakeupCard,
+  LcvReminderQueueItem,
   MakeupSubmission,
   MemberRsvp,
   MenuPreference,
   OverdueMemberItem,
   PastPresidentRecord,
   PaymentNotification,
+  ReminderChannel,
   RitualStep,
   RotaryMember,
   RsvpStatus,
@@ -126,6 +128,9 @@ export default function App() {
   const [speakerProposals, setSpeakerProposals] = useState<SpeakerProposal[]>(
     INITIAL_SPEAKER_PROPOSALS
   );
+  const [lcvReminderQueue, setLcvReminderQueue] = useState<LcvReminderQueueItem[]>([]);
+  const [outboundMessagingEnabled, setOutboundMessagingEnabled] =
+    useState<boolean>(false);
 
   // Tab 2: Operations (QR, Make-up, Fireside) State
   const [qrCheckedIn, setQrCheckedIn] = useState<boolean>(false);
@@ -240,6 +245,12 @@ export default function App() {
       setMeetingAttendances(
         serverData.meetingAttendances as Record<string, string[]>
       );
+    }
+    if (Array.isArray(serverData.lcvReminderQueue)) {
+      setLcvReminderQueue(serverData.lcvReminderQueue as LcvReminderQueueItem[]);
+    }
+    if (typeof serverData.outboundMessagingEnabled === 'boolean') {
+      setOutboundMessagingEnabled(serverData.outboundMessagingEnabled);
     }
     if (Array.isArray(serverData.makeupSubmissions)) {
       setMakeupSubmissions(serverData.makeupSubmissions as MakeupSubmission[]);
@@ -561,7 +572,8 @@ export default function App() {
     makeupSubmissions,
     INITIAL_MAKEUP_SUBMISSIONS,
     activeMemberId,
-    activeMemberDisplayName
+    activeMemberDisplayName,
+    members
   );
 
   const selectedMeetingAttendees =
@@ -780,6 +792,51 @@ export default function App() {
     );
   };
 
+  const handleUpdateCommunicationPrefs = async (
+    reminderOptOut: boolean,
+    preferredReminderChannel: ReminderChannel
+  ) => {
+    const token = sessionTokenRef.current || sessionToken;
+    if (!token) {
+      showToast(
+        'Sunucu Oturumu Gerekli (401)',
+        'Bildirim tercihlerini güncellemek için doğrulanmış kulüp oturumu gereklidir.'
+      );
+      return;
+    }
+    try {
+      const res = await fetch('/api/pilot/member-communication-prefs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          clubId: activeTenantClubId,
+          reminderOptOut,
+          preferredReminderChannel,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showToast(
+          `İletişim Tercihi Güncellenemedi (${res.status})`,
+          data?.message || 'İletişim tercihi sunucuya kaydedilemedi.'
+        );
+        return;
+      }
+      if (data?.state) applyServerTenantState(data.state);
+      showToast(
+        'İletişim & Hatırlatma Tercihi Güncellendi (#32)',
+        reminderOptOut
+          ? 'LCV hatırlatmaları sessize alındı (Opt-Out aktif).'
+          : `Tercih edilen taslak kanalı "${preferredReminderChannel}" olarak kaydedildi.`
+      );
+    } catch {
+      showToast('Bağlantı Hatası', 'Sunucu tercih servisine ulaşılamadı.');
+    }
+  };
+
   const handleRemindUnrespondedMembers = async () => {
     const pendingList = members.filter((m) => m.rsvpStatus === 'pending');
     if (pendingList.length === 0) {
@@ -789,6 +846,35 @@ export default function App() {
       );
       return;
     }
+
+    const token = sessionTokenRef.current || sessionToken;
+    if (token) {
+      try {
+        const res = await fetch('/api/pilot/lcv-reminders', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            clubId: activeTenantClubId,
+            meetingNo: selectedMeetingNo,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showToast(
+            `LCV Hatırlatma Kuyruğu Uyarısı (${res.status})`,
+            data?.message || 'LCV hatırlatma kuyruğu oluşturulamadı.'
+          );
+          return;
+        }
+        if (data?.state) applyServerTenantState(data.state);
+      } catch {
+        // Proceed to clipboard check below if offline
+      }
+    }
+
     const draftMessage = `Galata Rotary Kulübü Toplantı #${selectedMeetingNo} LCV Hatırlatması — Yanıt beklenen üyeler: ${pendingList
       .map((m) => m.fullName)
       .join(', ')}`;
@@ -804,7 +890,7 @@ export default function App() {
       'LCV Hatırlatma Taslağı Panoya Kopyalandı',
       `Henüz yanıt vermeyen ${pendingList
         .map((m) => m.fullName)
-        .join(', ')} için hatırlatma metni panoya kopyalandı.`
+        .join(', ')} için hatırlatma taslağı panoya kopyalandı (Dış gönderim kapalıdır).`
     );
   };
 
@@ -1053,6 +1139,14 @@ export default function App() {
       } else {
         setQrCheckedIn(true);
       }
+      if (data?.idempotentReplay) {
+        showToast(
+          'Yoklama Zaten Kayıtlı (İdempotent Yanıt #33)',
+          data?.message ||
+            `Toplantı #${selectedMeetingNo} için yoklama kaydınız zaten mevcuttur; mükerrer kayıt oluşturulmadı.`
+        );
+        return;
+      }
       showToast(
         'QR Yoklama Sunucuda Doğrulandı (+%2 Katılım)',
         `Toplantı #${selectedMeetingNo} kısa ömürlü imzalı QR kodu (${qrToken}) sunucu tarafından doğrulandı ve yoklamanız işlendi.`
@@ -1065,32 +1159,85 @@ export default function App() {
     }
   };
 
+  const handleManualCheckIn = async (
+    targetMemberId: string,
+    reason: string
+  ) => {
+    const token = sessionTokenRef.current || sessionToken;
+    if (!token) {
+      showToast(
+        'Sunucu Oturumu Gerekli (401)',
+        'Yetkili manuel yoklama için doğrulanmış Genel Sekreter veya Dönem Başkanı oturumu gereklidir.'
+      );
+      return;
+    }
+    try {
+      const res = await fetch('/api/pilot/manual-checkin', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          clubId: activeTenantClubId,
+          meetingNo: selectedMeetingNo,
+          targetMemberId,
+          reason,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showToast(
+          `Manuel Yoklama Reddedildi (${res.status})`,
+          data?.message || 'Manuel yoklama kaydedilemedi.'
+        );
+        return;
+      }
+      if (data?.state) applyServerTenantState(data.state);
+      showToast(
+        data?.idempotentReplay
+          ? 'Manuel Yoklama Zaten Kayıtlı (#33)'
+          : 'Yetkili Manuel Yoklama Kaydedildi (#33)',
+        data?.message || 'Üye yoklaması denetim iziyle kaydedildi.'
+      );
+    } catch {
+      showToast('Bağlantı Hatası', 'Manuel yoklama servisine ulaşılamadı.');
+    }
+  };
+
   const handleAddMakeupSubmission = async (
     payload: Omit<
       MakeupSubmission,
       'id' | 'status' | 'attendanceBoost' | 'memberName'
-    >
+    > & { status?: MakeupSubmission['status'] }
   ) => {
+    const initialStatus = payload.status === 'Taslak' ? 'Taslak' : 'İnceleniyor';
     const newEntry: MakeupSubmission = {
       id: `mk-${Date.now()}`,
       memberId: activeMemberId,
       memberName: activeMemberDisplayName,
       ...payload,
-      status: 'İnceleniyor',
+      status: initialStatus,
       attendanceBoost: 0,
     };
     const nextMakeups = [newEntry, ...makeupSubmissions];
     const ok = await recordServerAudit(
       'QR Yoklama & Make-up',
-      `Make-up Bildirimi Onaya Sunuldu: ${payload.targetClubOrEvent}`,
-      `${activeMemberDisplayName} · ${payload.activityType} (${payload.date}) katılım bildirimi Sekreter/Başkan onay kuyruğuna eklendi.`,
+      initialStatus === 'Taslak'
+        ? `Make-up Taslağı Kaydedildi: ${payload.targetClubOrEvent}`
+        : `Make-up Bildirimi Onaya Sunuldu: ${payload.targetClubOrEvent}`,
+      `${activeMemberDisplayName} · ${payload.activityType} (${payload.date}) katılım bildirimi ${initialStatus} durumunda kaydedildi.`,
       undefined,
       { makeupSubmissions: nextMakeups }
     );
     if (!ok) return;
     showToast(
-      'Make-up Bildirimi Onay Kuyruğuna Eklendi',
-      `${payload.targetClubOrEvent} katılımınız Genel Sekreter / Başkan onayından sonra devam oranınıza (+%3) işlenecektir.`
+      initialStatus === 'Taslak'
+        ? 'Make-up Taslağı Kaydedildi (#35)'
+        : 'Make-up Bildirimi Onay Kuyruğuna Eklendi',
+      initialStatus === 'Taslak'
+        ? `${payload.targetClubOrEvent} taslak olarak kaydedildi; dilediğiniz zaman incelemeye gönderebilirsiniz.`
+        : `${payload.targetClubOrEvent} katılımınız Genel Sekreter / Başkan onayından sonra devam oranınıza (+%3) işlenecektir.`
     );
   };
 
@@ -1136,6 +1283,102 @@ export default function App() {
       `Make-up Bildirimi Reddedildi: ${target.memberName}`,
       `${target.targetClubOrEvent} katılım kaydı sunucu onayıyla reddedildi.`
     );
+  };
+
+  const handleRequestMakeupRevision = async (
+    makeupId: string,
+    reviewerNote: string
+  ) => {
+    const target = makeupSubmissions.find((m) => m.id === makeupId);
+    if (!target) return;
+    const nextMakeups = makeupSubmissions.map((m) =>
+      m.id === makeupId
+        ? {
+            ...m,
+            status: 'Düzeltme İstendi' as const,
+            reviewerNote,
+            attendanceBoost: 0,
+          }
+        : m
+    );
+    const ok = await recordServerAudit(
+      'QR Yoklama & Make-up',
+      `Make-up Düzeltme Talebi: ${target.targetClubOrEvent}`,
+      `${target.memberName} (${target.targetClubOrEvent}) için düzeltme/kanıt talep edildi: ${reviewerNote}`,
+      ['sekreter', 'baskan'],
+      { makeupSubmissions: nextMakeups }
+    );
+    if (!ok) return;
+    showToast(
+      `Düzeltme İstendi (#35): ${target.memberName}`,
+      `Üyeden ek kanıt veya açıklama talep edildi.`
+    );
+  };
+
+  const handleUpdateOwnMakeupSubmission = async (
+    makeupId: string,
+    patch: Partial<MakeupSubmission>
+  ) => {
+    const target = makeupSubmissions.find((m) => m.id === makeupId);
+    if (!target) return;
+    const nextMakeups = makeupSubmissions.map((m) =>
+      m.id === makeupId ? { ...m, ...patch } : m
+    );
+    const ok = await recordServerAudit(
+      'QR Yoklama & Make-up',
+      `Make-up Kaydı Güncellendi (${patch.status || target.status}): ${target.targetClubOrEvent}`,
+      `${activeMemberDisplayName} kendi make-up kaydını "${patch.status || target.status}" durumuna güncelledi.`,
+      undefined,
+      { makeupSubmissions: nextMakeups }
+    );
+    if (!ok) return;
+    showToast(
+      `Make-up Durumu Güncellendi: ${patch.status || target.status}`,
+      `${target.targetClubOrEvent} kaydınız sunucu onayıyla güncellendi.`
+    );
+  };
+
+  const handleRevokeGuestMakeupCard = async (
+    cardId: string,
+    reason: string
+  ) => {
+    const token = sessionTokenRef.current || sessionToken;
+    if (!token) {
+      showToast(
+        'Sunucu Oturumu Gerekli (401)',
+        'Katılım belgesi iptali için doğrulanmış Sekreter veya Başkan oturumu gereklidir.'
+      );
+      return;
+    }
+    try {
+      const res = await fetch('/api/pilot/revoke-certificate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          clubId: activeTenantClubId,
+          certificateId: cardId,
+          reason,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showToast(
+          `Belge İptali Reddedildi (${res.status})`,
+          data?.message || 'Katılım belgesi iptal edilemedi.'
+        );
+        return;
+      }
+      if (data?.state) applyServerTenantState(data.state);
+      showToast(
+        'Misafir Katılım Belgesi İptal Edildi (#36)',
+        data?.message || 'Belge iptal edildi ve doğrulama uç noktasında geçersiz kılındı.'
+      );
+    } catch {
+      showToast('Bağlantı Hatası', 'Belge iptal servisine ulaşılamadı.');
+    }
   };
 
   const handleSendGuestMakeupCard = async (
@@ -1847,6 +2090,10 @@ export default function App() {
             onRemindUnrespondedMembers={handleRemindUnrespondedMembers}
             onDownloadKuverCsvNotify={handleDownloadKuverCsvNotify}
             onUpdateMeetingHotelCommitment={handleUpdateMeetingHotelCommitment}
+            lcvReminderQueue={lcvReminderQueue}
+            outboundMessagingEnabled={outboundMessagingEnabled}
+            activeMemberId={activeMemberId}
+            onUpdateCommunicationPrefs={handleUpdateCommunicationPrefs}
           />
         )}
 
@@ -1857,13 +2104,17 @@ export default function App() {
             qrCheckedIn={isCurrentMemberCheckedInForMeeting}
             onSimulateQrCheckIn={handleSimulateQrCheckIn}
             onGenerateMeetingQrToken={handleGenerateMeetingQrToken}
+            onManualCheckIn={handleManualCheckIn}
             activeSalonQrToken={activeSalonQrToken}
             makeupSubmissions={makeupSubmissions}
             onAddMakeupSubmission={handleAddMakeupSubmission}
             onApproveMakeupSubmission={handleApproveMakeupSubmission}
             onRejectMakeupSubmission={handleRejectMakeupSubmission}
+            onRequestMakeupRevision={handleRequestMakeupRevision}
+            onUpdateOwnMakeupSubmission={handleUpdateOwnMakeupSubmission}
             guestMakeupCards={guestMakeupCards}
             onSendGuestMakeupCard={handleSendGuestMakeupCard}
+            onRevokeGuestMakeupCard={handleRevokeGuestMakeupCard}
             onOpenOfficialCertificateModal={(card) =>
               setActiveCertificateCard(card)
             }
@@ -1871,6 +2122,7 @@ export default function App() {
             onSubmitFiresideReport={handleSubmitFiresideReport}
             members={members}
             onCreateFiresideGroup={handleCreateFiresideGroup}
+            activeMemberId={activeMemberId}
             activeMemberName={activeMemberDisplayName}
             volunteerShifts={volunteerShifts}
             onToggleVolunteerShift={handleToggleVolunteerShift}

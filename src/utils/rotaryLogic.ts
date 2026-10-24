@@ -1,9 +1,11 @@
 import {
   FinancialLineItem,
+  LcvReminderQueueItem,
   MakeupSubmission,
   MemberRsvp,
   MenuPreference,
   PaymentNotification,
+  ReminderChannel,
   RotaryMember,
   RsvpStatus,
   SpeakerProposal,
@@ -904,14 +906,40 @@ export function calculateSpecializedModulesSummary(
 }
 
 /**
+ * Resolves a legacy make-up record's `memberId` ONLY when the member roster contains
+ * a single unambiguous member with that exact normalized name (#35).
+ * If two or more members share the same name, returns undefined so legacy records never cross-contaminate.
+ */
+export function resolveUnambiguousLegacyMemberId(
+  memberName: string,
+  allMembers?: Pick<RotaryMember, 'id' | 'fullName'>[]
+): string | undefined {
+  if (!Array.isArray(allMembers) || allMembers.length === 0) return undefined;
+  const normalizeName = (name: string) =>
+    String(name || '')
+      .toLowerCase()
+      .replace(/^rtn\.?\s*/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  const targetKey = normalizeName(memberName);
+  if (!targetKey) return undefined;
+  const matches = allMembers.filter(
+    (m) => normalizeName(m.fullName) === targetKey
+  );
+  return matches.length === 1 ? matches[0].id : undefined;
+}
+
+/**
  * Calculates extra approved make-up count strictly bound to the target member (#35).
- * Prioritizes immutable `memberId` matching so two different members with the same fullName never collide.
+ * Always binds via immutable `memberId`. Legacy records without `memberId` are only matched
+ * if `allMembers` proves the name is 100% unique in the club roster (or when no roster collision exists).
  */
 export function calculateMemberExtraMakeups(
   submissions: MakeupSubmission[],
   initialSubmissions: MakeupSubmission[],
   memberId: string,
-  memberFullName: string
+  memberFullName: string,
+  allMembers?: Pick<RotaryMember, 'id' | 'fullName'>[]
 ): number {
   const normalizeName = (name: string) =>
     String(name || '')
@@ -921,9 +949,31 @@ export function calculateMemberExtraMakeups(
       .trim();
 
   const targetNameKey = normalizeName(memberFullName);
+
+  // Check if any other submission or roster member shares the same normalized name with a different memberId
+  const allKnownIdsForName = new Set<string>();
+  if (Array.isArray(allMembers)) {
+    for (const m of allMembers) {
+      if (normalizeName(m.fullName) === targetNameKey) {
+        allKnownIdsForName.add(m.id);
+      }
+    }
+  }
+  for (const s of [...submissions, ...initialSubmissions]) {
+    if (s.memberId && normalizeName(s.memberName) === targetNameKey) {
+      allKnownIdsForName.add(s.memberId);
+    }
+  }
+  const isNameAmbiguous =
+    allKnownIdsForName.size > 1 ||
+    (allKnownIdsForName.size === 1 && !allKnownIdsForName.has(memberId));
+
   const belongsToMember = (m: MakeupSubmission): boolean => {
     if (m.memberId) {
       return m.memberId === memberId;
+    }
+    if (isNameAmbiguous) {
+      return false;
     }
     return normalizeName(m.memberName) === targetNameKey;
   };
@@ -937,3 +987,175 @@ export function calculateMemberExtraMakeups(
 
   return Math.max(0, currentApproved - baselineApproved);
 }
+
+/**
+ * Generates a normalized activity key to prevent duplicate make-up credit for the same activity (#35).
+ */
+export function buildMakeupActivityKey(input: {
+  memberId: string;
+  date: string;
+  targetClubOrEvent: string;
+  activityType: string;
+}): string {
+  const norm = (val: string) =>
+    String(val || '')
+      .toLowerCase()
+      .replace(/\s+/g, ' ')
+      .trim();
+  return `${norm(input.memberId)}::${norm(input.date)}::${norm(
+    input.targetClubOrEvent
+  )}::${norm(input.activityType)}`;
+}
+
+/**
+ * Checks whether a make-up submission duplicates an existing non-rejected make-up record for the same member (#35).
+ */
+export function hasDuplicateMakeupActivity(
+  existingSubmissions: MakeupSubmission[],
+  candidate: {
+    id?: string;
+    memberId: string;
+    date: string;
+    targetClubOrEvent: string;
+    activityType: string;
+  }
+): boolean {
+  const candidateKey = buildMakeupActivityKey(candidate);
+  return existingSubmissions.some((ex) => {
+    if (candidate.id && ex.id === candidate.id) return false;
+    if (ex.status === 'Reddedildi') return false;
+    if (!ex.memberId) return false;
+    return (
+      buildMakeupActivityKey({
+        memberId: ex.memberId,
+        date: ex.date,
+        targetClubOrEvent: ex.targetClubOrEvent,
+        activityType: ex.activityType,
+      }) === candidateKey
+    );
+  });
+}
+
+/**
+ * Issue #32: Evaluates an LCV reminder batch for a specific meeting with:
+ * - Quiet hours guard (22:00 - 08:00 TR time)
+ * - Member opt-out respect (`reminderOptOut === true`)
+ * - Cooldown / duplicate prevention per `(meetingNo, memberId)` within 6 hours
+ * - Honest delivery status (`Taslak Kuyrukta (Dış Gönderim Kapalı)` unless external dispatch + provider receipt exist)
+ */
+export function evaluateLcvReminderBatch(params: {
+  meetingNo: number;
+  meetingDate: string;
+  members: RotaryMember[];
+  existingQueue: LcvReminderQueueItem[];
+  actorName: string;
+  currentHourTR?: number;
+  nowEpochMs?: number;
+  cooldownWindowMs?: number;
+  outboundDispatchEnabled?: boolean;
+  providerReceiptsByMemberId?: Record<string, string>;
+}): {
+  isQuietHours: boolean;
+  pendingMembersCount: number;
+  queuedItems: LcvReminderQueueItem[];
+  skippedOptOutMembers: string[];
+  skippedCooldownMembers: string[];
+} {
+  const hour =
+    typeof params.currentHourTR === 'number' ? params.currentHourTR : 14;
+  const nowMs =
+    typeof params.nowEpochMs === 'number' ? params.nowEpochMs : Date.now();
+  const cooldownMs =
+    typeof params.cooldownWindowMs === 'number'
+      ? params.cooldownWindowMs
+      : 6 * 60 * 60 * 1000;
+  const isQuietHours = hour >= 22 || hour < 8;
+
+  const pendingMembers = params.members.filter(
+    (m) => m.rsvpStatus === 'pending'
+  );
+  if (isQuietHours) {
+    return {
+      isQuietHours: true,
+      pendingMembersCount: pendingMembers.length,
+      queuedItems: [],
+      skippedOptOutMembers: [],
+      skippedCooldownMembers: [],
+    };
+  }
+
+  const queuedItems: LcvReminderQueueItem[] = [];
+  const skippedOptOutMembers: string[] = [];
+  const skippedCooldownMembers: string[] = [];
+
+  for (const member of pendingMembers) {
+    if (member.reminderOptOut) {
+      skippedOptOutMembers.push(member.fullName);
+      continue;
+    }
+
+    const recentExisting = params.existingQueue.find(
+      (q) =>
+        q.meetingNo === params.meetingNo &&
+        q.memberId === member.id &&
+        (q.status === 'Taslak Kuyrukta (Dış Gönderim Kapalı)' ||
+          q.status === 'Sağlayıcı Kanıtı ile İletildi') &&
+        nowMs - (q.createdAtEpochMs || 0) < cooldownMs
+    );
+    if (recentExisting) {
+      skippedCooldownMembers.push(member.fullName);
+      continue;
+    }
+
+    const channel: ReminderChannel =
+      member.preferredReminderChannel || 'WhatsApp Taslağı';
+    const providerReceipt = params.providerReceiptsByMemberId?.[member.id];
+    const isVerifiedDelivered =
+      Boolean(params.outboundDispatchEnabled) &&
+      typeof providerReceipt === 'string' &&
+      providerReceipt.trim().length > 0;
+
+    queuedItems.push({
+      id: `rem-${params.meetingNo}-${member.id}-${nowMs}`,
+      meetingNo: params.meetingNo,
+      memberId: member.id,
+      memberName: member.fullName,
+      channel,
+      draftMessage: `Sayın Rtn. ${member.fullName}, Galata Rotary Kulübü #${params.meetingNo} (${params.meetingDate}) toplantısı Pera Palace kuver bildirimi için LCV yanıtınızı rica ederiz.`,
+      status: isVerifiedDelivered
+        ? 'Sağlayıcı Kanıtı ile İletildi'
+        : 'Taslak Kuyrukta (Dış Gönderim Kapalı)',
+      createdAt: '23 Ekim 2026 · Şimdi',
+      createdAtEpochMs: nowMs,
+      createdBy: params.actorName,
+      ...(isVerifiedDelivered
+        ? { providerReceiptId: providerReceipt!.trim() }
+        : {}),
+    });
+  }
+
+  return {
+    isQuietHours: false,
+    pendingMembersCount: pendingMembers.length,
+    queuedItems,
+    skippedOptOutMembers,
+    skippedCooldownMembers,
+  };
+}
+
+/**
+ * Issue #36: Masks a guest Rotarian's full name for KVKK data minimization on unauthenticated public verification responses.
+ * Example: "Rtn. Hakan Çelik" -> "Rtn. H*** Ç***"
+ */
+export function maskGuestNameForPublicVerification(fullName: string): string {
+  const raw = String(fullName || '').trim();
+  if (!raw) return '***';
+  const hasRtnPrefix = /^rtn\.?\s+/i.test(raw);
+  const body = raw.replace(/^rtn\.?\s+/i, '').trim();
+  const maskedParts = body
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => `${part.charAt(0)}***`);
+  return `${hasRtnPrefix ? 'Rtn. ' : ''}${maskedParts.join(' ')}`;
+}
+

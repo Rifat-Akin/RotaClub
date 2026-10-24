@@ -49,6 +49,7 @@ export interface WeeklyMeeting {
   bulletinSummary?: string;
   attendanceCount?: number;
   highlights?: string[];
+  status?: 'Planlandı' | 'Aktif' | 'Tamamlandı' | 'İptal Edildi';
   // Issue #29 & #42: Persisted Hotel Banquet Commitment & Official Confirmation Fields
   minHotelGuarantee?: number;
   unitKuverCostTL?: number;
@@ -59,16 +60,45 @@ export interface WeeklyMeeting {
   hotelConfirmedAt?: string;
 }
 
+export type MakeupStatus =
+  | 'Taslak'
+  | 'İnceleniyor'
+  | 'Düzeltme İstendi'
+  | 'Onaylandı'
+  | 'Reddedildi'
+  | 'İtiraz Edildi';
+
+export interface MakeupAuditHistoryEntry {
+  timestamp: string;
+  actorId: string;
+  actorName: string;
+  actorRole: ClubRole;
+  fromStatus?: MakeupStatus;
+  toStatus: MakeupStatus;
+  note?: string;
+}
+
 export interface MakeupSubmission {
   id: string;
   memberId?: string;
   memberName: string;
   targetClubOrEvent: string;
-  activityType: 'Kulüp Toplantısı' | 'Bölge Semineri' | 'Hizmet Projesi' | 'Komite Toplantısı';
+  activityType:
+    | 'Kulüp Toplantısı'
+    | 'Bölge Semineri'
+    | 'Hizmet Projesi'
+    | 'Komite Toplantısı'
+    | 'Kulüp Ziyareti';
   date: string;
   description: string;
-  status: 'Onaylandı' | 'İnceleniyor' | 'Reddedildi';
+  evidenceRef?: string;
+  status: MakeupStatus;
   attendanceBoost: number;
+  reviewerNote?: string;
+  appealNote?: string;
+  reviewedBy?: string;
+  reviewedAt?: string;
+  auditTrail?: MakeupAuditHistoryEntry[];
 }
 
 export interface GuestRotaryMakeupCard {
@@ -81,6 +111,37 @@ export interface GuestRotaryMakeupCard {
   meetingDate: string;
   sentAt: string;
   verificationCode: string;
+  schemaVersion?: number;
+  status?: 'Taslak' | 'Aktif' | 'İptal Edildi';
+  issuedByMemberId?: string;
+  issuedByName?: string;
+  issuedByRole?: ClubRole;
+  revokedAt?: string;
+  revokedBy?: string;
+  revocationReason?: string;
+}
+
+export type ReminderChannel = 'E-Posta' | 'SMS' | 'WhatsApp Taslağı';
+
+export type LcvReminderDeliveryStatus =
+  | 'Taslak Kuyrukta (Dış Gönderim Kapalı)'
+  | 'Atlandı (Opt-Out)'
+  | 'Atlandı (Sessiz Saat 22:00-08:00)'
+  | 'Atlandı (Mükerrer / Cooldown)'
+  | 'Sağlayıcı Kanıtı ile İletildi';
+
+export interface LcvReminderQueueItem {
+  id: string;
+  meetingNo: number;
+  memberId: string;
+  memberName: string;
+  channel: ReminderChannel;
+  draftMessage: string;
+  status: LcvReminderDeliveryStatus;
+  createdAt: string;
+  createdAtEpochMs: number;
+  createdBy: string;
+  providerReceiptId?: string;
 }
 
 export interface FiresideGroup {
@@ -242,6 +303,11 @@ export interface RotaryMember {
   rsvpStatus: RsvpStatus;
   mealPreference: MenuPreference;
   guestName?: string;
+  // Issue #32: Communication Preferences & Opt-Out
+  reminderOptOut?: boolean;
+  preferredReminderChannel?: ReminderChannel;
+  lastRemindedMeetingNo?: number;
+  lastRemindedAtIso?: string;
 }
 
 export type Member = RotaryMember;
