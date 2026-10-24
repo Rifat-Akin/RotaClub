@@ -33,10 +33,12 @@ npm test           # both test suites
 npm run build
 node scripts/check-secrets.mjs --self-test
 node scripts/check-secrets.mjs
+node scripts/check-ci-policy.mjs --self-test
+node scripts/check-ci-policy.mjs
 npm audit --omit=dev --audit-level=high
 ```
 
-GitHub Actions runs the typecheck, tests, build, tracked-file secret scan and production dependency audit. A passing source scan is **not** a full historical secret exposure audit. The frontend build is **not** an approved production deployment.
+GitHub Actions runs the typecheck, tests, build, tracked-file secret scan and production dependency audit. CI's external GitHub Actions are pinned to reviewed commit SHAs, checkout credentials are not persisted, and `check-ci-policy.mjs` tests regressions to these controls. To upgrade an action, verify the new commit against the official upstream repository and update the CI and the script's reviewed SHA list together. A passing source scan is **not** a full historical secret exposure audit. The frontend build is **not** an approved production deployment.
 
 ## Branch, review and release workflow
 
