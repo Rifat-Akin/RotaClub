@@ -35,6 +35,7 @@ node scripts/check-secrets.mjs --self-test
 node scripts/check-secrets.mjs
 node scripts/check-ci-policy.mjs --self-test
 node scripts/check-ci-policy.mjs
+node --test scripts/release-preflight.test.mjs
 npm audit --omit=dev --audit-level=high
 ```
 
@@ -47,6 +48,12 @@ GitHub Actions runs the typecheck, tests, build, tracked-file secret scan and pr
 3. Keep PRs small, attach tests and a rollback strategy, and use the [PR template](.github/pull_request_template.md). Include a source SHA and links to GitHub Actions.
 4. Require independent review for authentication, multi-tenant isolation, financial state, privacy, backup and official certificates. **Do not equate local PASS with production GO.**
 5. Merge only after relevant checks and review; re-read remote `main` and the issue before claiming completion. Enable branch protection/required checks in repository settings; a workflow file alone does not enforce a protected `main`.
+
+## Read-only release evidence audit (#21)
+
+The manually triggered [RotaClub Release Evidence Audit](.github/workflows/release-preflight.yml) checks current GitHub `main` SHA, protected branch/required checks, CI results on that exact SHA, and the state of release/security/pilot issues #21, #75 and #76. Go to **GitHub Actions → RotaClub Release Evidence Audit (NO DEPLOY) → Run workflow**, on `main`, only when an evidence read-back is useful.
+
+The workflow runs with **read-only** GitHub permissions; it neither deploys, enables real users/outbound communications nor writes approvals. A successful *audit workflow* run means the check executed, **not** that the product is ready. Its summary always reports `RELEASE_DECISION=NO_GO`, `DEPLOYMENT_AUTHORIZED=NO`, and machine-checkable prerequisites as `PASS` or `HOLD`. Even closed issues and green CI **cannot replace** explicit authorized owner/club approval, two-device UAT, isolated restore and a separate release decision. Never use this report to auto-deploy.
 
 ## Release and rollback
 
