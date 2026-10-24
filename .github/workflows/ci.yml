@@ -55,6 +55,9 @@ jobs:
       - name: Verify secret scanner detects planted fixtures
         run: node scripts/check-secrets.mjs --self-test
 
+      - name: Adversarial scanner tests (Git and no-Git exports)
+        run: node --test scripts/check-secrets.test.mjs
+
       - name: Scan tracked files for high-confidence secrets
         run: node scripts/check-secrets.mjs
 
