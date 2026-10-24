@@ -628,21 +628,34 @@ test('Issue #35: calculateMemberExtraMakeups isolates approved make-ups per memb
   );
 });
 
-test('evaluateLcvReminderBatch enforces quiet hours, opt-out, 6h cooldown, and honest draft-only status (#32)', () => {
-  const nowMs = Date.parse('2026-10-23T14:00:00.000Z');
+test('evaluateLcvReminderBatch enforces quiet hours in Europe/Istanbul, per-meeting meetingRsvps, dynamic club/venue templates, opt-out, 6h cooldown, and honest draft-only status (#32)', () => {
+  // 2026-10-23T11:00:00.000Z is 14:00 in Europe/Istanbul (UTC+3)
+  const daytimeEpochMs = Date.parse('2026-10-23T11:00:00.000Z');
+  // 2026-10-23T20:00:00.000Z is 23:00 in Europe/Istanbul (UTC+3, quiet hours)
+  const quietEpochMs = Date.parse('2026-10-23T20:00:00.000Z');
+
   const membersForReminder: RotaryMember[] = [
     {
       ...SAMPLE_MEMBERS[0],
       id: 'm-pending-ok',
       fullName: 'Caner Erkin',
-      rsvpStatus: 'pending',
+      rsvpStatus: 'attending', // Global status is attending, but meeting #1842 is pending!
+      meetingRsvps: { '1842': 'pending', '1841': 'attending' },
       preferredReminderChannel: 'E-Posta',
+    },
+    {
+      ...SAMPLE_MEMBERS[0],
+      id: 'm-responded-for-meeting',
+      fullName: 'Emre Belözoğlu',
+      rsvpStatus: 'pending', // Global status is pending, but meeting #1842 is already attending!
+      meetingRsvps: { '1842': 'attending' },
     },
     {
       ...SAMPLE_MEMBERS[1],
       id: 'm-pending-optout',
       fullName: 'Selim Yalçın',
       rsvpStatus: 'pending',
+      meetingRsvps: { '1842': 'pending' },
       reminderOptOut: true,
     },
     {
@@ -650,6 +663,7 @@ test('evaluateLcvReminderBatch enforces quiet hours, opt-out, 6h cooldown, and h
       id: 'm-pending-cooldown',
       fullName: 'Zeynep Korkmaz',
       rsvpStatus: 'pending',
+      meetingRsvps: { '1842': 'pending' },
     },
   ];
 
@@ -663,38 +677,52 @@ test('evaluateLcvReminderBatch enforces quiet hours, opt-out, 6h cooldown, and h
       draftMessage: 'Önceki taslak',
       status: 'Taslak Kuyrukta (Dış Gönderim Kapalı)' as const,
       createdAt: '23 Ekim 2026 · 12:00',
-      createdAtEpochMs: nowMs - 2 * 60 * 60 * 1000, // 2 hours ago (within 6h cooldown)
+      createdAtEpochMs: daytimeEpochMs - 2 * 60 * 60 * 1000, // 2 hours ago (within 6h cooldown)
       createdBy: 'Dr. Zeynep Kaya',
     },
   ];
 
-  // Quiet hours (23:00 TR) blocks batch queueing
+  // Quiet hours (23:00 TR derived from quietEpochMs) blocks batch queueing even without passing currentHourTR
   const quietBatch = evaluateLcvReminderBatch({
+    clubName: 'Karaköy Rotary Kulübü',
     meetingNo: 1842,
     meetingDate: '27 Ekim 2026 Salı',
+    meetingVenue: 'JW Marriott Bosphorus',
     members: membersForReminder,
     existingQueue,
     actorName: 'Dr. Zeynep Kaya',
-    currentHourTR: 23,
-    nowEpochMs: nowMs,
+    nowEpochMs: quietEpochMs,
   });
   assert.equal(quietBatch.isQuietHours, true);
   assert.equal(quietBatch.queuedItems.length, 0);
 
-  // Normal daytime hour (14:00 TR, 2 hours after m-pending-cooldown was reminded)
+  // Normal daytime hour (14:00 TR derived from daytimeEpochMs)
   const daytimeBatch = evaluateLcvReminderBatch({
+    clubName: 'Karaköy Rotary Kulübü',
     meetingNo: 1842,
     meetingDate: '27 Ekim 2026 Salı',
+    meetingVenue: 'JW Marriott Bosphorus',
     members: membersForReminder,
     existingQueue,
     actorName: 'Dr. Zeynep Kaya',
-    currentHourTR: 14,
-    nowEpochMs: nowMs,
+    nowEpochMs: daytimeEpochMs,
   });
   assert.equal(daytimeBatch.isQuietHours, false);
   assert.equal(daytimeBatch.queuedItems.length, 1);
   assert.equal(daytimeBatch.queuedItems[0].memberId, 'm-pending-ok');
   assert.equal(daytimeBatch.queuedItems[0].channel, 'E-Posta');
+  assert.equal(
+    daytimeBatch.queuedItems[0].draftMessage.includes('Karaköy Rotary Kulübü'),
+    true
+  );
+  assert.equal(
+    daytimeBatch.queuedItems[0].draftMessage.includes('JW Marriott Bosphorus'),
+    true
+  );
+  assert.equal(
+    daytimeBatch.queuedItems[0].draftMessage.includes('Galata Rotary'),
+    false
+  );
   assert.equal(
     daytimeBatch.queuedItems[0].status,
     'Taslak Kuyrukta (Dış Gönderim Kapalı)'
@@ -714,4 +742,5 @@ test('maskGuestNameForPublicVerification masks guest full name under KVKK for un
     'S*** K***'
   );
 });
+
 

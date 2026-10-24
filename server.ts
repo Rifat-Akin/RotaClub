@@ -24,8 +24,10 @@ import {
 } from './src/server/pilotEngine';
 import {
   AuditLogEntry,
+  CertificateApprovalHistoryEntry,
   ClubRole,
   FinancialLineItem,
+  GuestRotaryMakeupCard,
   MakeupAuditHistoryEntry,
   MakeupStatus,
   MakeupSubmission,
@@ -34,10 +36,14 @@ import {
   TreasuryLedgerEntry,
 } from './src/types/rotary';
 import {
+  buildMakeupActivityKey,
   evaluateLcvReminderBatch,
+  getIstanbulHourFromEpochMs,
+  hasDuplicateInMakeupBatch,
   hasDuplicateMakeupActivity,
   maskGuestNameForPublicVerification,
   resolveUnambiguousLegacyMemberId,
+  SERVER_LCV_REMINDER_COOLDOWN_MS,
 } from './src/utils/rotaryLogic';
 
 const PORT = 3000;
@@ -369,11 +375,28 @@ export function createPilotExpressApp(
   options?: {
     trustedWebAuthnRootPems?: string[];
     trustedWebAuthnOrigins?: string[];
+    trustProxy?: boolean | number | string;
+    clock?: () => Date;
+    trustedMessagingProvider?: (params: {
+      clubId: string;
+      meetingNo: number;
+      memberId: string;
+      channel: ReminderChannel;
+    }) => string | undefined;
   }
 ) {
   const app = express();
-  app.set('trust proxy', 1);
+  if (options?.trustProxy !== undefined) {
+    app.set('trust proxy', options.trustProxy);
+  } else if (process.env.ROTACLUB_TRUST_PROXY === '1') {
+    app.set('trust proxy', 1);
+  } else {
+    app.set('trust proxy', false);
+  }
   app.use(express.json({ limit: '2mb' }));
+
+  const getServerNow = (): Date =>
+    options?.clock ? options.clock() : new Date();
 
   // Prevent browser/proxy caching of sensitive club & financial API responses
   app.use('/api', (_req, res, next) => {
@@ -2670,14 +2693,36 @@ export function createPilotExpressApp(
         return;
       }
 
-      const {
-        clubId,
-        meetingNo,
-        simulatedHourTR,
-        simulatedNowIso,
-        cooldownWindowMs,
-        providerReceiptsByMemberId,
-      } = req.body || {};
+      const bodyObj =
+        req.body && typeof req.body === 'object'
+          ? (req.body as Record<string, unknown>)
+          : {};
+
+      // Security Audit (#32): Reject any client attempt to override server clock, quiet hours, or cooldown policy
+      if (
+        'simulatedHourTR' in bodyObj ||
+        'simulatedNowIso' in bodyObj ||
+        'cooldownWindowMs' in bodyObj
+      ) {
+        res.status(422).json({
+          error: 'CLIENT_CLOCK_OVERRIDE_FORBIDDEN',
+          message:
+            'Saat ve bekleme süresi (cooldown) politikası güvenliği (#32): İstemci üzerinden saat veya cooldown parametresi gönderilemez; gerçek zaman sunucu tarafından (Europe/Istanbul) hesaplanır.',
+        });
+        return;
+      }
+
+      // Security Audit (#32): Reject any client attempt to forge provider delivery receipts
+      if ('providerReceiptsByMemberId' in bodyObj) {
+        res.status(422).json({
+          error: 'UNTRUSTED_PROVIDER_RECEIPT',
+          message:
+            'Teslimat kanıtı güvenliği (#32): Sağlayıcı teslimat makbuzları istemciden gönderilemez; yalnızca sunucu tarafı doğrulanmış entegrasyondan üretilebilir.',
+        });
+        return;
+      }
+
+      const { clubId, meetingNo } = bodyObj;
       const authorizedClubId = verifyTenantBoundary(
         user,
         typeof clubId === 'string' ? clubId.trim() : undefined,
@@ -2705,41 +2750,52 @@ export function createPilotExpressApp(
         return;
       }
 
-      const effectiveHour =
-        typeof simulatedHourTR === 'number' && Number.isFinite(simulatedHourTR)
-          ? simulatedHourTR
-          : 14;
-      const parsedSimMs =
-        typeof simulatedNowIso === 'string' && simulatedNowIso.trim()
-          ? Date.parse(simulatedNowIso.trim())
-          : NaN;
-      const effectiveNowMs = Number.isFinite(parsedSimMs)
-        ? parsedSimMs
-        : Date.now();
+      const serverNow = getServerNow();
+      const effectiveNowMs = serverNow.getTime();
+      const effectiveHourTR = getIstanbulHourFromEpochMs(effectiveNowMs);
+
+      let trustedReceipts: Record<string, string> | undefined;
+      if (
+        Boolean(tenant.outboundMessagingEnabled) &&
+        typeof options?.trustedMessagingProvider === 'function'
+      ) {
+        trustedReceipts = {};
+        for (const m of tenant.members) {
+          const ch: ReminderChannel =
+            m.preferredReminderChannel || 'WhatsApp Taslağı';
+          const receipt = options.trustedMessagingProvider({
+            clubId: authorizedClubId,
+            meetingNo: targetMeetingNo,
+            memberId: m.id,
+            channel: ch,
+          });
+          if (typeof receipt === 'string' && receipt.trim()) {
+            trustedReceipts[m.id] = receipt.trim();
+          }
+        }
+      }
 
       const batch = evaluateLcvReminderBatch({
         meetingNo: targetMeetingNo,
+        selectedMeetingNo: tenant.selectedMeetingNo,
         meetingDate: meetingObj.date,
+        clubName: tenant.clubName,
+        meetingVenue: meetingObj.venue,
         members: tenant.members,
         existingQueue: tenant.lcvReminderQueue || [],
         actorName: `${user.fullName} (${user.role})`,
-        currentHourTR: effectiveHour,
+        currentHourTR: effectiveHourTR,
         nowEpochMs: effectiveNowMs,
-        cooldownWindowMs:
-          typeof cooldownWindowMs === 'number' ? cooldownWindowMs : undefined,
+        cooldownWindowMs: SERVER_LCV_REMINDER_COOLDOWN_MS,
         outboundDispatchEnabled: Boolean(tenant.outboundMessagingEnabled),
-        providerReceiptsByMemberId:
-          providerReceiptsByMemberId &&
-          typeof providerReceiptsByMemberId === 'object'
-            ? (providerReceiptsByMemberId as Record<string, string>)
-            : undefined,
+        providerReceiptsByMemberId: trustedReceipts,
       });
 
       if (batch.isQuietHours) {
         res.status(422).json({
           error: 'QUIET_HOURS_ACTIVE',
           message:
-            'Sessiz saat kuralı (#32): 22:00 ile 08:00 saatleri arasında üyelere LCV hatırlatma bildirimi kuyruğa alınamaz veya gönderilemez.',
+            'Sessiz saat kuralı (#32): Europe/Istanbul saatiyle 22:00 ile 08:00 saatleri arasında üyelere LCV hatırlatma bildirimi kuyruğa alınamaz veya gönderilemez.',
           batchSummary: batch,
         });
         return;
@@ -2782,7 +2838,7 @@ export function createPilotExpressApp(
         actorRole: user.role,
         module: 'LCV & Kuver',
         action: `LCV Hatırlatma Kuyruğu İşlendi (Toplantı #${targetMeetingNo})`,
-        detail: `Toplantı #${targetMeetingNo} için ${batch.queuedItems.length} üye taslak kuyruğa eklendi (Dış gönderim: ${
+        detail: `Toplantı #${targetMeetingNo} (${meetingObj.venue}) için ${batch.queuedItems.length} üye taslak kuyruğa eklendi (Dış gönderim: ${
           tenant.outboundMessagingEnabled ? 'Açık' : 'Kapalı'
         }, Opt-out atlanan: ${batch.skippedOptOutMembers.length}, Mükerrer atlanan: ${
           batch.skippedCooldownMembers.length
@@ -2911,7 +2967,7 @@ export function createPilotExpressApp(
     }
   );
 
-  // Issue #36: Cryptographic Guest Make-up Certificate Verification Code Generator (64-bit / 16-Hex HMAC-SHA256), Rate Limiter, Re-Verification & Revocation
+  // Issue #36: Cryptographic Guest Make-up Certificate Verification Code Generator (64-bit / 16-Hex HMAC-SHA256), Bounded IP Rate Limiter, Approval Gate, Re-Verification & Revocation
   const computeGuestCertificateVerificationCode = (
     clubId: string,
     card: {
@@ -2922,16 +2978,22 @@ export function createPilotExpressApp(
       meetingNo: number;
       meetingDate: string;
       issuedByMemberId?: string;
+      approvedByMemberId?: string;
+      status?: 'Taslak' | 'Aktif' | 'İptal Edildi';
       schemaVersion?: number;
     }
   ): string => {
     const version = card.schemaVersion || 1;
     const issuer = card.issuedByMemberId || 'officer';
+    const approver =
+      card.status === 'Aktif' && card.approvedByMemberId
+        ? `:${card.approvedByMemberId}`
+        : '';
     const district = card.guestDistrict || 'UR 2420. Bölge';
     const digest = crypto
       .createHmac('sha256', getServerSecret())
       .update(
-        `RotaclubGuestCertificate:v${version}:${clubId}:${card.id}:${card.meetingNo}:${card.guestName}:${card.guestClub}:${district}:${card.meetingDate}:${issuer}`
+        `RotaclubGuestCertificate:v${version}:${clubId}:${card.id}:${card.meetingNo}:${card.guestName}:${card.guestClub}:${district}:${card.meetingDate}:${issuer}${approver}`
       )
       .digest('hex')
       .slice(0, 16)
@@ -2939,24 +3001,40 @@ export function createPilotExpressApp(
     return `GLR-2420-${card.meetingNo}-${digest}`;
   };
 
+  const VERIFY_CERT_RATE_WINDOW_MS = 60_000;
+  const VERIFY_CERT_MAX_REQUESTS = 20;
+  const MAX_VERIFY_RATE_BUCKETS = 2000;
   const verifyCertRateBuckets = new Map<
     string,
     { count: number; windowStartMs: number }
   >();
 
+  const pruneVerifyCertRateBuckets = (nowMs: number) => {
+    for (const [k, v] of verifyCertRateBuckets.entries()) {
+      if (nowMs - v.windowStartMs > VERIFY_CERT_RATE_WINDOW_MS) {
+        verifyCertRateBuckets.delete(k);
+      }
+    }
+    while (verifyCertRateBuckets.size >= MAX_VERIFY_RATE_BUCKETS) {
+      const oldestKey = verifyCertRateBuckets.keys().next().value;
+      if (!oldestKey) break;
+      verifyCertRateBuckets.delete(oldestKey);
+    }
+  };
+
   app.get('/api/pilot/verify-certificate', (req: AuthenticatedRequest, res) => {
+    // Security Audit (#36): Never use client-controlled request headers for rate limiting
     const rateKey =
-      (typeof req.headers['x-test-rate-limit-key'] === 'string' &&
-        req.headers['x-test-rate-limit-key'].trim()) ||
-      req.ip ||
-      'global-verify-client';
-    const nowMs = Date.now();
+      req.ip || req.socket?.remoteAddress || 'unknown-verify-client';
+    const nowMs = getServerNow().getTime();
+    pruneVerifyCertRateBuckets(nowMs);
+
     const bucket = verifyCertRateBuckets.get(rateKey);
-    if (!bucket || nowMs - bucket.windowStartMs > 60_000) {
+    if (!bucket || nowMs - bucket.windowStartMs > VERIFY_CERT_RATE_WINDOW_MS) {
       verifyCertRateBuckets.set(rateKey, { count: 1, windowStartMs: nowMs });
     } else {
       bucket.count += 1;
-      if (bucket.count > 20) {
+      if (bucket.count > VERIFY_CERT_MAX_REQUESTS) {
         res.status(429).json({
           valid: false,
           error: 'RATE_LIMIT_EXCEEDED',
@@ -3022,9 +3100,29 @@ export function createPilotExpressApp(
         error: 'CERTIFICATE_NOT_APPROVED',
         status: 'Taslak',
         message:
-          'Bu belge henüz taslak aşamasındadır ve resmi onay almamıştır (#36).',
+          'Bu belge henüz taslak aşamasındadır ve resmi katılım/yetkili onayı almamıştır (#36).',
       });
       return;
+    }
+
+    // Security Audit (#36): Any v1+ active certificate must have verified approval gate metadata & approval history
+    if (card.schemaVersion) {
+      const hasApprovedHistory =
+        Array.isArray(card.approvalHistory) &&
+        card.approvalHistory.some((h) => h.action === 'ONAYLANDI');
+      if (
+        !card.approvedByMemberId ||
+        !card.attendanceEvidence ||
+        !hasApprovedHistory
+      ) {
+        res.status(422).json({
+          valid: false,
+          error: 'CERTIFICATE_NOT_APPROVED',
+          message:
+            'Belge onay kapısı eksik (#36): Sertifikanın doğrulanmış katılım kanıtı ve yetkili onay geçmişi bulunmamaktadır.',
+        });
+        return;
+      }
     }
 
     // Re-verify HMAC against current stored fields for all v1+ server-issued certificates (#36)
@@ -3074,15 +3172,201 @@ export function createPilotExpressApp(
         status: card.status || 'Aktif',
         schemaVersion: card.schemaVersion || 1,
         issuedByRole: card.issuedByRole || 'sekreter',
+        approvedByRole: card.approvedByRole || card.issuedByRole || 'sekreter',
+        approvedAt: card.approvedAt || card.sentAt,
         ...(isAuthorizedClubOfficer
           ? {
               id: card.id,
               issuedByName: card.issuedByName,
+              approvedByName: card.approvedByName,
+              attendanceEvidence: card.attendanceEvidence,
+              approvalHistory: card.approvalHistory,
             }
           : {}),
       },
     });
   });
+
+  app.post(
+    '/api/pilot/approve-certificate',
+    requireAuth,
+    (req: AuthenticatedRequest, res) => {
+      const user = req.authUser!;
+      if (user.role !== 'sekreter' && user.role !== 'baskan') {
+        res.status(403).json({
+          error: 'RBAC_FORBIDDEN',
+          message:
+            'Sertifika aktifleştirme yetkisi (#36): Yalnızca Genel Sekreter veya Dönem Başkanı dijital katılım belgesini onaylayarak aktifleştirebilir.',
+        });
+        return;
+      }
+
+      const { clubId, certificateId, attendanceEvidence } = req.body || {};
+      const authorizedClubId = verifyTenantBoundary(
+        user,
+        typeof clubId === 'string' ? clubId.trim() : undefined,
+        store,
+        res
+      );
+      if (!authorizedClubId) return;
+
+      const cleanCertId =
+        typeof certificateId === 'string' ? certificateId.trim() : '';
+      const cleanEvidence =
+        typeof attendanceEvidence === 'string' ? attendanceEvidence.trim() : '';
+      if (!cleanCertId || cleanEvidence.length < 5) {
+        res.status(422).json({
+          error: 'ATTENDANCE_EVIDENCE_REQUIRED',
+          message:
+            'Sertifika aktifleştirmesi için geçerli certificateId ve en az 5 karakterlik doğrulanmış katılım kanıtı (attendanceEvidence) zorunludur (#36).',
+        });
+        return;
+      }
+
+      const tenant = store.getTenantState(authorizedClubId);
+      const targetCard = (tenant.guestMakeupCards || []).find(
+        (c) => c.id === cleanCertId || c.verificationCode === cleanCertId
+      );
+      if (!targetCard) {
+        res.status(404).json({
+          error: 'CERTIFICATE_NOT_FOUND',
+          message: 'Onaylanacak katılım belgesi bulunamadı (#36).',
+        });
+        return;
+      }
+
+      if (targetCard.status === 'İptal Edildi') {
+        res.status(409).json({
+          error: 'CERTIFICATE_ALREADY_REVOKED',
+          message:
+            'İptal edilmiş bir katılım belgesi yeniden aktifleştirilemez (#36).',
+        });
+        return;
+      }
+
+      if (targetCard.status === 'Aktif') {
+        res.status(409).json({
+          error: 'CERTIFICATE_ALREADY_ACTIVE',
+          message: 'Bu katılım belgesi zaten onaylanmış ve aktif durumdadır (#36).',
+        });
+        return;
+      }
+
+      const meetingObj = tenant.meetings.find(
+        (m) => m.meetingNo === targetCard.meetingNo
+      );
+      if (!meetingObj) {
+        res.status(404).json({
+          error: 'MEETING_NOT_FOUND',
+          message: `Toplantı bulunamadı (#36): #${targetCard.meetingNo} numaralı toplantı kulüp takviminde kayıtlı değildir.`,
+        });
+        return;
+      }
+
+      if (meetingObj.status === 'İptal Edildi') {
+        res.status(422).json({
+          error: 'MEETING_CANCELLED',
+          message: `İptal edilmiş toplantı (#36): Toplantı #${targetCard.meetingNo} iptal edildiği için katılım belgesi onaylanamaz.`,
+        });
+        return;
+      }
+
+      const meetingAttendees =
+        tenant.meetingAttendances?.[String(targetCard.meetingNo)] || [];
+      const hasVerifiedSessionAttendance =
+        meetingAttendees.length > 0 ||
+        meetingObj.isPast === true ||
+        meetingObj.status === 'Tamamlandı';
+      if (!hasVerifiedSessionAttendance) {
+        res.status(422).json({
+          error: 'MEETING_ATTENDANCE_NOT_VERIFIED',
+          message: `Toplantı katılım doğrulaması eksik (#36): Toplantı #${targetCard.meetingNo} için henüz doğrulanmış salon yoklaması (QR veya yetkili yoklama kaydı) bulunmadığından misafir katılım belgesi aktifleştirilemez.`,
+        });
+        return;
+      }
+
+      const nowStr = formatNowTR();
+      const updatedCardForHmac: GuestRotaryMakeupCard = {
+        ...targetCard,
+        schemaVersion: targetCard.schemaVersion || 1,
+        status: 'Aktif',
+        issuedByMemberId: targetCard.issuedByMemberId || user.memberId,
+        issuedByName: targetCard.issuedByName || user.fullName,
+        issuedByRole: targetCard.issuedByRole || user.role,
+        approvedByMemberId: user.memberId,
+        approvedByName: user.fullName,
+        approvedByRole: user.role,
+        approvedAt: nowStr,
+        attendanceEvidence: cleanEvidence,
+      };
+      const activeVerificationCode = computeGuestCertificateVerificationCode(
+        authorizedClubId,
+        updatedCardForHmac
+      );
+      const approvalEntry: CertificateApprovalHistoryEntry = {
+        timestamp: nowStr,
+        action: 'ONAYLANDI',
+        actorId: user.memberId,
+        actorName: user.fullName,
+        actorRole: user.role,
+        note: cleanEvidence,
+      };
+
+      const casResult = store.updateTenant(
+        authorizedClubId,
+        (curr) => ({
+          ...curr,
+          guestMakeupCards: (curr.guestMakeupCards || []).map((c) =>
+            c.id === targetCard.id
+              ? {
+                  ...updatedCardForHmac,
+                  verificationCode: activeVerificationCode,
+                  approvalHistory: [
+                    ...(c.approvalHistory || []),
+                    approvalEntry,
+                  ],
+                }
+              : c
+          ),
+        }),
+        tenant.revision
+      );
+
+      if (!casResult.ok) {
+        res.status(409).json({
+          error: 'REVISION_CONFLICT',
+          currentRevision: casResult.currentRevision,
+        });
+        return;
+      }
+
+      store.appendAuditEntry({
+        clubId: authorizedClubId,
+        actorName: `${user.fullName} (${user.rotaryId})`,
+        actorRole: user.role,
+        module: 'QR Yoklama & Make-up',
+        action: `Misafir Katılım Belgesi Onaylandı & Aktifleştirildi (${activeVerificationCode})`,
+        detail: `${targetCard.guestName} (${targetCard.guestClub}) adına düzenlenen Toplantı #${targetCard.meetingNo} katılım belgesi doğrulanmış katılım kanıtıyla (${cleanEvidence}) aktifleştirildi.`,
+        timestamp: nowStr,
+      });
+
+      const approvedCertificate = (casResult.state.guestMakeupCards || []).find(
+        (c) => c.id === targetCard.id
+      );
+
+      res.json({
+        ok: true,
+        revision: casResult.state.revision,
+        approvedCertificateCode: activeVerificationCode,
+        certificate: approvedCertificate,
+        state: redactStateForRole(
+          casResult.state,
+          store.getAuditLedger(authorizedClubId),
+          user
+        ),
+      });
+    }
+  );
 
   app.post(
     '/api/pilot/revoke-certificate',
@@ -3132,6 +3416,14 @@ export function createPilotExpressApp(
       }
 
       const nowStr = formatNowTR();
+      const revocationHistoryEntry: CertificateApprovalHistoryEntry = {
+        timestamp: nowStr,
+        action: 'IPTAL_EDILDI',
+        actorId: user.memberId,
+        actorName: user.fullName,
+        actorRole: user.role,
+        note: cleanReason,
+      };
       const casResult = store.updateTenant(
         authorizedClubId,
         (curr) => ({
@@ -3144,6 +3436,10 @@ export function createPilotExpressApp(
                   revokedAt: nowStr,
                   revokedBy: `${user.fullName} (${user.role})`,
                   revocationReason: cleanReason,
+                  approvalHistory: [
+                    ...(c.approvalHistory || []),
+                    revocationHistoryEntry,
+                  ],
                 }
               : c
           ),
@@ -3311,7 +3607,61 @@ export function createPilotExpressApp(
           normalizePersonName(String(name || '').replace(/^Rtn\.\s*/i, ''));
         const selfCanonical = stripTitle(user.fullName);
 
-        // Check for duplicate make-up activity across all incoming submissions (#35)
+        // Check for duplicate make-up activity both within the incoming batch and against stored records (#35)
+        const normalizedBatchForDupCheck = incomingPatch.makeupSubmissions
+          .filter((incMk: { id?: string }) => incMk && typeof incMk.id === 'string')
+          .map(
+            (incMk: {
+              id: string;
+              memberId?: string;
+              memberName?: string;
+              date?: string;
+              targetClubOrEvent?: string;
+              activityType?: string;
+              status?: string;
+            }) => {
+              const existingMk = existingMakeupsById.get(incMk.id);
+              const effectiveMemberId =
+                existingMk?.memberId ||
+                (isMakeupApprover
+                  ? incMk.memberId ||
+                    resolveUnambiguousLegacyMemberId(
+                      incMk.memberName || '',
+                      currentTenant.members
+                    ) ||
+                    user.memberId
+                  : user.memberId);
+              return {
+                id: incMk.id,
+                memberId: effectiveMemberId,
+                date: incMk.date || existingMk?.date || '',
+                targetClubOrEvent:
+                  incMk.targetClubOrEvent ||
+                  existingMk?.targetClubOrEvent ||
+                  '',
+                activityType:
+                  incMk.activityType ||
+                  existingMk?.activityType ||
+                  'Kulüp Ziyareti',
+                status: incMk.status || existingMk?.status || 'İnceleniyor',
+              };
+            }
+          );
+
+        if (
+          hasDuplicateInMakeupBatch(
+            normalizedBatchForDupCheck,
+            currentTenant.members
+          )
+        ) {
+          res.status(409).json({
+            error: 'DUPLICATE_MAKEUP_SUBMISSION',
+            message:
+              'Mükerrer telafi engellendi (#35): Gönderilen istek paketi (batch) içinde aynı üye, tarih, etkinlik türü ve hedef kulüp/etkinlik adına birden fazla eşdeğer make-up başvurusu bulunmaktadır.',
+          });
+          return;
+        }
+
         for (const incMk of incomingPatch.makeupSubmissions) {
           if (!incMk || typeof incMk.id !== 'string') continue;
           const existingMk = existingMakeupsById.get(incMk.id);
@@ -3338,16 +3688,13 @@ export function createPilotExpressApp(
             isNewOrReactivatedOrActivityChanged &&
             incMk.status !== 'Reddedildi' &&
             effectiveMemberId &&
-            hasDuplicateMakeupActivity(
-              currentTenant.makeupSubmissions,
-              {
-                id: incMk.id,
-                memberId: effectiveMemberId,
-                targetClubOrEvent: incMk.targetClubOrEvent || '',
-                activityType: incMk.activityType || 'Kulüp Ziyareti',
-                date: incMk.date || '',
-              }
-            )
+            hasDuplicateMakeupActivity(currentTenant.makeupSubmissions, {
+              id: incMk.id,
+              memberId: effectiveMemberId,
+              targetClubOrEvent: incMk.targetClubOrEvent || '',
+              activityType: incMk.activityType || 'Kulüp Ziyareti',
+              date: incMk.date || '',
+            })
           ) {
             res.status(409).json({
               error: 'DUPLICATE_MAKEUP_SUBMISSION',
@@ -3522,14 +3869,41 @@ export function createPilotExpressApp(
         }
       }
 
-      // Issue #36 Fix: Only Club Secretary or President can issue or modify guest make-up certificates
-      if (Array.isArray(incomingPatch.guestMakeupCards) && !isMakeupApprover) {
-        res.status(403).json({
-          error: 'RBAC_FORBIDDEN',
-          message:
-            'Misafir Rotaryen katılım belgesi düzenleme yetkisi (#36): Yalnızca Genel Sekreter veya Dönem Başkanı dijital katılım belgesi düzenleyebilir.',
-        });
-        return;
+      // Issue #36 Fix: Only Club Secretary or President can issue or modify guest make-up certificates, and new/draft certificates CANNOT be directly created or mutated as 'Aktif' via /api/pilot/sync
+      if (Array.isArray(incomingPatch.guestMakeupCards)) {
+        if (!isMakeupApprover) {
+          res.status(403).json({
+            error: 'RBAC_FORBIDDEN',
+            message:
+              'Misafir Rotaryen katılım belgesi düzenleme yetkisi (#36): Yalnızca Genel Sekreter veya Dönem Başkanı dijital katılım belgesi düzenleyebilir.',
+          });
+          return;
+        }
+
+        const existingCardsById = new Map(
+          (currentTenant.guestMakeupCards || []).map((c) => [c.id, c])
+        );
+        for (const incCard of incomingPatch.guestMakeupCards) {
+          if (!incCard || typeof incCard.id !== 'string') continue;
+          const existingCard = existingCardsById.get(incCard.id);
+          if (
+            (!existingCard &&
+              ((incCard.status && incCard.status !== 'Taslak') ||
+                Boolean(incCard.approvedByMemberId) ||
+                Boolean(incCard.approvedAt))) ||
+            (existingCard &&
+              existingCard.status === 'Taslak' &&
+              incCard.status &&
+              incCard.status !== 'Taslak')
+          ) {
+            res.status(422).json({
+              error: 'CERTIFICATE_APPROVAL_GATE_REQUIRED',
+              message:
+                'Sertifika onay kapısı zorunludur (#36): Yeni katılım belgeleri yalnızca "Taslak" olarak oluşturulabilir ve doğrulanmış toplantı/katılım kanıtıyla "/api/pilot/approve-certificate" uç noktasından aktifleştirilebilir.',
+            });
+            return;
+          }
+        }
       }
 
       // Issue #39 Fix: Close ALL direct client write paths to treasuryLedger, bankStatements, financialItems, and overdueMembers!
@@ -3975,7 +4349,13 @@ export function createPilotExpressApp(
               })
             : curr.scholars;
 
-          // Issue #14, #16 & #39 Fix: Safe member merge that NEVER overwrites server state with KVKK-redacted fields or altered debt balances!
+          const effectiveSelectedMeetingKey = String(
+            isBoardAdmin && incomingPatch.selectedMeetingNo !== undefined
+              ? incomingPatch.selectedMeetingNo
+              : curr.selectedMeetingNo || 1842
+          );
+
+          // Issue #14, #16, #32 & #39 Fix: Safe member merge that NEVER overwrites server state with KVKK-redacted fields or altered debt balances, and tracks per-meeting RSVP!
           const sanitizedMembers: RotaryMember[] = Array.isArray(
             incomingPatch.members
           )
@@ -3990,11 +4370,25 @@ export function createPilotExpressApp(
                       duesBalance: 0,
                       mealBalance: 0,
                       foundationBalance: 0,
+                      meetingRsvps: {
+                        [effectiveSelectedMeetingKey]:
+                          incMember.rsvpStatus || 'pending',
+                        ...(incMember.meetingRsvps || {}),
+                      },
                     };
                   }
+                  const nextRsvp = incMember.rsvpStatus ?? existing.rsvpStatus;
                   return {
                     ...existing,
                     ...incMember,
+                    rsvpStatus: nextRsvp,
+                    meetingRsvps: {
+                      ...(existing.meetingRsvps || {}),
+                      ...(incMember.meetingRsvps || {}),
+                      [effectiveSelectedMeetingKey]:
+                        incMember.meetingRsvps?.[effectiveSelectedMeetingKey] ??
+                        nextRsvp,
+                    },
                     // Never clobber unmasked PII with KVKK-masked strings
                     phone:
                       incMember.phone && !incMember.phone.includes('***')
@@ -4029,28 +4423,71 @@ export function createPilotExpressApp(
                   const selfPatch = incomingPatch.members.find(
                     (m: { id: string }) => m.id === user.memberId
                   );
-                  return selfPatch
-                    ? {
-                        ...existingMember,
-                        rsvpStatus:
-                          selfPatch.rsvpStatus ?? existingMember.rsvpStatus,
-                        mealPreference:
-                          selfPatch.mealPreference ??
-                          existingMember.mealPreference,
-                        reminderOptOut:
-                          selfPatch.reminderOptOut ??
-                          existingMember.reminderOptOut,
-                        preferredReminderChannel:
-                          selfPatch.preferredReminderChannel ??
-                          existingMember.preferredReminderChannel,
-                      }
-                    : existingMember;
+                  if (!selfPatch) return existingMember;
+                  const nextRsvp =
+                    selfPatch.rsvpStatus ?? existingMember.rsvpStatus;
+                  return {
+                    ...existingMember,
+                    rsvpStatus: nextRsvp,
+                    mealPreference:
+                      selfPatch.mealPreference ??
+                      existingMember.mealPreference,
+                    reminderOptOut:
+                      selfPatch.reminderOptOut ??
+                      existingMember.reminderOptOut,
+                    preferredReminderChannel:
+                      selfPatch.preferredReminderChannel ??
+                      existingMember.preferredReminderChannel,
+                    meetingRsvps: {
+                      ...(existingMember.meetingRsvps || {}),
+                      ...(selfPatch.meetingRsvps || {}),
+                      [effectiveSelectedMeetingKey]:
+                        selfPatch.meetingRsvps?.[effectiveSelectedMeetingKey] ??
+                        nextRsvp,
+                    },
+                  };
                 })
+            : incomingPatch.rsvpStatus !== undefined
+            ? curr.members.map((existingMember) =>
+                existingMember.id === user.memberId
+                  ? {
+                      ...existingMember,
+                      rsvpStatus: incomingPatch.rsvpStatus,
+                      meetingRsvps: {
+                        ...(existingMember.meetingRsvps || {}),
+                        [effectiveSelectedMeetingKey]: incomingPatch.rsvpStatus,
+                      },
+                    }
+                  : existingMember
+              )
             : curr.members;
 
           const nowTrStamp = formatNowTR();
 
-          const sanitizedMakeupSubmissions = Array.isArray(
+          const normalizeAuditTrailEntries = (
+            entries: MakeupAuditHistoryEntry[] | undefined,
+            fallbackActorId: string,
+            fallbackActorName: string,
+            fallbackStatus: MakeupStatus
+          ): MakeupAuditHistoryEntry[] => {
+            if (!Array.isArray(entries) || entries.length === 0) return [];
+            return entries.map((raw) => {
+              const rec = raw as unknown as Record<string, unknown>;
+              return {
+                timestamp: String(raw.timestamp || rec.at || nowTrStamp),
+                actorId: String(
+                  raw.actorId || rec.actorMemberId || fallbackActorId
+                ),
+                actorName: String(raw.actorName || fallbackActorName),
+                actorRole: (raw.actorRole as ClubRole) || 'uye',
+                ...(raw.fromStatus ? { fromStatus: raw.fromStatus } : {}),
+                toStatus: raw.toStatus || fallbackStatus,
+                ...(raw.note ? { note: String(raw.note) } : {}),
+              };
+            });
+          };
+
+          const sanitizedMakeupSubmissions: MakeupSubmission[] = Array.isArray(
             incomingPatch.makeupSubmissions
           )
             ? isMakeupApprover
@@ -4067,7 +4504,7 @@ export function createPilotExpressApp(
                     reviewerNote?: string;
                     appealNote?: string;
                     status: MakeupSubmission['status'];
-                  }) => {
+                  }): MakeupSubmission => {
                     const existingMk = curr.makeupSubmissions.find(
                       (ex) => ex.id === mk.id
                     );
@@ -4078,7 +4515,12 @@ export function createPilotExpressApp(
                         mk.memberName,
                         curr.members
                       );
-                    const prevTrail = existingMk?.auditTrail || [];
+                    const prevTrail = normalizeAuditTrailEntries(
+                      existingMk?.auditTrail,
+                      resolvedMemberId || user.memberId,
+                      mk.memberName || user.fullName,
+                      existingMk?.status || mk.status
+                    );
                     const statusChanged =
                       !existingMk || existingMk.status !== mk.status;
                     const newTrailEntry: MakeupAuditHistoryEntry | null =
@@ -4088,7 +4530,9 @@ export function createPilotExpressApp(
                             actorId: user.memberId,
                             actorName: user.fullName,
                             actorRole: user.role,
-                            fromStatus: existingMk?.status,
+                            ...(existingMk?.status
+                              ? { fromStatus: existingMk.status }
+                              : {}),
                             toStatus: mk.status,
                             note:
                               mk.reviewerNote ||
@@ -4099,12 +4543,40 @@ export function createPilotExpressApp(
                           }
                         : null;
                     return {
-                      ...existingMk,
-                      ...mk,
+                      id: mk.id,
                       ...(resolvedMemberId
                         ? { memberId: resolvedMemberId }
                         : {}),
+                      memberName: mk.memberName || existingMk?.memberName || '',
+                      targetClubOrEvent: mk.targetClubOrEvent,
+                      activityType: mk.activityType,
+                      date: mk.date,
+                      description: mk.description || '',
+                      ...(mk.evidenceRef ?? existingMk?.evidenceRef
+                        ? {
+                            evidenceRef:
+                              mk.evidenceRef ?? existingMk?.evidenceRef,
+                          }
+                        : {}),
+                      ...(mk.reviewerNote ?? existingMk?.reviewerNote
+                        ? {
+                            reviewerNote:
+                              mk.reviewerNote ?? existingMk?.reviewerNote,
+                          }
+                        : {}),
+                      ...(mk.appealNote ?? existingMk?.appealNote
+                        ? {
+                            appealNote: mk.appealNote ?? existingMk?.appealNote,
+                          }
+                        : {}),
+                      status: mk.status,
                       attendanceBoost: mk.status === 'Onaylandı' ? 3 : 0,
+                      reviewedBy: statusChanged
+                        ? `${user.fullName} (${user.role})`
+                        : existingMk?.reviewedBy,
+                      reviewedAt: statusChanged
+                        ? nowTrStamp
+                        : existingMk?.reviewedAt,
                       auditTrail: newTrailEntry
                         ? [...prevTrail, newTrailEntry]
                         : prevTrail,
@@ -4112,104 +4584,117 @@ export function createPilotExpressApp(
                   }
                 )
               : (() => {
-                  const updatedExisting = curr.makeupSubmissions.map(
-                    (existingMk) => {
-                      const incMatch = incomingPatch.makeupSubmissions.find(
-                        (m: { id: string }) => m.id === existingMk.id
-                      );
-                      if (!incMatch) return existingMk;
-                      const ownerId =
-                        existingMk.memberId ||
-                        resolveUnambiguousLegacyMemberId(
-                          existingMk.memberName,
-                          curr.members
+                  const updatedExisting: MakeupSubmission[] =
+                    curr.makeupSubmissions.map(
+                      (existingMk): MakeupSubmission => {
+                        const incMatch = incomingPatch.makeupSubmissions.find(
+                          (m: { id: string }) => m.id === existingMk.id
                         );
-                      if (ownerId !== user.memberId) return existingMk;
-                      const nextStatus: MakeupStatus =
-                        incMatch.status || existingMk.status;
-                      const prevTrail = existingMk.auditTrail || [];
-                      const statusChanged = nextStatus !== existingMk.status;
-                      const newTrailEntry: MakeupAuditHistoryEntry | null =
-                        statusChanged
-                          ? {
-                              timestamp: nowTrStamp,
-                              actorId: user.memberId,
-                              actorName: user.fullName,
-                              actorRole: user.role,
-                              fromStatus: existingMk.status,
-                              toStatus: nextStatus,
-                              note:
-                                incMatch.appealNote ||
-                                `Üye işlemi: ${existingMk.status} -> ${nextStatus}`,
-                            }
-                          : null;
-                      return {
-                        ...existingMk,
-                        targetClubOrEvent:
-                          incMatch.targetClubOrEvent ??
-                          existingMk.targetClubOrEvent,
-                        activityType:
-                          incMatch.activityType ?? existingMk.activityType,
-                        date: incMatch.date ?? existingMk.date,
-                        description:
-                          incMatch.description ?? existingMk.description,
-                        evidenceRef:
-                          incMatch.evidenceRef ?? existingMk.evidenceRef,
-                        appealNote:
-                          incMatch.appealNote ?? existingMk.appealNote,
-                        status: nextStatus,
-                        memberId: user.memberId,
-                        attendanceBoost: existingMk.attendanceBoost,
-                        auditTrail: newTrailEntry
-                          ? [...prevTrail, newTrailEntry]
-                          : prevTrail,
-                      };
-                    }
-                  );
-                  const newlyAdded = incomingPatch.makeupSubmissions
-                    .filter(
-                      (mk: { id: string }) =>
-                        !curr.makeupSubmissions.some((ex) => ex.id === mk.id)
-                    )
-                    .map(
-                      (mk: {
-                        id: string;
-                        targetClubOrEvent: string;
-                        activityType: MakeupSubmission['activityType'];
-                        date: string;
-                        description: string;
-                        evidenceRef?: string;
-                        status?: MakeupStatus;
-                      }) => {
-                        const initialStatus: MakeupStatus =
-                          mk.status === 'Taslak' ? 'Taslak' : 'İnceleniyor';
+                        if (!incMatch) return existingMk;
+                        const ownerId =
+                          existingMk.memberId ||
+                          resolveUnambiguousLegacyMemberId(
+                            existingMk.memberName,
+                            curr.members
+                          );
+                        if (ownerId !== user.memberId) return existingMk;
+                        const nextStatus: MakeupStatus =
+                          incMatch.status || existingMk.status;
+                        const prevTrail = normalizeAuditTrailEntries(
+                          existingMk.auditTrail,
+                          user.memberId,
+                          user.fullName,
+                          existingMk.status
+                        );
+                        const statusChanged = nextStatus !== existingMk.status;
+                        const newTrailEntry: MakeupAuditHistoryEntry | null =
+                          statusChanged
+                            ? {
+                                timestamp: nowTrStamp,
+                                actorId: user.memberId,
+                                actorName: user.fullName,
+                                actorRole: user.role,
+                                fromStatus: existingMk.status,
+                                toStatus: nextStatus,
+                                note:
+                                  incMatch.appealNote ||
+                                  `Üye işlemi: ${existingMk.status} -> ${nextStatus}`,
+                              }
+                            : null;
                         return {
-                          ...mk,
+                          ...existingMk,
+                          targetClubOrEvent:
+                            incMatch.targetClubOrEvent ??
+                            existingMk.targetClubOrEvent,
+                          activityType:
+                            incMatch.activityType ?? existingMk.activityType,
+                          date: incMatch.date ?? existingMk.date,
+                          description:
+                            incMatch.description ?? existingMk.description,
+                          evidenceRef:
+                            incMatch.evidenceRef ?? existingMk.evidenceRef,
+                          appealNote:
+                            incMatch.appealNote ?? existingMk.appealNote,
+                          status: nextStatus,
                           memberId: user.memberId,
-                          memberName: user.fullName,
-                          status: initialStatus,
-                          attendanceBoost: 0,
-                          auditTrail: [
-                            {
-                              at: nowTrStamp,
-                              actorMemberId: user.memberId,
-                              actorName: user.fullName,
-                              actorRole: user.role,
-                              toStatus: initialStatus,
-                              note:
-                                initialStatus === 'Taslak'
-                                  ? 'Üye tarafından taslak olarak kaydedildi'
-                                  : 'Üye tarafından incelemeye gönderildi',
-                            },
-                          ],
+                          attendanceBoost: existingMk.attendanceBoost,
+                          auditTrail: newTrailEntry
+                            ? [...prevTrail, newTrailEntry]
+                            : prevTrail,
                         };
                       }
                     );
+                  const newlyAdded: MakeupSubmission[] =
+                    incomingPatch.makeupSubmissions
+                      .filter(
+                        (mk: { id: string }) =>
+                          !curr.makeupSubmissions.some((ex) => ex.id === mk.id)
+                      )
+                      .map(
+                        (mk: {
+                          id: string;
+                          targetClubOrEvent: string;
+                          activityType: MakeupSubmission['activityType'];
+                          date: string;
+                          description: string;
+                          evidenceRef?: string;
+                          status?: MakeupStatus;
+                        }): MakeupSubmission => {
+                          const initialStatus: MakeupStatus =
+                            mk.status === 'Taslak' ? 'Taslak' : 'İnceleniyor';
+                          const initialTrailEntry: MakeupAuditHistoryEntry = {
+                            timestamp: nowTrStamp,
+                            actorId: user.memberId,
+                            actorName: user.fullName,
+                            actorRole: user.role,
+                            toStatus: initialStatus,
+                            note:
+                              initialStatus === 'Taslak'
+                                ? 'Üye tarafından taslak olarak kaydedildi'
+                                : 'Üye tarafından incelemeye gönderildi',
+                          };
+                          return {
+                            id: mk.id,
+                            targetClubOrEvent: mk.targetClubOrEvent,
+                            activityType: mk.activityType,
+                            date: mk.date,
+                            description: mk.description || '',
+                            ...(mk.evidenceRef
+                              ? { evidenceRef: mk.evidenceRef }
+                              : {}),
+                            memberId: user.memberId,
+                            memberName: user.fullName,
+                            status: initialStatus,
+                            attendanceBoost: 0,
+                            auditTrail: [initialTrailEntry],
+                          };
+                        }
+                      );
                   return [...newlyAdded, ...updatedExisting];
                 })()
             : curr.makeupSubmissions;
 
-          const sanitizedGuestMakeupCards =
+          const sanitizedGuestMakeupCards: GuestRotaryMakeupCard[] =
             isMakeupApprover && Array.isArray(incomingPatch.guestMakeupCards)
               ? incomingPatch.guestMakeupCards.map(
                   (card: {
@@ -4220,10 +4705,8 @@ export function createPilotExpressApp(
                     guestEmail: string;
                     meetingNo: number;
                     meetingDate: string;
-                    speakerAndTopic?: string;
                     sentAt: string;
-                    status?: 'Taslak' | 'Aktif' | 'İptal Edildi';
-                  }) => {
+                  }): GuestRotaryMakeupCard => {
                     const existingCard = curr.guestMakeupCards.find(
                       (ex) => ex.id === card.id
                     );
@@ -4232,19 +4715,42 @@ export function createPilotExpressApp(
                     }
                     const schemaVersion = 1;
                     const issuedByMemberId = user.memberId;
+                    const draftStatus = 'Taslak' as const;
                     const cardForHmac = {
-                      ...card,
+                      id: card.id,
+                      guestName: card.guestName,
+                      guestClub: card.guestClub,
+                      guestDistrict: card.guestDistrict || 'UR 2420. Bölge',
+                      meetingNo: card.meetingNo,
+                      meetingDate: card.meetingDate,
                       schemaVersion,
                       issuedByMemberId,
+                      status: draftStatus,
                     };
                     return {
-                      ...card,
+                      id: card.id,
+                      guestName: card.guestName,
+                      guestClub: card.guestClub,
                       guestDistrict: card.guestDistrict || 'UR 2420. Bölge',
+                      guestEmail: card.guestEmail || '',
+                      meetingNo: card.meetingNo,
+                      meetingDate: card.meetingDate,
+                      sentAt: card.sentAt || nowTrStamp,
                       schemaVersion,
-                      status: card.status === 'Taslak' ? 'Taslak' : 'Aktif',
+                      status: draftStatus,
                       issuedByMemberId,
                       issuedByName: user.fullName,
                       issuedByRole: user.role,
+                      approvalHistory: [
+                        {
+                          timestamp: nowTrStamp,
+                          action: 'TASLAK_OLUSTURULDU',
+                          actorId: user.memberId,
+                          actorName: user.fullName,
+                          actorRole: user.role,
+                          note: 'Misafir katılım belgesi taslağı oluşturuldu (onay kapısı bekliyor)',
+                        },
+                      ],
                       verificationCode:
                         computeGuestCertificateVerificationCode(
                           authorizedClubId,

@@ -49,6 +49,7 @@ interface OperationsTabProps {
   onSendGuestMakeupCard: (
     card: Omit<GuestRotaryMakeupCard, 'id' | 'sentAt' | 'verificationCode'>
   ) => void;
+  onApproveGuestMakeupCard?: (cardId: string, attendanceEvidence: string) => void;
   onRevokeGuestMakeupCard?: (cardId: string, reason: string) => void;
   onOpenOfficialCertificateModal: (card: GuestRotaryMakeupCard) => void;
   firesideGroups: FiresideGroup[];
@@ -77,6 +78,7 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
   onUpdateOwnMakeupSubmission,
   guestMakeupCards,
   onSendGuestMakeupCard,
+  onApproveGuestMakeupCard,
   onRevokeGuestMakeupCard,
   onOpenOfficialCertificateModal,
   firesideGroups,
@@ -974,7 +976,7 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                         key={card.id}
                         className="p-3 bg-white flex flex-wrap items-center justify-between gap-3 text-xs"
                       >
-                        <div>
+                        <div className="space-y-0.5">
                           <div className="font-semibold text-slate-900">
                             {card.guestName} · {card.guestClub}
                           </div>
@@ -991,17 +993,43 @@ export const OperationsTab: React.FC<OperationsTabProps> = ({
                               className={
                                 card.status === 'İptal Edildi'
                                   ? 'text-rose-600 font-semibold'
+                                  : card.status === 'Taslak'
+                                  ? 'text-amber-700 font-semibold'
                                   : 'text-emerald-700 font-semibold'
                               }
                             >
-                              {card.status || 'Aktif'}
+                              {card.status || 'Taslak'}
                             </span>
                           </div>
+                          {card.approvedByName && (
+                            <div className="text-[10px] text-slate-500 font-mono-num">
+                              Onaylayan: {card.approvedByName}
+                              {card.attendanceEvidence
+                                ? ` · Kanıt: ${card.attendanceEvidence}`
+                                : ''}
+                            </div>
+                          )}
                         </div>
                         <div className="flex flex-wrap items-center gap-2">
                           <span className="font-mono-num text-[11px] text-emerald-700 font-semibold">
                             {card.verificationCode}
                           </span>
+                          {isBoardLeader &&
+                            onApproveGuestMakeupCard &&
+                            card.status === 'Taslak' && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  onApproveGuestMakeupCard(
+                                    card.id,
+                                    `Toplantı #${card.meetingNo} misafir katılım defteri ve yoklama teyidi`
+                                  )
+                                }
+                                className="min-h-[34px] px-2.5 py-1 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white font-semibold transition-colors cursor-pointer"
+                              >
+                                Onayla & Aktifleştir
+                              </button>
+                            )}
                           {isBoardLeader &&
                             onRevokeGuestMakeupCard &&
                             card.status !== 'İptal Edildi' && (

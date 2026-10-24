@@ -101,6 +101,15 @@ export interface MakeupSubmission {
   auditTrail?: MakeupAuditHistoryEntry[];
 }
 
+export interface CertificateApprovalHistoryEntry {
+  timestamp: string;
+  action: 'TASLAK_OLUSTURULDU' | 'ONAYLANDI' | 'IPTAL_EDILDI';
+  actorId: string;
+  actorName: string;
+  actorRole: ClubRole;
+  note?: string;
+}
+
 export interface GuestRotaryMakeupCard {
   id: string;
   guestName: string;
@@ -116,6 +125,12 @@ export interface GuestRotaryMakeupCard {
   issuedByMemberId?: string;
   issuedByName?: string;
   issuedByRole?: ClubRole;
+  approvedByMemberId?: string;
+  approvedByName?: string;
+  approvedByRole?: ClubRole;
+  approvedAt?: string;
+  attendanceEvidence?: string;
+  approvalHistory?: CertificateApprovalHistoryEntry[];
   revokedAt?: string;
   revokedBy?: string;
   revocationReason?: string;
@@ -303,11 +318,12 @@ export interface RotaryMember {
   rsvpStatus: RsvpStatus;
   mealPreference: MenuPreference;
   guestName?: string;
-  // Issue #32: Communication Preferences & Opt-Out
+  // Issue #32: Communication Preferences, Opt-Out & Per-Meeting RSVP Map
   reminderOptOut?: boolean;
   preferredReminderChannel?: ReminderChannel;
   lastRemindedMeetingNo?: number;
   lastRemindedAtIso?: string;
+  meetingRsvps?: Record<string, RsvpStatus>;
 }
 
 export type Member = RotaryMember;

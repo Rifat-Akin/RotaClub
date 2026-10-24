@@ -711,8 +711,18 @@ export default function App() {
   };
 
   const handleChangeRsvpStatus = async (status: RsvpStatus) => {
+    const meetingKey = String(selectedMeetingNo);
     const nextMembers = members.map((m) =>
-      m.id === activeMemberId ? { ...m, rsvpStatus: status } : m
+      m.id === activeMemberId
+        ? {
+            ...m,
+            rsvpStatus: status,
+            meetingRsvps: {
+              ...(m.meetingRsvps || {}),
+              [meetingKey]: status,
+            },
+          }
+        : m
     );
     const statusLabels: Record<RsvpStatus, string> = {
       attending: 'Katılıyorum (1 Kuver)',
@@ -733,7 +743,7 @@ export default function App() {
     setMembers(nextMembers);
     showToast(
       `LCV Güncellendi: ${statusLabels[status]}`,
-      'Pera Palace Hotel canlı kuver listesi ve İsim İsim LCV Matrisi sunucu onayıyla güncellendi.'
+      'Canlı kuver listesi ve toplantı bazlı LCV matrisi sunucu onayıyla güncellendi.'
     );
   };
 
@@ -764,19 +774,24 @@ export default function App() {
   ) => {
     const target = members.find((m) => m.id === memberId);
     if (!target) return;
+    const meetingKey = String(selectedMeetingNo);
     const nextMembers = members.map((m) =>
       m.id === memberId
         ? {
             ...m,
             rsvpStatus: status,
             mealPreference: menu || m.mealPreference,
+            meetingRsvps: {
+              ...(m.meetingRsvps || {}),
+              [meetingKey]: status,
+            },
           }
         : m
     );
     const ok = await recordServerAudit(
       'LCV & Kuver',
       `Sekreterlik Kuver Matrisi Güncellemesi: ${target.fullName}`,
-      `${target.fullName} üyesinin LCV durumu "${status}" olarak Sekreterlik/Başkanlık tarafından güncellendi.`,
+      `${target.fullName} üyesinin #${selectedMeetingNo} LCV durumu "${status}" olarak Sekreterlik/Başkanlık tarafından güncellendi.`,
       ['sekreter', 'baskan'],
       { members: nextMembers }
     );
@@ -788,7 +803,7 @@ export default function App() {
     }
     showToast(
       `Üye LCV Durumu Güncellendi: ${target.fullName}`,
-      'Pera Palace Hotel canlı kuver toplamı yeni LCV durumuna göre yeniden hesaplandı.'
+      'Canlı kuver toplamı yeni toplantı LCV durumuna göre yeniden hesaplandı.'
     );
   };
 
@@ -838,11 +853,14 @@ export default function App() {
   };
 
   const handleRemindUnrespondedMembers = async () => {
-    const pendingList = members.filter((m) => m.rsvpStatus === 'pending');
+    const meetingKey = String(selectedMeetingNo);
+    const pendingList = members.filter(
+      (m) => (m.meetingRsvps?.[meetingKey] || m.rsvpStatus) === 'pending'
+    );
     if (pendingList.length === 0) {
       showToast(
         'LCV Durumu Güncel',
-        'Tüm üyelerin LCV yanıtı güncel durumda.'
+        'Seçili toplantı için tüm üyelerin LCV yanıtı güncel durumda.'
       );
       return;
     }
@@ -875,7 +893,12 @@ export default function App() {
       }
     }
 
-    const draftMessage = `Galata Rotary Kulübü Toplantı #${selectedMeetingNo} LCV Hatırlatması — Yanıt beklenen üyeler: ${pendingList
+    const activeMeetingObj =
+      meetings.find((m) => m.meetingNo === selectedMeetingNo) || meetings[0];
+    const venueLabel = activeMeetingObj?.venue
+      ? ` (${activeMeetingObj.venue})`
+      : '';
+    const draftMessage = `${activeTenantClubName} Toplantı #${selectedMeetingNo}${venueLabel} LCV Hatırlatması — Yanıt beklenen üyeler: ${pendingList
       .map((m) => m.fullName)
       .join(', ')}`;
     const copied = await copyTextToClipboard(draftMessage);
@@ -1338,6 +1361,54 @@ export default function App() {
     );
   };
 
+  const handleApproveGuestMakeupCard = async (
+    cardId: string,
+    attendanceEvidence: string
+  ) => {
+    const token = sessionTokenRef.current || sessionToken;
+    if (!token) {
+      showToast(
+        'Sunucu Oturumu Gerekli (401)',
+        'Katılım belgesi onayı için doğrulanmış Sekreter veya Başkan oturumu gereklidir.'
+      );
+      return;
+    }
+    try {
+      const res = await fetch('/api/pilot/approve-certificate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          clubId: activeTenantClubId,
+          certificateId: cardId,
+          attendanceEvidence,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showToast(
+          `Belge Onayı Reddedildi (${res.status})`,
+          data?.message ||
+            'Katılım belgesi onaylanamadı. Toplantı yoklama kaydının mevcut olduğundan emin olunuz.'
+        );
+        return;
+      }
+      if (data?.state) applyServerTenantState(data.state);
+      if (data?.certificate) {
+        setActiveCertificateCard(data.certificate);
+      }
+      showToast(
+        'Misafir Katılım Belgesi Onaylandı & Aktifleştirildi (#36)',
+        data?.message ||
+          'Belge sunucu onay kapısından geçerek resmi doğrulamaya açıldı.'
+      );
+    } catch {
+      showToast('Bağlantı Hatası', 'Belge onay servisine ulaşılamadı.');
+    }
+  };
+
   const handleRevokeGuestMakeupCard = async (
     cardId: string,
     reason: string
@@ -1387,14 +1458,15 @@ export default function App() {
     const newCard: GuestRotaryMakeupCard = {
       id: `gmk-${Date.now()}`,
       ...payload,
+      status: 'Taslak',
       sentAt: '23 Ekim 2026 · Şimdi',
-      verificationCode: `GLR-2420-${payload.meetingNo}-PENDING`,
+      verificationCode: `GLR-2420-${payload.meetingNo}-DRAFT`,
     };
     const nextCards = [newCard, ...guestMakeupCards];
     const ok = await recordServerAudit(
       'QR Yoklama & Make-up',
-      `Misafir Rotaryen Make-up Sertifikası Düzenlendi: ${payload.guestName}`,
-      `${payload.guestName} (${payload.guestClub}) için resmi dijital katılım belgesi oluşturuldu.`,
+      `Misafir Rotaryen Make-up Sertifika Taslağı Oluşturuldu: ${payload.guestName}`,
+      `${payload.guestName} (${payload.guestClub}) için taslak katılım belgesi oluşturuldu (#36 onay kapısı bekliyor).`,
       ['sekreter', 'baskan'],
       { guestMakeupCards: nextCards }
     );
@@ -1408,8 +1480,8 @@ export default function App() {
       syncedCards?.find((c) => c.id === newCard.id) || newCard;
     setActiveCertificateCard(serverIssuedCard);
     showToast(
-      'Resmi Dijital Make-up Sertifikası Hazır',
-      `${payload.guestName} (${payload.guestClub}) için sunucu doğrulama kodlu (${serverIssuedCard.verificationCode}) dijital katılım belgesi sunucu onayıyla oluşturuldu.`
+      'Misafir Make-up Sertifika Taslağı Oluşturuldu (#36)',
+      `${payload.guestName} (${payload.guestClub}) için taslak belge oluşturuldu. Resmi geçerlilik için toplantı yoklaması sonrası "Onayla & Aktifleştir" adımını tamamlayınız.`
     );
   };
 
@@ -2114,6 +2186,7 @@ export default function App() {
             onUpdateOwnMakeupSubmission={handleUpdateOwnMakeupSubmission}
             guestMakeupCards={guestMakeupCards}
             onSendGuestMakeupCard={handleSendGuestMakeupCard}
+            onApproveGuestMakeupCard={handleApproveGuestMakeupCard}
             onRevokeGuestMakeupCard={handleRevokeGuestMakeupCard}
             onOpenOfficialCertificateModal={(card) =>
               setActiveCertificateCard(card)

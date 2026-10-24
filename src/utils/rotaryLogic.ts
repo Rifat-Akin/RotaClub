@@ -1037,15 +1037,76 @@ export function hasDuplicateMakeupActivity(
 }
 
 /**
+ * Checks whether an incoming batch of make-up submissions contains two or more active/non-rejected records
+ * for the same member and same activity (#35 intra-batch duplicate prevention).
+ */
+export function hasDuplicateInMakeupBatch(
+  batch: Array<{
+    id?: string;
+    memberId?: string;
+    memberName?: string;
+    date: string;
+    targetClubOrEvent: string;
+    activityType: string;
+    status?: string;
+  }>,
+  allMembers?: RotaryMember[]
+): boolean {
+  const seenKeys = new Set<string>();
+  for (const item of batch) {
+    if (item.status === 'Reddedildi') continue;
+    const effectiveMemberId =
+      item.memberId ||
+      (item.memberName
+        ? resolveUnambiguousLegacyMemberId(item.memberName, allMembers)
+        : undefined);
+    if (!effectiveMemberId) continue;
+    const key = buildMakeupActivityKey({
+      memberId: effectiveMemberId,
+      date: item.date || '',
+      targetClubOrEvent: item.targetClubOrEvent || '',
+      activityType: item.activityType || 'Kulüp Ziyareti',
+    });
+    if (seenKeys.has(key)) {
+      return true;
+    }
+    seenKeys.add(key);
+  }
+  return false;
+}
+
+/**
+ * Computes the current hour (0-23) in Europe/Istanbul timezone from a UTC epoch timestamp (#32).
+ */
+export function getIstanbulHourFromEpochMs(epochMs: number): number {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Europe/Istanbul',
+    hour: 'numeric',
+    hourCycle: 'h23',
+  }).formatToParts(new Date(epochMs));
+  const hourPart = parts.find((p) => p.type === 'hour');
+  return hourPart
+    ? parseInt(hourPart.value, 10)
+    : new Date(epochMs).getUTCHours();
+}
+
+export const SERVER_LCV_REMINDER_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+/**
  * Issue #32: Evaluates an LCV reminder batch for a specific meeting with:
- * - Quiet hours guard (22:00 - 08:00 TR time)
+ * - Quiet hours guard (22:00 - 08:00 Europe/Istanbul time)
+ * - Per-meeting RSVP targeting (`member.meetingRsvps[String(meetingNo)]`)
+ * - Dynamic club & venue message template (`clubName`, `meetingVenue`)
  * - Member opt-out respect (`reminderOptOut === true`)
- * - Cooldown / duplicate prevention per `(meetingNo, memberId)` within 6 hours
- * - Honest delivery status (`Taslak Kuyrukta (Dış Gönderim Kapalı)` unless external dispatch + provider receipt exist)
+ * - Server policy cooldown / duplicate prevention per `(meetingNo, memberId)` within 6 hours
+ * - Honest delivery status (`Taslak Kuyrukta (Dış Gönderim Kapalı)` unless external dispatch + trusted provider receipt exist)
  */
 export function evaluateLcvReminderBatch(params: {
   meetingNo: number;
+  selectedMeetingNo?: number;
   meetingDate: string;
+  clubName?: string;
+  meetingVenue?: string;
   members: RotaryMember[];
   existingQueue: LcvReminderQueueItem[];
   actorName: string;
@@ -1056,33 +1117,52 @@ export function evaluateLcvReminderBatch(params: {
   providerReceiptsByMemberId?: Record<string, string>;
 }): {
   isQuietHours: boolean;
+  currentHourTR: number;
   pendingMembersCount: number;
   queuedItems: LcvReminderQueueItem[];
   skippedOptOutMembers: string[];
   skippedCooldownMembers: string[];
 } {
-  const hour =
-    typeof params.currentHourTR === 'number' ? params.currentHourTR : 14;
   const nowMs =
     typeof params.nowEpochMs === 'number' ? params.nowEpochMs : Date.now();
+  const hour =
+    typeof params.currentHourTR === 'number'
+      ? params.currentHourTR
+      : getIstanbulHourFromEpochMs(nowMs);
   const cooldownMs =
     typeof params.cooldownWindowMs === 'number'
       ? params.cooldownWindowMs
-      : 6 * 60 * 60 * 1000;
+      : SERVER_LCV_REMINDER_COOLDOWN_MS;
   const isQuietHours = hour >= 22 || hour < 8;
 
-  const pendingMembers = params.members.filter(
-    (m) => m.rsvpStatus === 'pending'
-  );
+  const meetingKey = String(params.meetingNo);
+  const pendingMembers = params.members.filter((m) => {
+    const specificRsvp = m.meetingRsvps?.[meetingKey];
+    if (specificRsvp !== undefined) {
+      return specificRsvp === 'pending';
+    }
+    if (
+      typeof params.selectedMeetingNo === 'number' &&
+      params.selectedMeetingNo !== params.meetingNo
+    ) {
+      return true;
+    }
+    return m.rsvpStatus === 'pending';
+  });
+
   if (isQuietHours) {
     return {
       isQuietHours: true,
+      currentHourTR: hour,
       pendingMembersCount: pendingMembers.length,
       queuedItems: [],
       skippedOptOutMembers: [],
       skippedCooldownMembers: [],
     };
   }
+
+  const resolvedClubName = (params.clubName || 'Galata Rotary Kulübü').trim();
+  const resolvedVenue = (params.meetingVenue || 'Pera Palace Hotel').trim();
 
   const queuedItems: LcvReminderQueueItem[] = [];
   const skippedOptOutMembers: string[] = [];
@@ -1121,7 +1201,7 @@ export function evaluateLcvReminderBatch(params: {
       memberId: member.id,
       memberName: member.fullName,
       channel,
-      draftMessage: `Sayın Rtn. ${member.fullName}, Galata Rotary Kulübü #${params.meetingNo} (${params.meetingDate}) toplantısı Pera Palace kuver bildirimi için LCV yanıtınızı rica ederiz.`,
+      draftMessage: `Sayın Rtn. ${member.fullName}, ${resolvedClubName} #${params.meetingNo} (${params.meetingDate}) toplantısı ${resolvedVenue} kuver bildirimi için LCV yanıtınızı rica ederiz.`,
       status: isVerifiedDelivered
         ? 'Sağlayıcı Kanıtı ile İletildi'
         : 'Taslak Kuyrukta (Dış Gönderim Kapalı)',
@@ -1136,6 +1216,7 @@ export function evaluateLcvReminderBatch(params: {
 
   return {
     isQuietHours: false,
+    currentHourTR: hour,
     pendingMembersCount: pendingMembers.length,
     queuedItems,
     skippedOptOutMembers,

@@ -90,10 +90,12 @@ export const OfficialMakeupCertificateModal: React.FC<
                     className={
                       card.status === 'İptal Edildi'
                         ? 'text-rose-600 font-bold'
+                        : card.status === 'Taslak'
+                        ? 'text-amber-700 font-bold'
                         : 'text-emerald-700 font-bold'
                     }
                   >
-                    {card.status || 'Aktif'}
+                    {card.status || 'Taslak'}
                   </span>{' '}
                   · Şema v{card.schemaVersion ?? 1}
                 </div>
@@ -101,6 +103,15 @@ export const OfficialMakeupCertificateModal: React.FC<
                 <div>Tarih: {card.meetingDate}</div>
               </div>
             </div>
+
+            {card.status === 'Taslak' && (
+              <div
+                role="alert"
+                className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 font-medium"
+              >
+                Bu katılım belgesi henüz <strong>TASLAK</strong> aşamasındadır ve resmi geçerliliği yoktur (#36). Aktifleştirilmesi için doğrulanmış toplantı yoklaması ve Sekreter/Başkan onayı gereklidir.
+              </div>
+            )}
 
             {card.status === 'İptal Edildi' && (
               <div
@@ -130,6 +141,11 @@ export const OfficialMakeupCertificateModal: React.FC<
                 çizelgesinde <strong>Make-up (+1 Toplantı Katılımı)</strong> olarak işlenmesini rica
                 eder, Rotaryen sevgi ve saygılarımızı sunarız.
               </p>
+              {card.attendanceEvidence && (
+                <p className="text-xs font-mono-num text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+                  Katılım Kanıtı: {card.attendanceEvidence}
+                </p>
+              )}
             </div>
 
             {/* Official Seal & Digital Server Verification Row (#36: No fake wet signature claims) */}
@@ -141,7 +157,11 @@ export const OfficialMakeupCertificateModal: React.FC<
                 </div>
                 <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#0C3C7C]/5 border border-[#0C3C7C]/20 text-[11px] font-mono-num font-semibold text-[#0C3C7C]">
                   <CheckCircle2 className="w-3.5 h-3.5 text-[#0C3C7C]" />
-                  <span>Sunucu Kayıt Onayı</span>
+                  <span>
+                    {card.status === 'Aktif'
+                      ? 'Sunucu Kayıt Onaylı'
+                      : 'Onay Kapısı Bekleniyor'}
+                  </span>
                 </div>
                 <div className="text-xs font-bold text-slate-900">
                   {termInfo.president}
@@ -172,7 +192,7 @@ export const OfficialMakeupCertificateModal: React.FC<
                   <span>Doğrulama: {card.verificationCode}</span>
                 </div>
                 <div className="text-xs font-bold text-slate-900">
-                  {card.issuedByName || termInfo.secretary}
+                  {card.approvedByName || card.issuedByName || termInfo.secretary}
                 </div>
                 <div className="text-[11px] text-slate-500">
                   Alıcı: {card.guestEmail || 'KVKK Korumalı'}

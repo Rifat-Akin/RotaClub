@@ -32,6 +32,7 @@ import {
   GalataProject,
   GuestRotaryMakeupCard,
   LcvReminderQueueItem,
+  MakeupAuditHistoryEntry,
   MakeupSubmission,
   MenuPreference,
   OverdueMemberItem,
@@ -1829,7 +1830,7 @@ function createIsolatedNonGalataMembers(
       duesBalance: 0,
       mealBalance: 0,
       foundationBalance: 0,
-      rsvpStatus: 'attending',
+      rsvpStatus: 'pending',
       mealPreference: 'Balık',
     },
   ];
@@ -1905,10 +1906,77 @@ export function createTenantClubState(
     qrCheckedIn: false,
     meetingAttendances: {},
     makeupSubmissions: isGalata
-      ? INITIAL_MAKEUP_SUBMISSIONS.map((m) => ({ ...m }))
+      ? INITIAL_MAKEUP_SUBMISSIONS.map((m) => {
+          const resolvedId =
+            m.memberId ||
+            resolveUnambiguousLegacyMemberId(
+              m.memberName,
+              GALATA_ROTARY_MEMBERS
+            );
+          return {
+            ...m,
+            ...(resolvedId ? { memberId: resolvedId } : {}),
+            auditTrail:
+              Array.isArray(m.auditTrail) && m.auditTrail.length > 0
+                ? m.auditTrail.map((entry): MakeupAuditHistoryEntry => ({
+                    timestamp: String(entry.timestamp || m.date),
+                    actorId: String(entry.actorId || resolvedId || 'm-2'),
+                    actorName: String(entry.actorName || m.memberName),
+                    actorRole: entry.actorRole || 'uye',
+                    ...(entry.fromStatus ? { fromStatus: entry.fromStatus } : {}),
+                    toStatus: entry.toStatus || m.status,
+                    ...(entry.note ? { note: entry.note } : {}),
+                  }))
+                : [
+                    {
+                      timestamp: m.date,
+                      actorId:
+                        m.status === 'Onaylandı'
+                          ? 'm-2'
+                          : resolvedId || 'm-rifat',
+                      actorName:
+                        m.status === 'Onaylandı'
+                          ? 'Rtn. Av. Nazlı Denizmen'
+                          : m.memberName,
+                      actorRole:
+                        m.status === 'Onaylandı' ? 'sekreter' : 'uye',
+                      toStatus: m.status,
+                      note:
+                        m.status === 'Onaylandı'
+                          ? 'Sekreterlik tarafından dönem başında onaylandı'
+                          : 'Üye tarafından incelemeye gönderildi',
+                    },
+                  ],
+          };
+        })
       : [],
     guestMakeupCards: isGalata
-      ? INITIAL_GUEST_MAKEUP_CARDS.map((g) => ({ ...g }))
+      ? INITIAL_GUEST_MAKEUP_CARDS.map((g) => ({
+          ...g,
+          status: g.status || 'Aktif',
+          issuedByMemberId: g.issuedByMemberId || 'm-2',
+          issuedByName: g.issuedByName || 'Rtn. Av. Nazlı Denizmen',
+          issuedByRole: g.issuedByRole || 'sekreter',
+          approvedByMemberId: g.approvedByMemberId || 'm-2',
+          approvedByName: g.approvedByName || 'Rtn. Av. Nazlı Denizmen',
+          approvedByRole: g.approvedByRole || 'sekreter',
+          approvedAt: g.approvedAt || g.sentAt,
+          attendanceEvidence:
+            g.attendanceEvidence || 'Kulüp Protokol Kayıt Defteri Onaylı',
+          approvalHistory:
+            Array.isArray(g.approvalHistory) && g.approvalHistory.length > 0
+              ? g.approvalHistory
+              : [
+                  {
+                    timestamp: g.sentAt,
+                    action: 'ONAYLANDI',
+                    actorId: 'm-2',
+                    actorName: 'Rtn. Av. Nazlı Denizmen',
+                    actorRole: 'sekreter',
+                    note: 'Kulüp Protokol Kayıt Defteri Onaylı',
+                  },
+                ],
+        }))
       : [],
     firesideGroups: isGalata
       ? INITIAL_FIRESIDE_GROUPS.map((f) => ({ ...f }))
@@ -1939,9 +2007,16 @@ export function createTenantClubState(
         ],
     projects: baseProjects,
     scholars: isGalata ? INITIAL_SCHOLARS.map((s) => ({ ...s })) : [],
-    members: isGalata
+    members: (isGalata
       ? GALATA_ROTARY_MEMBERS.map((m) => ({ ...m }))
-      : createIsolatedNonGalataMembers(clubId, clubPrefix),
+      : createIsolatedNonGalataMembers(clubId, clubPrefix)
+    ).map((m) => ({
+      ...m,
+      meetingRsvps: {
+        '1842': m.rsvpStatus,
+        ...(m.meetingRsvps || {}),
+      },
+    })),
     committees: isGalata ? INITIAL_CLUB_COMMITTEES.map((c) => ({ ...c })) : [],
     pastPresidents: isGalata
       ? INITIAL_PAST_PRESIDENTS.map((pp) => ({ ...pp }))
@@ -2058,15 +2133,67 @@ export function migrateDatabaseLossless(
           : {},
       makeupSubmissions: Array.isArray(existingTenant.makeupSubmissions)
         ? existingTenant.makeupSubmissions.map((mk) => {
-            if (mk.memberId) return mk;
             const roster = Array.isArray(existingTenant.members)
               ? existingTenant.members
               : defaultTenant.members;
-            const resolvedId = resolveUnambiguousLegacyMemberId(
-              mk.memberName,
-              roster
-            );
-            return resolvedId ? { ...mk, memberId: resolvedId } : mk;
+            const resolvedId =
+              mk.memberId ||
+              resolveUnambiguousLegacyMemberId(mk.memberName, roster);
+            const normalizedTrail: MakeupAuditHistoryEntry[] =
+              Array.isArray(mk.auditTrail) && mk.auditTrail.length > 0
+                ? mk.auditTrail.map((rawEntry) => {
+                    const legacyRec = rawEntry as unknown as Record<
+                      string,
+                      unknown
+                    >;
+                    return {
+                      timestamp: String(
+                        rawEntry.timestamp ||
+                          legacyRec.at ||
+                          mk.date ||
+                          '23 Ekim 2026'
+                      ),
+                      actorId: String(
+                        rawEntry.actorId ||
+                          legacyRec.actorMemberId ||
+                          resolvedId ||
+                          'm-2'
+                      ),
+                      actorName: String(
+                        rawEntry.actorName || mk.memberName || 'Kulüp Üyesi'
+                      ),
+                      actorRole: (rawEntry.actorRole as ClubRole) || 'uye',
+                      ...(rawEntry.fromStatus
+                        ? { fromStatus: rawEntry.fromStatus }
+                        : {}),
+                      toStatus: rawEntry.toStatus || mk.status,
+                      ...(rawEntry.note
+                        ? { note: String(rawEntry.note) }
+                        : {}),
+                    };
+                  })
+                : [
+                    {
+                      timestamp: mk.date || '23 Ekim 2026',
+                      actorId:
+                        mk.status === 'Onaylandı'
+                          ? 'm-2'
+                          : resolvedId || 'm-rifat',
+                      actorName:
+                        mk.status === 'Onaylandı'
+                          ? 'Rtn. Av. Nazlı Denizmen'
+                          : mk.memberName,
+                      actorRole:
+                        mk.status === 'Onaylandı' ? 'sekreter' : 'uye',
+                      toStatus: mk.status,
+                      note: 'Kayıt geçmişi doğrulandı',
+                    },
+                  ];
+            return {
+              ...mk,
+              ...(resolvedId ? { memberId: resolvedId } : {}),
+              auditTrail: normalizedTrail,
+            };
           })
         : defaultTenant.makeupSubmissions,
       guestMakeupCards: Array.isArray(existingTenant.guestMakeupCards)
@@ -2096,9 +2223,16 @@ export function migrateDatabaseLossless(
       scholars: Array.isArray(existingTenant.scholars)
         ? existingTenant.scholars
         : defaultTenant.scholars,
-      members: Array.isArray(existingTenant.members)
+      members: (Array.isArray(existingTenant.members)
         ? existingTenant.members
-        : defaultTenant.members,
+        : defaultTenant.members
+      ).map((m) => ({
+        ...m,
+        meetingRsvps: {
+          [String(existingTenant.selectedMeetingNo || 1842)]: m.rsvpStatus,
+          ...(m.meetingRsvps || {}),
+        },
+      })),
       committees: Array.isArray(existingTenant.committees)
         ? existingTenant.committees
         : defaultTenant.committees,
